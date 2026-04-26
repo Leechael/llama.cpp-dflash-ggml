@@ -48,6 +48,8 @@
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 #define LLAMA_STATE_SEQ_VERSION 2
 
+#define LLAMA_MEM_SNAPSHOT_INVALID -1
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -68,6 +70,9 @@ extern "C" {
     typedef int32_t llama_pos;
     typedef int32_t llama_token;
     typedef int32_t llama_seq_id;
+
+    // opaque handle returned by llama_seq_snapshot / used by llama_seq_restore and llama_seq_release
+    typedef int32_t llama_mem_snapshot_id;
 
     enum llama_vocab_type {
         LLAMA_VOCAB_TYPE_NONE   = 0, // For models without vocab
@@ -784,6 +789,15 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    // Snapshot/restore the recurrent state (SSM + conv) for seq_id.
+    // snapshot() allocates per-layer backup buffers and copies the current state into them.
+    // restore() copies the backed-up state back; release() frees the backup buffers.
+    // These are no-ops on non-recurrent memory types (returns LLAMA_MEM_SNAPSHOT_INVALID).
+    // The caller is responsible for calling release() after each snapshot.
+    LLAMA_API llama_mem_snapshot_id llama_seq_snapshot(struct llama_context * ctx, llama_seq_id seq_id);
+    LLAMA_API bool                  llama_seq_restore (struct llama_context * ctx, llama_mem_snapshot_id snap_id);
+    LLAMA_API void                  llama_seq_release (struct llama_context * ctx, llama_mem_snapshot_id snap_id);
 
     //
     // State / sessions

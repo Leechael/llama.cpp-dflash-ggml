@@ -67,6 +67,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
                         int   il);
 
     // tree-mode variant: uses ggml_ssm_conv_tree + ggml_gated_delta_net_tree
+    // When persist_inter != nullptr, calls ggml_gated_delta_net_tree_persist to write
+    // per-token intermediate states to the provided external buffer.
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_tree(
                 ggml_tensor * q,
                 ggml_tensor * k,
@@ -74,7 +76,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
-                ggml_tensor * par_ids, // [n_tokens] i32
+                ggml_tensor * par_ids,      // [n_tokens] i32
+                ggml_tensor * persist_inter, // optional, may be null
                         int   il);
 };
 
