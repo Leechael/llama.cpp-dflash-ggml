@@ -7,6 +7,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3328,7 +3329,13 @@ bool llama_memory_can_shift(llama_memory_t mem) {
 // snapshot/restore for recurrent (SSM + conv) state
 
 llama_mem_snapshot_id llama_seq_snapshot(struct llama_context * ctx, llama_seq_id seq_id) {
-    auto * mem = dynamic_cast<llama_memory_recurrent *>(ctx->get_memory());
+    auto * raw_mem = ctx->get_memory();
+    auto * mem = dynamic_cast<llama_memory_recurrent *>(raw_mem);
+    if (!mem) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(raw_mem)) {
+            mem = hyb->get_mem_recr();
+        }
+    }
     if (!mem) {
         return LLAMA_MEM_SNAPSHOT_INVALID;
     }
@@ -3336,7 +3343,13 @@ llama_mem_snapshot_id llama_seq_snapshot(struct llama_context * ctx, llama_seq_i
 }
 
 bool llama_seq_restore(struct llama_context * ctx, llama_mem_snapshot_id snap_id) {
-    auto * mem = dynamic_cast<llama_memory_recurrent *>(ctx->get_memory());
+    auto * raw_mem = ctx->get_memory();
+    auto * mem = dynamic_cast<llama_memory_recurrent *>(raw_mem);
+    if (!mem) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(raw_mem)) {
+            mem = hyb->get_mem_recr();
+        }
+    }
     if (!mem) {
         return false;
     }
@@ -3344,7 +3357,13 @@ bool llama_seq_restore(struct llama_context * ctx, llama_mem_snapshot_id snap_id
 }
 
 void llama_seq_release(struct llama_context * ctx, llama_mem_snapshot_id snap_id) {
-    auto * mem = dynamic_cast<llama_memory_recurrent *>(ctx->get_memory());
+    auto * raw_mem = ctx->get_memory();
+    auto * mem = dynamic_cast<llama_memory_recurrent *>(raw_mem);
+    if (!mem) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(raw_mem)) {
+            mem = hyb->get_mem_recr();
+        }
+    }
     if (mem) {
         mem->release(snap_id);
     }
