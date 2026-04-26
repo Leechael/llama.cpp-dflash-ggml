@@ -307,3 +307,14 @@ if (LLAMA_BUILD_TESTS_QWEN35_TREE)
     llama_build(test-qwen35-tree.cpp)
     # Note: NOT registered with llama_test / add_test — must be run manually.
 endif()
+
+# DDTree Phase 2 acceptance test: snapshot/restore symmetry.
+# Requires a 16+ GB Qwen3.5-27B GGUF not available in CI.
+# Requires the llama_seq_snapshot / llama_seq_restore / llama_seq_release API
+# delivered by the Phase 2 implementation agent.
+# Enable manually: cmake -DLLAMA_BUILD_TESTS_QWEN35_TREE_ROLLBACK=ON ...
+option(LLAMA_BUILD_TESTS_QWEN35_TREE_ROLLBACK "Build DDTree snapshot/restore acceptance test (requires large GGUF)" OFF)
+if (LLAMA_BUILD_TESTS_QWEN35_TREE_ROLLBACK)
+    llama_build(test-qwen35-tree-rollback.cpp)
+    # Note: NOT registered with llama_test / add_test — must be run manually.
+endif()
