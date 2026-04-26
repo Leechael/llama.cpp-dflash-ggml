@@ -786,37 +786,12 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_tree::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ubatch->parent_id != nullptr);
     GGML_ASSERT(inp_parent_ids != nullptr);
-    GGML_ASSERT(inp_tree_mask  != nullptr);
 
     const int32_t n_tokens = (int32_t) ubatch->n_tokens;
 
-    // upload parent_ids
-    {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_parent_ids->buffer));
-        int32_t * data = (int32_t *) inp_parent_ids->data;
-        memcpy(data, ubatch->parent_id, n_tokens * sizeof(int32_t));
-    }
-
-    // build tree_mask: entry [i, j] = 0.0 if j is an ancestor of i (or i==j), -inf otherwise.
-    // Shape is [n_tokens, n_tokens, 1, 1]; stride between query rows = n_tokens.
-    {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_tree_mask->buffer));
-        float * data = (float *) inp_tree_mask->data;
-        const int32_t stride = n_tokens; // ne[0]
-
-        std::fill(data, data + (int64_t)stride * n_tokens, -INFINITY);
-
-        for (int32_t i = 0; i < n_tokens; ++i) {
-            // walk the ancestor chain of token i (inclusive)
-            int32_t cur = i;
-            while (cur >= 0) {
-                data[(int64_t)i * stride + cur] = 0.0f;
-                const int32_t p = ubatch->parent_id[cur];
-                if (p < 0) break; // root
-                cur = p;
-            }
-        }
-    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(inp_parent_ids->buffer));
+    int32_t * data = (int32_t *) inp_parent_ids->data;
+    memcpy(data, ubatch->parent_id, n_tokens * sizeof(int32_t));
 }
 
 //
@@ -1848,21 +1823,12 @@ void llm_graph_context::build_inp_tree() const {
     ggml_set_input(inp->inp_parent_ids);
     ggml_set_name(inp->inp_parent_ids, "parent_ids");
 
-    // tree_mask shape matches kq_mask for Phase 1 (n_past=0 → n_kv == n_tokens, n_stream=1).
-    // Layout: [n_tokens, n_tokens, 1, 1] — row i is query i, col j is key j.
+    // The ancestor-only attention mask is written directly into the standard
+    // kq_mask buffer in llama_kv_cache::set_input_kq_mask when ubatch->parent_id
+    // is set, so we don't allocate a separate tree_mask graph input here.
     // TODO: phase-1 leaves pos as 1D — M-RoPE 4-axis is UNKNOWN-3 in roadmap
-    inp->inp_tree_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens, 1, 1);
-    ggml_set_input(inp->inp_tree_mask);
-    ggml_set_name(inp->inp_tree_mask, "tree_mask");
 
-    // Cast to F16 for flash-attention; FA kernels assert mask->type == F16.
-    ggml_tensor * tree_mask_cnv = cparams.flash_attn
-        ? ggml_cast(ctx0, inp->inp_tree_mask, GGML_TYPE_F16)
-        : inp->inp_tree_mask;
-
-    // expose to the graph context so model builders can use them directly
     const_cast<llm_graph_context *>(this)->parent_ids = inp->inp_parent_ids;
-    const_cast<llm_graph_context *>(this)->tree_mask  = tree_mask_cnv;
 
     res->add_input(std::move(inp));
 }

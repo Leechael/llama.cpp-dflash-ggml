@@ -511,9 +511,9 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
-// Input for tree-mode forward: parent_ids and tree mask.
-// parent_ids[i] is the index of token i's parent in the batch (-1 = root).
-// tree_mask is [n_tokens, n_tokens] f32: 0.0 if j is an ancestor of i (or i==j), -inf otherwise.
+// Input for tree-mode forward. Holds parent_ids; ancestor mask is written
+// into the standard kq_mask by llama_kv_cache::set_input_kq_mask when
+// ubatch->parent_id is non-null, so no separate mask tensor is allocated here.
 class llm_graph_input_tree : public llm_graph_input_i {
 public:
     llm_graph_input_tree() = default;
@@ -522,7 +522,6 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     ggml_tensor * inp_parent_ids = nullptr; // I32 [n_tokens]
-    ggml_tensor * inp_tree_mask  = nullptr; // F32 [n_tokens, n_tokens]
 };
 
 //
@@ -775,9 +774,9 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
-    // tree-mode fields: non-null when batch.parent_id is set
+    // tree-mode field: non-null when batch.parent_id is set; consumed by
+    // ggml_ssm_conv_tree / ggml_gated_delta_net_tree on hybrid layers.
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32
-    ggml_tensor * tree_mask  = nullptr; // [n_tokens, n_tokens] f32, ancestor-only mask
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

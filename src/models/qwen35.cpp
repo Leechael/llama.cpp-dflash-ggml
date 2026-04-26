@@ -183,12 +183,6 @@ ggml_tensor * llm_build_qwen35::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    // In tree mode, substitute tree_mask for the KV-cache attention mask.
-    // For Phase 1 (n_past=0) n_kv == n_tokens so shapes are compatible.
-    if (tree_mask != nullptr) {
-        inp->self_kq_mask_cnv = tree_mask;
-    }
-
     cur = build_attn(inp,
                 nullptr, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);

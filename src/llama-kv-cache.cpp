@@ -1621,6 +1621,27 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
 
+    // Tree-mode: write ancestor-only mask directly. Phase 1 assumes single
+    // stream and no past KV (n_kv == n_tokens), so cell index j corresponds
+    // to tree-batch token j.
+    if (ubatch->parent_id != nullptr) {
+        GGML_ASSERT(n_stream == 1 && "tree-mode requires n_stream == 1 in Phase 1");
+        GGML_ASSERT(n_kv == (int64_t) n_tokens && "tree-mode Phase 1 expects n_kv == n_tokens (no past)");
+
+        std::fill(data, data + n_kv * n_tps, -INFINITY);
+
+        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
+            int32_t cur = (int32_t) i;
+            while (cur >= 0) {
+                data[i * n_kv + cur] = 0.0f;
+                const int32_t p = ubatch->parent_id[cur];
+                if (p < 0) break;
+                cur = p;
+            }
+        }
+        return;
+    }
+
     //const int64_t t_start = ggml_time_us();
 
     const args_set_input_kq_mask args = {
