@@ -685,8 +685,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     assert(n_tokens%n_seqs == 0);
 
-    // tree-mode parent_ids must not be split across ubatches
-    GGML_ASSERT((batch.parent_id == nullptr || n_used == 0) &&
+    // tree-mode parent_ids must not be split across ubatches: the ubatch must cover
+    // every token of the public batch in a single emission.
+    GGML_ASSERT((batch.parent_id == nullptr || (size_t) n_tokens == (size_t) batch.n_tokens) &&
                 "tree-mode batch with parent_id must fit in a single ubatch");
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
