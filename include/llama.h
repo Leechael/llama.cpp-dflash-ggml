@@ -241,6 +241,10 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+
+        // tree-mode parent indices: parent_id[i] is the index of token i's parent in the batch
+        // -1 means root (no parent). NULL means chain mode (default behavior unchanged).
+        int32_t      *  parent_id;
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -932,7 +936,14 @@ extern "C" {
             int32_t embd,
             int32_t n_seq_max);
 
-    // Frees a batch of tokens allocated with llama_batch_init()
+    // Like llama_batch_init but also allocates parent_id[n_tokens], filled with -1 (tree roots).
+    // Callers must free with llama_batch_free().
+    LLAMA_API struct llama_batch llama_batch_init_tree(
+            int32_t n_tokens,
+            int32_t embd,
+            int32_t n_seq_max);
+
+    // Frees a batch of tokens allocated with llama_batch_init() or llama_batch_init_tree()
     LLAMA_API void llama_batch_free(struct llama_batch batch);
 
     // Process a batch of tokens.

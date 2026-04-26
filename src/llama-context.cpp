@@ -1538,6 +1538,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return encode(batch_inp);
     }
 
+    // tree-mode batches are only supported for the Qwen3.5 hybrid architecture
+    if (batch_inp.parent_id != nullptr && model.arch != LLM_ARCH_QWEN35) {
+        LLAMA_LOG_ERROR("%s: parent_id (tree-mode batch) is only supported for LLM_ARCH_QWEN35, got arch=%d\n",
+                        __func__, (int) model.arch);
+        return -1;
+    }
+
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
