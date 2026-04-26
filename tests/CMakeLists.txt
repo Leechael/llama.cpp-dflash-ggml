@@ -298,3 +298,12 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# DDTree Phase 1 acceptance test.
+# Requires a 16+ GB Qwen3.5-27B GGUF not available in CI.
+# Enable manually: cmake -DLLAMA_BUILD_TESTS_QWEN35_TREE=ON ...
+option(LLAMA_BUILD_TESTS_QWEN35_TREE "Build DDTree tree-mode acceptance test (requires large GGUF)" OFF)
+if (LLAMA_BUILD_TESTS_QWEN35_TREE)
+    llama_build(test-qwen35-tree.cpp)
+    # Note: NOT registered with llama_test / add_test — must be run manually.
+endif()
