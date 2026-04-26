@@ -6,6 +6,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3322,6 +3323,31 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+// snapshot/restore for recurrent (SSM + conv) state
+
+llama_mem_snapshot_id llama_seq_snapshot(struct llama_context * ctx, llama_seq_id seq_id) {
+    auto * mem = dynamic_cast<llama_memory_recurrent *>(ctx->get_memory());
+    if (!mem) {
+        return LLAMA_MEM_SNAPSHOT_INVALID;
+    }
+    return mem->snapshot(seq_id);
+}
+
+bool llama_seq_restore(struct llama_context * ctx, llama_mem_snapshot_id snap_id) {
+    auto * mem = dynamic_cast<llama_memory_recurrent *>(ctx->get_memory());
+    if (!mem) {
+        return false;
+    }
+    return mem->restore(snap_id);
+}
+
+void llama_seq_release(struct llama_context * ctx, llama_mem_snapshot_id snap_id) {
+    auto * mem = dynamic_cast<llama_memory_recurrent *>(ctx->get_memory());
+    if (mem) {
+        mem->release(snap_id);
+    }
 }
 
 // llama state API

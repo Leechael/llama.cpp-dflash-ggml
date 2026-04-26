@@ -179,6 +179,14 @@ public:
 
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
+    // After a tree-verify forward fills KV slots [0..N), compact the accepted
+    // spine: copies K/V rows from accepted_dfs[0..commit_n) to slots [0..commit_n),
+    // then truncates the logical length of the cache to commit_n.
+    // Only operates on the stream assigned to seq_id.
+    void seq_compact_tree(llama_seq_id seq_id,
+                          const std::vector<int32_t> & accepted_dfs,
+                          int32_t commit_n);
+
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
     // return empty slot_info on failure

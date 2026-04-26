@@ -6,6 +6,7 @@
 
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <vector>
 
 //
@@ -59,6 +60,12 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
+
+    // snapshot/restore API for recurrent state (SSM + conv)
+    // snap_id < 0 indicates failure
+    llama_mem_snapshot_id snapshot(llama_seq_id seq_id);
+    bool                  restore (llama_mem_snapshot_id snap_id);
+    void                  release (llama_mem_snapshot_id snap_id);
 
     // state write/load
 
@@ -116,6 +123,20 @@ private:
 
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
+
+    // per-snapshot: the seq_id that was snapshotted, plus backup tensors for each layer
+    struct snapshot_entry {
+        llama_seq_id seq_id;
+        // backup tensors: one per layer, same type/shape as r_l[il] / s_l[il] for that seq cell
+        // r_backup[il] and s_backup[il] are null for filtered (null) layers
+        std::vector<ggml_tensor *> r_backup; // [n_layer]
+        std::vector<ggml_tensor *> s_backup; // [n_layer]
+        // ggml contexts and backend buffers that own the backup tensors
+        std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    };
+
+    llama_mem_snapshot_id next_snap_id = 0;
+    std::unordered_map<llama_mem_snapshot_id, snapshot_entry> snapshots;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
