@@ -428,6 +428,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * b,
         ggml_tensor * s,
         int           il) {
+    // dispatch to tree variant when parent_ids are available
+    if (parent_ids != nullptr) {
+        return build_delta_net_tree(q, k, v, g, b, s, parent_ids, il);
+    }
+
     const int64_t n_seq_tokens = q->ne[2];
 
     if (n_seq_tokens == 1) {
@@ -442,4 +447,38 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     }
 
     return build_delta_net_chunking(q, k, v, g, b, s, il);
+}
+
+std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_tree(
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * g,
+        ggml_tensor * b,
+        ggml_tensor * s,
+        ggml_tensor * par_ids,
+        int           il) {
+    const int64_t S_v      = v->ne[0];
+    const int64_t H_v      = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    // ggml_gated_delta_net_tree has the same packed output layout as ggml_gated_delta_net
+    ggml_tensor * result = ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, par_ids);
+    cb(result, "fgdn_tree", il);
+
+    ggml_tensor * output = ggml_view_4d(ctx0, result,
+            S_v, H_v, n_tokens, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
+
+    ggml_tensor * new_state = ggml_view_4d(ctx0, result,
+            S_v, S_v, H_v, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * S_v),
+            ggml_row_size(result->type, S_v * S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
+
+    return {output, new_state};
 }

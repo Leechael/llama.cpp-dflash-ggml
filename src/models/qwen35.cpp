@@ -18,6 +18,11 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
 
     cb(inpL, "model.input_embed", -1);
 
+    // build tree-mode inputs when parent_ids are present in the ubatch
+    if (ubatch.parent_id != nullptr) {
+        build_inp_tree();
+    }
+
     auto * inp = build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
@@ -178,6 +183,12 @@ ggml_tensor * llm_build_qwen35::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
+    // In tree mode, substitute tree_mask for the KV-cache attention mask.
+    // For Phase 1 (n_past=0) n_kv == n_tokens so shapes are compatible.
+    if (tree_mask != nullptr) {
+        inp->self_kq_mask_cnv = tree_mask;
+    }
+
     cur = build_attn(inp,
                 nullptr, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
@@ -280,7 +291,10 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    // use tree conv when parent_ids are set; identical output shape to ggml_ssm_conv
+    ggml_tensor * conv_output_proper = (parent_ids != nullptr)
+        ? ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, parent_ids)
+        : ggml_ssm_conv     (ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
