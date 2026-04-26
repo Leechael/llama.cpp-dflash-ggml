@@ -1621,12 +1621,13 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
 
-    // Tree-mode: write ancestor-only mask directly. Phase 1 assumes single
-    // stream and no past KV (n_kv == n_tokens), so cell index j corresponds
-    // to tree-batch token j.
+    // Tree-mode: write ancestor-only mask directly. Phase 1 assumes a single
+    // stream and no past KV, so KV slot j corresponds to tree-batch token j
+    // for j < n_tokens. n_kv may be padded above n_tokens; surplus columns
+    // stay -inf (treated as empty cells).
     if (ubatch->parent_id != nullptr) {
         GGML_ASSERT(n_stream == 1 && "tree-mode requires n_stream == 1 in Phase 1");
-        GGML_ASSERT(n_kv == (int64_t) n_tokens && "tree-mode Phase 1 expects n_kv == n_tokens (no past)");
+        GGML_ASSERT(n_kv >= (int64_t) n_tokens && "tree-mode Phase 1 expects n_kv >= n_tokens");
 
         std::fill(data, data + n_kv * n_tps, -INFINITY);
 
