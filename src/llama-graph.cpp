@@ -1855,9 +1855,14 @@ void llm_graph_context::build_inp_tree() const {
     ggml_set_input(inp->inp_tree_mask);
     ggml_set_name(inp->inp_tree_mask, "tree_mask");
 
+    // Cast to F16 for flash-attention; FA kernels assert mask->type == F16.
+    ggml_tensor * tree_mask_cnv = cparams.flash_attn
+        ? ggml_cast(ctx0, inp->inp_tree_mask, GGML_TYPE_F16)
+        : inp->inp_tree_mask;
+
     // expose to the graph context so model builders can use them directly
     const_cast<llm_graph_context *>(this)->parent_ids = inp->inp_parent_ids;
-    const_cast<llm_graph_context *>(this)->tree_mask  = inp->inp_tree_mask;
+    const_cast<llm_graph_context *>(this)->tree_mask  = tree_mask_cnv;
 
     res->add_input(std::move(inp));
 }
