@@ -731,6 +731,11 @@ llama_mem_snapshot_id llama_memory_recurrent::snapshot(llama_seq_id seq_id) {
     // copy current cell state into the backup tensors via a host bounce buffer.
     // ggml_backend_tensor_copy doesn't follow view_src->buffer, but tensor_get/set do.
     const int32_t cell_id = cells[seq_id].tail;
+    entry.cell_id = cell_id;
+    if (cell_id >= 0) {
+        entry.cell_pos = cells[cell_id].pos;
+        entry.cell_src = cells[cell_id].src;
+    }
     if (cell_id >= 0) {
         std::vector<uint8_t> bounce;
         for (int il = 0; il < n_layer; ++il) {
@@ -765,10 +770,15 @@ bool llama_memory_recurrent::restore(llama_mem_snapshot_id snap_id) {
 
     if (seq_id < 0 || (uint32_t) seq_id >= size) { return false; }
 
-    const int32_t cell_id = cells[seq_id].tail;
+    // restore the seq's tail to the cell that was snapshotted
+    const int32_t cell_id = entry.cell_id;
     if (cell_id < 0) {
-        return true; // no live cell — nothing to restore into
+        return true; // no live cell at snapshot time — nothing to restore
     }
+
+    cells[seq_id].tail = cell_id;
+    cells[cell_id].pos = entry.cell_pos;
+    cells[cell_id].src = entry.cell_src;
 
     const int32_t n_layer = (int32_t) r_l.size();
 

@@ -125,6 +125,7 @@ private:
     size_t size_s_bytes() const;
 
     // per-snapshot: the seq_id that was snapshotted, plus backup tensors for each layer
+    // and the cell metadata at snapshot time so restore can roll back the position counter.
     struct snapshot_entry {
         llama_seq_id seq_id;
         // backup tensors: one per layer, same type/shape as r_l[il] / s_l[il] for that seq cell
@@ -133,6 +134,10 @@ private:
         std::vector<ggml_tensor *> s_backup; // [n_layer]
         // ggml contexts and backend buffers that own the backup tensors
         std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+        // cell bookkeeping captured at snapshot time
+        int32_t   cell_id  = -1;
+        llama_pos cell_pos = -1;
+        int32_t   cell_src = -1;
     };
 
     llama_mem_snapshot_id next_snap_id = 0;
