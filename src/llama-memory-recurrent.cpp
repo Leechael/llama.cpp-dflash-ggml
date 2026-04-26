@@ -728,29 +728,26 @@ llama_mem_snapshot_id llama_memory_recurrent::snapshot(llama_seq_id seq_id) {
         entry.ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
-    // copy current cell state into the backup tensors using ggml_backend_tensor_copy via row views
+    // copy current cell state into the backup tensors via a host bounce buffer.
+    // ggml_backend_tensor_copy doesn't follow view_src->buffer, but tensor_get/set do.
     const int32_t cell_id = cells[seq_id].tail;
     if (cell_id >= 0) {
-        // allocate a small temp context just for creating non-owning views
-        ggml_init_params view_params = {
-            /*.mem_size   =*/ size_t(4u * n_layer * ggml_tensor_overhead()),
-            /*.mem_buffer =*/ NULL,
-            /*.no_alloc   =*/ true,
-        };
-        ggml_context_ptr view_ctx { ggml_init(view_params) };
-
+        std::vector<uint8_t> bounce;
         for (int il = 0; il < n_layer; ++il) {
             if (r_l[il] == nullptr) { continue; }
 
             const size_t r_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
             const size_t s_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
 
-            // view into the main tensor at the cell_id row (shape matches backup tensor)
-            ggml_tensor * r_view = ggml_view_1d(view_ctx.get(), r_l[il], hparams.n_embd_r(), (size_t) cell_id * r_row);
-            ggml_tensor * s_view = ggml_view_1d(view_ctx.get(), s_l[il], hparams.n_embd_s(), (size_t) cell_id * s_row);
+            if (bounce.size() < std::max(r_row, s_row)) {
+                bounce.resize(std::max(r_row, s_row));
+            }
 
-            ggml_backend_tensor_copy(r_view, entry.r_backup[il]);
-            ggml_backend_tensor_copy(s_view, entry.s_backup[il]);
+            ggml_backend_tensor_get(r_l[il], bounce.data(), (size_t) cell_id * r_row, r_row);
+            ggml_backend_tensor_set(entry.r_backup[il], bounce.data(), 0, r_row);
+
+            ggml_backend_tensor_get(s_l[il], bounce.data(), (size_t) cell_id * s_row, s_row);
+            ggml_backend_tensor_set(entry.s_backup[il], bounce.data(), 0, s_row);
         }
     }
 
@@ -775,14 +772,7 @@ bool llama_memory_recurrent::restore(llama_mem_snapshot_id snap_id) {
 
     const int32_t n_layer = (int32_t) r_l.size();
 
-    // create a temp context for row views into the main tensors
-    ggml_init_params view_params = {
-        /*.mem_size   =*/ size_t(4u * n_layer * ggml_tensor_overhead()),
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context_ptr view_ctx { ggml_init(view_params) };
-
+    std::vector<uint8_t> bounce;
     for (int il = 0; il < n_layer; ++il) {
         if (r_l[il] == nullptr) { continue; }
         if (entry.r_backup[il] == nullptr) { continue; }
@@ -790,12 +780,15 @@ bool llama_memory_recurrent::restore(llama_mem_snapshot_id snap_id) {
         const size_t r_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
         const size_t s_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
 
-        // view into the main tensor at the cell_id row, copy backup back in
-        ggml_tensor * r_view = ggml_view_1d(view_ctx.get(), r_l[il], hparams.n_embd_r(), (size_t) cell_id * r_row);
-        ggml_tensor * s_view = ggml_view_1d(view_ctx.get(), s_l[il], hparams.n_embd_s(), (size_t) cell_id * s_row);
+        if (bounce.size() < std::max(r_row, s_row)) {
+            bounce.resize(std::max(r_row, s_row));
+        }
 
-        ggml_backend_tensor_copy(entry.r_backup[il], r_view);
-        ggml_backend_tensor_copy(entry.s_backup[il], s_view);
+        ggml_backend_tensor_get(entry.r_backup[il], bounce.data(), 0, r_row);
+        ggml_backend_tensor_set(r_l[il], bounce.data(), (size_t) cell_id * r_row, r_row);
+
+        ggml_backend_tensor_get(entry.s_backup[il], bounce.data(), 0, s_row);
+        ggml_backend_tensor_set(s_l[il], bounce.data(), (size_t) cell_id * s_row, s_row);
     }
 
     return true;
