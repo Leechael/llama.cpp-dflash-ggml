@@ -227,7 +227,7 @@ int main(int argc, char ** argv) {
         // The first token for both runs is the argmax of the prompt's last
         // position logits, captured now so both runs start identically.
         // ------------------------------------------------------------------
-        const float * prompt_logits = llama_get_logits_ith(ctx, 0);
+        const float * prompt_logits = llama_get_logits_ith(ctx, n_prompt - 1);
         llama_token tok_first = argmax(prompt_logits, vocab_size);
         LOG_INF("first token after prompt: %d\n", (int)tok_first);
 
