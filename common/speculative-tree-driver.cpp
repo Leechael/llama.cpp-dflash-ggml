@@ -10,10 +10,16 @@
 //     row l*n_embd .. (l+1)*n_embd - 1 = layer l's hidden across ctx_len positions.
 //   This matches what dflash-draft.cpp's fc projection expects.
 //
-// SSM rollback strategy (first-cut, see comment at step 9):
-//   snapshot the recurrent state BEFORE target verify, restore on accept_depth < tree_depth.
-//   After restoring, replay accepted tokens through chain-mode decode to re-advance SSM state.
-//   This is slower than per-layer rollback in the reference but correct.
+// SSM rollback strategy (Phase 2.4):
+//   After tree verify, call llama_dflash_rollback_ssm_to_dfs() which copies the SSM state
+//   captured at the deepest accepted DFS node from the per-layer persist buffers (written by
+//   ggml_gated_delta_net_tree_persist during the tree forward) back into the live cache.
+//   This is O(1) per layer and requires no chain-replay decode.
+//
+// KNOWN LIMITATION (Task 4, option b): conv state is NOT rolled back. The conv state reflects
+//   the last DFS token processed rather than the deepest accepted node. The divergence decays
+//   within K_conv (~4) tokens; the chain-vs-spec test may see a few divergent tokens at each
+//   tree boundary before reconverging. This is a known Phase 2.4 limitation; see roadmap §6.1.
 
 #include "speculative-tree-driver.h"
 #include "speculative-tree.h"
@@ -311,12 +317,10 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
 
     const int N = (int)tree.nodes.size(); // includes root node at index 0
 
-    // ── Step 6: snapshot SSM state before target verify ───────────────────────
-    // For the first-cut Phase 4 implementation we snapshot before the tree forward
-    // and restore if the accepted path doesn't reach the full tree depth.
-    // This is slower than per-layer rollback from intermediate captures but is
-    // correct and avoids depending on SSM intermediate state capture APIs.
-    llama_mem_snapshot_id snap_id = llama_seq_snapshot(d->target_ctx, 0);
+    // ── Step 6: (Phase 2.4) no snapshot needed before target verify ──────────
+    // The tree forward writes per-layer SSM intermediate states to persist buffers
+    // (ggml_gated_delta_net_tree_persist); rollback after accept reads directly from
+    // those buffers instead of restoring a pre-verify snapshot and replaying.
 
     // ── Step 7: target verify (tree-mode forward) ─────────────────────────────
     // Build a tree batch of N tokens and run target decode.
@@ -335,9 +339,6 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
         llama_batch_free(tree_batch);
         if (ret != 0) {
             LOG_ERR("%s: target tree llama_decode failed: %d\n", __func__, ret);
-            if (snap_id != LLAMA_MEM_SNAPSHOT_INVALID) {
-                llama_seq_release(d->target_ctx, snap_id);
-            }
             return {};
         }
     }
@@ -348,9 +349,6 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
         const float * row = llama_get_logits_ith(d->target_ctx, i);
         if (!row) {
             LOG_ERR("%s: target logits[%d] unavailable\n", __func__, i);
-            if (snap_id != LLAMA_MEM_SNAPSHOT_INVALID) {
-                llama_seq_release(d->target_ctx, snap_id);
-            }
             return {};
         }
         int32_t best = 0;
@@ -373,49 +371,30 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     // We keep only the accepted_dfs columns and append them to the ring.
     driver_ingest_capture(d, accepted_dfs.data(), (int32_t)commit_n);
 
-    // ── Step 9: compact KV cache and rollback recurrent state ─────────────────
+    // ── Step 9: compact KV cache and rollback SSM state via persist buffers ───
     // KV compaction: copies K/V rows from accepted_dfs[0..commit_n) to spine [0..commit_n).
     // This is a no-op on pure SSM models.
     llama_kv_cache_seq_compact_tree(d->target_ctx, 0,
                                     accepted_dfs.data(), (int32_t)accept_depth,
                                     (int32_t)commit_n);
 
-    // Recurrent state rollback: two cases.
-    //   (a) accept_depth == N (full tree accepted): SSM state is already correct.
-    //   (b) accept_depth <  N: we snapped before verify, restore and replay.
-    //
-    // Trade-off vs reference: the reference uses per-layer intermediate captures
-    // (ssm_intermediate_states) written during the tree forward to roll back to
-    // exactly the accepted DFS node in O(1) per layer. Here we restore to the
-    // pre-verify snapshot and replay the accepted tokens through chain-mode decode.
-    // This adds ~accept_depth sequential target decodes per step, which is expensive
-    // but correct. A future optimisation can add per-layer intermediate capture APIs.
-    if (snap_id != LLAMA_MEM_SNAPSHOT_INVALID) {
-        if (accept_depth < N) {
-            // Restore SSM to pre-verify state then replay accepted path.
-            bool ok = llama_seq_restore(d->target_ctx, snap_id);
-            if (!ok) {
-                LOG_WRN("%s: seq_restore failed; SSM state may be stale\n", __func__);
-            }
-            // Replay: chain-decode root + accepted children (skip root which is already committed).
-            for (int i = 1; i < commit_n; ++i) {
-                llama_batch replay_batch = llama_batch_init(1, 0, 1);
-                replay_batch.n_tokens    = 1;
-                replay_batch.token[0]    = tree.nodes[accepted_dfs[i]].token_id;
-                replay_batch.pos[0]      = committed_pos + tree.nodes[accepted_dfs[i]].depth;
-                replay_batch.n_seq_id[0] = 1;
-                replay_batch.seq_id[0][0] = 0;
-                replay_batch.logits[0]   = 0; // don't need logits from replay
-                int ret = llama_decode(d->target_ctx, replay_batch);
-                llama_batch_free(replay_batch);
-                if (ret != 0) {
-                    LOG_WRN("%s: SSM replay decode failed at step %d\n", __func__, i);
-                    break;
-                }
-            }
+    // SSM rollback (Phase 2.4): copy the SSM state from the persist buffer column at the
+    // deepest accepted DFS node back into the live recurrent cache for seq_id=0.
+    // This is always needed: the tree forward leaves SSM at tree[N-1] (last DFS node),
+    // but we need it at accepted_dfs[commit_n-1] (deepest accepted node).
+    // accept_depth == N is not a special case — we still rollback to the correct node.
+    {
+        const int32_t rollback_node = (commit_n > 0) ? accepted_dfs[commit_n - 1] : 0;
+        bool ok = llama_dflash_rollback_ssm_to_dfs(d->target_ctx, /*seq_id=*/0, rollback_node);
+        if (!ok) {
+            LOG_WRN("%s: llama_dflash_rollback_ssm_to_dfs failed (persist buffers may be unallocated)\n",
+                    __func__);
         }
-        llama_seq_release(d->target_ctx, snap_id);
     }
+    // NOTE: conv state is NOT rolled back here (Phase 2.4 Task 4, option b).
+    // The conv state holds the window for the last DFS-processed token instead of the
+    // deepest accepted node. Divergence is bounded by K_conv (~4 tokens) and decays
+    // naturally. A future phase can add ggml_ssm_conv_tree_persist to fix this exactly.
 
     // ── Step 10: assemble output ──────────────────────────────────────────────
     // accepted[0] = root_token (always, the input token echoed back).

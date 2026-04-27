@@ -428,9 +428,15 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * b,
         ggml_tensor * s,
         int           il) {
-    // dispatch to tree variant when parent_ids are available; persist_inter is null until wired in 2.4
+    // dispatch to tree variant when parent_ids are available
     if (parent_ids != nullptr) {
-        return build_delta_net_tree(q, k, v, g, b, s, parent_ids, nullptr, il);
+        // Phase 2.4: fetch per-layer persist buffer from graph context if allocated
+        ggml_tensor * persist_inter = nullptr;
+        if (dflash_persist_inter_l != nullptr && il >= 0 &&
+                il < (int32_t)dflash_persist_inter_l->size()) {
+            persist_inter = (*dflash_persist_inter_l)[il];
+        }
+        return build_delta_net_tree(q, k, v, g, b, s, parent_ids, persist_inter, il);
     }
 
     const int64_t n_seq_tokens = q->ne[2];

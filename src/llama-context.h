@@ -109,6 +109,12 @@ struct llama_context {
     void          set_capture_hidden(bool enable);
     ggml_tensor * get_hidden_capture() const;
 
+    // dflash Phase 2.4: persist-based SSM rollback.
+    // Copies the SSM state stored in dflash_persist_inter_l[il] at DFS column
+    // accepted_dfs_node back into the live s_l[il] tensor at the seq's tail cell.
+    // Returns false if the context has no recurrent memory or buffers are unallocated.
+    bool dflash_rollback_ssm_to_dfs(llama_seq_id seq_id, int32_t accepted_dfs_node);
+
     // Host-side accessor: returns pointer into hidden_capture_host (always CPU).
     // Returns nullptr if capture is disabled or no decode has run.
     const float * get_hidden_capture_data(int64_t * out_ne0, int64_t * out_ne1) const;
@@ -358,6 +364,23 @@ private:
     // dflash hidden capture: when true, qwen35 forward writes captured hidden states
     // into a graph output tensor; accessible via get_hidden_capture() after decode.
     bool capture_hidden = false;
+
+    // dflash Phase 2.4: per-layer SSM intermediate-state persist buffers.
+    // Allocated on first tree-mode decode; one tensor per delta-net layer (nullptr for
+    // full-attn layers). Shape: [S_v, S_v, H_v, n_tokens] F16, contiguous.
+    // After tree verify, llama_dflash_rollback_ssm_to_dfs() copies column[accepted_dfs_node]
+    // back into the live SSM state, replacing the snapshot/restore/replay path.
+    std::vector<ggml_tensor *>  dflash_persist_inter_l;   // [n_layer], nullptr for non-recurrent
+    ggml_context_ptr            dflash_persist_inter_ctx;  // ggml context owning the tensors
+    ggml_backend_buffer_ptr     dflash_persist_inter_buf;  // backend buffer owning the data
+    int64_t                     dflash_persist_max_n_tokens = 0; // current capacity
+
+    // Ensure the persist buffers can hold n_tokens columns; reallocates if needed.
+    void ensure_dflash_persist_capacity(int64_t n_tokens);
+
+    // Returns the per-layer persist tensor for layer il, or nullptr if not a recurrent
+    // layer or the buffers have not yet been allocated (non-tree-mode decode).
+    ggml_tensor * dflash_get_persist_inter(int32_t il) const;
 
     // host-side mirror of t_hidden_capture, populated via ggml_backend_tensor_get_async
     // after each decode. get_hidden_capture_data() returns into this buffer so callers
