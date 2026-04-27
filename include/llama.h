@@ -810,17 +810,17 @@ extern "C" {
     LLAMA_API void                  llama_seq_release (struct llama_context * ctx, llama_mem_snapshot_id snap_id);
 
     // Compact the KV cache after a tree-verify forward pass.
-    // Copies K/V rows accepted_dfs[0..commit_n) to spine slots [0..commit_n),
-    // then truncates the logical cache length to commit_n.
+    // The tree was placed at slots [spine_start, spine_start+N); after this call
+    // the accepted spine occupies slots [spine_start, spine_start+commit_n) in
+    // DFS order, and prompt cells (slots < spine_start) are untouched.
     // No-op on non-KV memory types (e.g. pure SSM models).
-    // Only safe to call immediately after a tree-batch llama_decode() while the
-    // KV slots [0..N) still hold the unsorted tree verification results.
     LLAMA_API void llama_kv_cache_seq_compact_tree(
             struct llama_context * ctx,
             llama_seq_id           seq_id,
             const int32_t        * accepted_dfs,
             int32_t                n_accepted,
-            int32_t                commit_n);
+            int32_t                commit_n,
+            int32_t                spine_start);
 
     //
     // State / sessions
