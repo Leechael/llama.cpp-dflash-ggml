@@ -92,6 +92,8 @@ add_library(${TARGET} STATIC
     speculative.h
     speculative-tree.cpp
     speculative-tree.h
+    speculative-tree-driver.cpp
+    speculative-tree-driver.h
     unicode.cpp
     unicode.h
     jinja/lexer.cpp

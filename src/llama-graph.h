@@ -524,6 +524,38 @@ public:
     ggml_tensor * inp_parent_ids = nullptr; // I32 [n_tokens]
 };
 
+// Graph input class for the dflash draft model's target_feat_raw, pos_q, and pos_k tensors.
+// The host side stashes the data via llama_set_target_feat_raw() before calling llama_decode()
+// on the draft context. set_input() memcpy's the stashed data into the GGML input tensors.
+class llm_graph_input_target_feat : public llm_graph_input_i {
+public:
+    // host_data, n_embd_fc, ctx_len are non-owning; they point into llama_context's pending fields.
+    // committed_pos is the number of tokens already committed before this draft step.
+    llm_graph_input_target_feat(
+            const float ** host_data_ptr,   // pointer to context's pending_target_feat_raw field
+            const int64_t * n_embd_fc_ptr,  // pointer to context's pending_target_feat_n_embd_fc
+            const int64_t * ctx_len_ptr,    // pointer to context's pending_target_feat_ctx_len
+            const int64_t * committed_pos_ptr) // pointer to context's pending_draft_committed_pos
+        : host_data_ptr(host_data_ptr), n_embd_fc_ptr(n_embd_fc_ptr),
+          ctx_len_ptr(ctx_len_ptr), committed_pos_ptr(committed_pos_ptr) {}
+    virtual ~llm_graph_input_target_feat() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    // [5*n_embd, ctx_len] F32 — stacked hidden captures from target layers
+    ggml_tensor * inp_target_feat_raw = nullptr;
+    // [block_size] I32 — Q positions: [committed_pos .. committed_pos + block_size)
+    ggml_tensor * inp_pos_q = nullptr;
+    // [ctx_len + block_size] I32 — K positions: [0 .. ctx_len + block_size)
+    ggml_tensor * inp_pos_k = nullptr;
+
+private:
+    const float ** host_data_ptr;
+    const int64_t * n_embd_fc_ptr;
+    const int64_t * ctx_len_ptr;
+    const int64_t * committed_pos_ptr;
+};
+
 //
 // llm_graph_result
 //
@@ -583,6 +615,14 @@ struct llm_graph_params {
     // If true, qwen35 forward writes hidden states at dflash_target_capture_layers
     // into t_hidden_capture on the result. No-op (zero overhead) when false.
     bool capture_hidden = false;
+
+    // dflash draft target_feat injection (Task 1).
+    // Non-owning pointers into llama_context's pending_target_feat fields.
+    // Non-null only when running the dflash-draft graph; graph inputs use them in set_input().
+    const float ** pending_target_feat_raw_ptr      = nullptr;
+    const int64_t * pending_target_feat_n_embd_fc_ptr = nullptr;
+    const int64_t * pending_target_feat_ctx_len_ptr   = nullptr;
+    const int64_t * pending_draft_committed_pos_ptr   = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -782,6 +822,13 @@ struct llm_graph_context {
     // dflash hidden capture: propagated from llm_graph_params::capture_hidden
     const bool capture_hidden;
 
+    // dflash draft target_feat injection: propagated from llm_graph_params.
+    // Non-owning; valid only for the dflash-draft graph builder.
+    const float ** pending_target_feat_raw_ptr;
+    const int64_t * pending_target_feat_n_embd_fc_ptr;
+    const int64_t * pending_target_feat_ctx_len_ptr;
+    const int64_t * pending_draft_committed_pos_ptr;
+
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
@@ -900,6 +947,11 @@ struct llm_graph_context {
     ggml_tensor * build_inp_cross_embd() const;
     ggml_tensor * build_inp_pos_bucket_enc() const;
     ggml_tensor * build_inp_pos_bucket_dec() const;
+
+    // Build input tensors for the dflash draft model (target_feat_raw, pos_q, pos_k).
+    // Returns the target_feat_raw tensor (already registered as graph input).
+    // pos_q and pos_k are accessible via the returned llm_graph_input_target_feat*.
+    llm_graph_input_target_feat * build_inp_target_feat(int64_t n_embd_fc, int64_t ctx_len) const;
     ggml_tensor * build_pos_bias(ggml_tensor * pos_bucket, ggml_tensor * attn_rel_b) const;
 
     //

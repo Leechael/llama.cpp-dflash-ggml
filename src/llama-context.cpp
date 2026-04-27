@@ -6,6 +6,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 #include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
@@ -1079,6 +1080,15 @@ const float * llama_context::get_hidden_capture_data(int64_t * out_ne0, int64_t 
     if (out_ne0) *out_ne0 = hidden_capture_ne0;
     if (out_ne1) *out_ne1 = hidden_capture_ne1;
     return hidden_capture_host.data();
+}
+
+void llama_context::set_target_feat_raw(const float * data, int64_t n_embd_fc, int64_t ctx_len,
+                                        int64_t committed_pos) {
+    // Stash non-owning pointer and dims; read by llm_graph_input_target_feat::set_input().
+    pending_target_feat_raw       = data;
+    pending_target_feat_n_embd_fc = n_embd_fc;
+    pending_target_feat_ctx_len   = ctx_len;
+    pending_draft_committed_pos   = committed_pos;
 }
 
 void llama_context::set_warmup(bool value) {
@@ -2235,6 +2245,12 @@ llm_graph_params llama_context::graph_params(
         /*.cb             =*/ graph_get_cb(),
         /*.res            =*/ res,
         /*.capture_hidden =*/ capture_hidden,
+        // Wire pending_target_feat pointers so build_inp_target_feat() can read them.
+        // These are non-null only when the caller invoked llama_set_target_feat_raw().
+        /*.pending_target_feat_raw_ptr       =*/ &pending_target_feat_raw,
+        /*.pending_target_feat_n_embd_fc_ptr =*/ &pending_target_feat_n_embd_fc,
+        /*.pending_target_feat_ctx_len_ptr   =*/ &pending_target_feat_ctx_len,
+        /*.pending_draft_committed_pos_ptr   =*/ &pending_draft_committed_pos,
     };
 }
 
@@ -3166,6 +3182,14 @@ const float * llama_get_hidden_capture_data(llama_context * ctx, int64_t * out_n
     return ctx->get_hidden_capture_data(out_ne0, out_ne1);
 }
 
+void llama_set_target_feat_raw(llama_context * ctx,
+                               const float   * data,
+                               int64_t         n_embd_fc,
+                               int64_t         ctx_len,
+                               int64_t         committed_pos) {
+    ctx->set_target_feat_raw(data, n_embd_fc, ctx_len, committed_pos);
+}
+
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
 }
@@ -3441,6 +3465,27 @@ void llama_seq_release(struct llama_context * ctx, llama_mem_snapshot_id snap_id
     if (mem) {
         mem->release(snap_id);
     }
+}
+
+void llama_kv_cache_seq_compact_tree(
+        struct llama_context * ctx,
+        llama_seq_id           seq_id,
+        const int32_t        * accepted_dfs,
+        int32_t                n_accepted,
+        int32_t                commit_n) {
+    auto * raw_mem = ctx->get_memory();
+    llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(raw_mem);
+    if (!kv) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(raw_mem)) {
+            kv = hyb->get_mem_attn();
+        }
+    }
+    if (!kv) {
+        // non-KV memory (pure SSM) — no cache compaction needed
+        return;
+    }
+    std::vector<int32_t> dfs_vec(accepted_dfs, accepted_dfs + n_accepted);
+    kv->seq_compact_tree(seq_id, dfs_vec, commit_n);
 }
 
 // llama state API

@@ -14,7 +14,8 @@
 //   3. out_norm + shared lm_head → logits [vocab, block_size]
 
 #include "models.h"
-#include "llama-impl.h"  // LLAMA_TENSOR_NAME_FATTN
+#include "llama-impl.h"   // LLAMA_TENSOR_NAME_FATTN
+#include "llama-graph.h"  // llm_graph_input_target_feat, build_inp_target_feat
 
 llm_build_dflash_draft::llm_build_dflash_draft(
         const llama_model  & model,
@@ -38,18 +39,21 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     ggml_set_name(noise_embed, "dflash_noise_embed");
     ggml_set_input(noise_embed);
 
-    // target_feat_raw: [5*n_embd, ctx_len] packed hidden captures from target.
-    // We represent ctx_len as a second batch dimension via a 2D tensor.
-    // For Phase 3, the host uploads this for each draft step.
-    // The tensor ne[1] is the number of context tokens captured from the target.
-    // We store it as a separate graph input and split via view inside the graph.
+    // target_feat_raw / pos_q / pos_k: registered as graph inputs via build_inp_target_feat.
+    // The host stashes data with llama_set_target_feat_raw() before llama_decode(); the
+    // graph input class copies it into these GGML tensors at set_input() time.
     //
-    // Use GGML_TYPE_F32 to avoid FA mask type issues.
-    // ctx_len comes from ubatch metadata; for Phase 3 we fix it to n_ctx.
-    const int64_t ctx_len = n_ctx; // will be overridden by actual context at runtime
-    ggml_tensor * target_feat_raw = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_fc, ctx_len);
-    ggml_set_name(target_feat_raw, "dflash_target_feat_raw");
-    ggml_set_input(target_feat_raw);
+    // ctx_len is read directly from the pending context length stashed by the driver before
+    // llama_decode(). At reservation time (graph preheating), the pointer may be null/zero,
+    // in which case we fall back to n_ctx as the worst-case upper bound.
+    const int64_t ctx_len = (pending_target_feat_ctx_len_ptr && *pending_target_feat_ctx_len_ptr > 0)
+                            ? *pending_target_feat_ctx_len_ptr
+                            : n_ctx;
+    llm_graph_input_target_feat * inp_tf = build_inp_target_feat(n_embd_fc, ctx_len);
+
+    ggml_tensor * target_feat_raw = inp_tf->inp_target_feat_raw;
+    ggml_tensor * pos_q           = inp_tf->inp_pos_q;
+    ggml_tensor * pos_k           = inp_tf->inp_pos_k;
 
     // ── Step 1: feature fusion ────────────────────────────────────────────────
     // target_feat = rms_norm(fc @ target_feat_raw, hidden_norm)
@@ -64,19 +68,11 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     cb(target_feat, "dflash_target_feat", -1);
 
     // ── Step 2: position tensors ──────────────────────────────────────────────
-    // Q positions: [ctx_len .. ctx_len + block_size - 1]  (noise tokens follow context)
-    // K positions: [0 .. ctx_len + block_size - 1]        (context then noise)
-    //
-    // For Phase 3, we create constant position tensors.
-    // In Phase 4 these will be driven by the actual KV fill position.
-    ggml_tensor * pos_q = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);  // n_tokens == block_size
-    ggml_set_name(pos_q, "dflash_pos_q");
-    ggml_set_input(pos_q);
-
+    // Q positions: [committed_pos .. committed_pos + block_size)
+    // K positions: [0 .. ctx_len + block_size)
+    // Both tensors were created and registered by build_inp_target_feat() above.
+    // set_input() fills them from pending_draft_committed_pos before each decode.
     const int64_t total_k = ctx_len + n_tokens;
-    ggml_tensor * pos_k = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, total_k);
-    ggml_set_name(pos_k, "dflash_pos_k");
-    ggml_set_input(pos_k);
 
     // ── Step 3: 5-layer decoder ───────────────────────────────────────────────
     ggml_tensor * h = noise_embed; // [n_embd, block_size]
