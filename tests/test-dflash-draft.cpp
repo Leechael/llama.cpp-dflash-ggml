@@ -196,12 +196,20 @@ int main(int argc, char ** argv) {
         }
 
         // out_embd: [DRAFT_BATCH_SIZE * embd_dim] floats
+        // Public API is one token per call; loop over the batch.
         std::vector<float> token_embd((size_t)DRAFT_BATCH_SIZE * embd_dim, 0.0f);
-        llama_model_token_embd_lookup(target_model,
-                                      batch_tokens.data(),
-                                      DRAFT_BATCH_SIZE,
-                                      token_embd.data(),
-                                      embd_dim);
+        for (int i = 0; i < DRAFT_BATCH_SIZE; ++i) {
+            const int rc = llama_model_token_embd_lookup(
+                target_model,
+                batch_tokens[i],
+                token_embd.data() + (size_t)i * embd_dim,
+                embd_dim);
+            if (rc != 0) {
+                throw std::runtime_error(
+                    "llama_model_token_embd_lookup failed for token " +
+                    std::to_string(batch_tokens[i]));
+            }
+        }
         LOG_INF("token_embd lookup done (%d tokens x %d dim)\n", DRAFT_BATCH_SIZE, embd_dim);
 
         // ------------------------------------------------------------------

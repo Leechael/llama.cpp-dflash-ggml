@@ -150,9 +150,9 @@ static std::vector<float> decode_chain(llama_context * ctx,
     return logits;
 }
 
-// Clear context KV cache between the two decode runs.
+// Clear context memory (KV cache + recurrent state) between the two decode runs.
 static void clear_kv(llama_context * ctx) {
-    llama_kv_self_clear(ctx);
+    llama_memory_clear(llama_get_memory(ctx), /*data=*/true);
 }
 
 // ---------------------------------------------------------------------------
