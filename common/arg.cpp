@@ -601,6 +601,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --model is required\n");
     }
 
+    // DDTree mode requires a draft model
+    if (params.speculative.ddtree_mode && !params.speculative.has_dft()) {
+        throw std::invalid_argument("error: --speculative-mode ddtree requires -md/--model-draft\n");
+    }
+
     if (params.escape) {
         string_process_escapes(params.prompt);
         string_process_escapes(params.input_prefix);
@@ -3552,6 +3557,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("ngram min hits must be at least 1");
             }
             params.speculative.ngram_min_hits = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--speculative-mode"}, "[chain|ddtree]",
+        "speculative decoding mode: 'chain' = standard draft-model chain (default), "
+        "'ddtree' = DDTree dflash-draft speculative decoding (requires -md)",
+        [](common_params & params, const std::string & value) {
+            if (value == "chain") {
+                params.speculative.ddtree_mode = false;
+            } else if (value == "ddtree") {
+                params.speculative.ddtree_mode = true;
+            } else {
+                throw std::invalid_argument("--speculative-mode must be 'chain' or 'ddtree'");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPECULATIVE_MODE"));
+    add_opt(common_arg(
+        {"--ddtree-budget"}, "N",
+        string_format("DDTree: total tree node budget per spec step (default: %d)", params.speculative.ddtree_budget),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("--ddtree-budget must be >= 1");
+            }
+            params.speculative.ddtree_budget = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DDTREE_BUDGET"));
+    add_opt(common_arg(
+        {"--ddtree-temp"}, "F",
+        string_format("DDTree: temperature for draft log-prob extraction (default: %.1f)", (double)params.speculative.ddtree_temp),
+        [](common_params & params, const std::string & value) {
+            params.speculative.ddtree_temp = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DDTREE_TEMP"));
+    add_opt(common_arg(
+        {"--ddtree-no-chain-seed"},
+        "DDTree: disable chain-seed greedy initialization (enabled by default)",
+        [](common_params & params) {
+            params.speculative.ddtree_chain_seed = false;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
