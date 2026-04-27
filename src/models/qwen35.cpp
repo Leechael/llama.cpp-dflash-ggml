@@ -327,8 +327,15 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    // use tree conv when parent_ids are set; identical output shape to ggml_ssm_conv
-    ggml_tensor * conv_output_proper = (parent_ids != nullptr)
+    // use tree conv when parent_ids are set; identical output shape to ggml_ssm_conv.
+    // LLAMA_DDTREE_FORCE_CHAIN_KERNEL=1 forces the chain kernel even with parent_ids;
+    // diagnostic only (sibling/cousin tokens become wrong, root stays equivalent).
+    static const bool s_ddtree_force_chain_kernel = []{
+        const char * e = getenv("LLAMA_DDTREE_FORCE_CHAIN_KERNEL");
+        return e && e[0] == '1';
+    }();
+    const bool use_tree_kernel = (parent_ids != nullptr) && !s_ddtree_force_chain_kernel;
+    ggml_tensor * conv_output_proper = use_tree_kernel
         ? ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, parent_ids)
         : ggml_ssm_conv     (ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
