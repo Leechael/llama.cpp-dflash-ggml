@@ -40,6 +40,7 @@ static void usage(const char * prog) {
         "  --prompt-text STR        (alternative to --prompt-tokens; tokenized in-process)\n"
         "  --prompt-text-file PATH  (alternative to --prompt-text; UTF-8 text file)\n"
         "  --out-summary PATH       (text summary; required)\n"
+        "  --n-siblings N           (extra sibling nodes at depth 1; default 0)\n"
         "  --n-gpu-layers N         (default 99)\n"
         "  --n-ctx N                (default 4096)\n",
         prog);
@@ -100,7 +101,8 @@ static std::vector<float> run_chain_capture_last(llama_model * model,
 
 static std::vector<float> run_chain_then_tree_root(llama_model * model,
                                                    const llama_context_params & cparams,
-                                                   const std::vector<int32_t> & tokens) {
+                                                   const std::vector<int32_t> & tokens,
+                                                   int n_siblings) {
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
         throw std::runtime_error("failed to create tree-root context");
@@ -131,15 +133,26 @@ static std::vector<float> run_chain_then_tree_root(llama_model * model,
         llama_batch_free(batch);
     }
 
-    // tree batch with one node { token = tokens[N-1], parent = -1, pos = N-1 }
-    llama_batch tbatch = llama_batch_init_tree(/*n_tokens=*/1, /*embd=*/0, /*n_seq_max=*/1);
+    // tree batch: root at index 0 + n_siblings nodes at depth 1 (parent = root)
+    const int n_nodes = 1 + n_siblings;
+    llama_batch tbatch = llama_batch_init_tree(/*n_tokens=*/n_nodes, /*embd=*/0, /*n_seq_max=*/1);
+    // root
     tbatch.token[0]     = (llama_token)tokens[n_prefix];
     tbatch.pos[0]       = n_prefix;
     tbatch.n_seq_id[0]  = 1;
     tbatch.seq_id[0][0] = 0;
-    tbatch.parent_id[0] = -1; // root
+    tbatch.parent_id[0] = -1;
     tbatch.logits[0]    = 1;
-    tbatch.n_tokens     = 1;
+    // siblings: identical token, depth 1, parent = root (flat index 0)
+    for (int i = 1; i < n_nodes; ++i) {
+        tbatch.token[i]     = (llama_token)tokens[n_prefix];
+        tbatch.pos[i]       = n_prefix + 1;
+        tbatch.n_seq_id[i]  = 1;
+        tbatch.seq_id[i][0] = 0;
+        tbatch.parent_id[i] = 0;
+        tbatch.logits[i]    = 0;
+    }
+    tbatch.n_tokens = n_nodes;
 
     if (llama_decode(ctx, tbatch) != 0) {
         llama_batch_free(tbatch);
@@ -229,6 +242,7 @@ int main(int argc, char ** argv) {
     std::string out_summary;
     int32_t n_gpu_layers = 99;
     int32_t n_ctx        = 4096;
+    int32_t n_siblings   = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -237,6 +251,7 @@ int main(int argc, char ** argv) {
         else if (arg == "--prompt-text"      && i + 1 < argc) prompt_text        = argv[++i];
         else if (arg == "--prompt-text-file" && i + 1 < argc) prompt_text_file   = argv[++i];
         else if (arg == "--out-summary"      && i + 1 < argc) out_summary        = argv[++i];
+        else if (arg == "--n-siblings"       && i + 1 < argc) n_siblings         = std::atoi(argv[++i]);
         else if (arg == "--n-gpu-layers"     && i + 1 < argc) n_gpu_layers       = std::atoi(argv[++i]);
         else if (arg == "--n-ctx"            && i + 1 < argc) n_ctx              = std::atoi(argv[++i]);
         else if (arg == "-h" || arg == "--help") { usage(argv[0]); return 0; }
@@ -284,13 +299,14 @@ int main(int argc, char ** argv) {
         LOG_INF("loaded %zu tokens; running chain pass...\n", tokens.size());
         std::vector<float> A = run_chain_capture_last(model, cparams, tokens);
 
-        LOG_INF("running chain-prefill + tree-root pass...\n");
-        std::vector<float> B = run_chain_then_tree_root(model, cparams, tokens);
+        LOG_INF("running chain-prefill + tree-root pass (n_siblings=%d)...\n", n_siblings);
+        std::vector<float> B = run_chain_then_tree_root(model, cparams, tokens, n_siblings);
 
         DiffStats s = diff_logits(A, B);
 
         std::ofstream f(out_summary);
         f << "n_tokens=" << tokens.size() << "\n";
+        f << "n_siblings=" << n_siblings << "\n";
         f << "vocab_size=" << A.size() << "\n";
         f << "max_abs_diff=" << s.max_abs_diff << "\n";
         f << "mean_abs_diff=" << s.mean_abs_diff << "\n";
