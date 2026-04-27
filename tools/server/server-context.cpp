@@ -2777,20 +2777,26 @@ private:
         }
 
         if (batch.n_tokens == 0) {
-            // DDTree slots don't put tokens in the main batch (driver handles its own decodes).
-            // Check if any DDTree slot is actively generating before counting as empty.
-            bool has_ddtree_generating = false;
+            // DDTree slots don't put tokens in the main batch (the driver handles its
+            // own tree-mode decodes after the main loop). When ddtree_mode is on, the
+            // main batch can legitimately be empty for several consecutive ticks while
+            // slots transition through DONE_PROMPT → GENERATING or wait for the next
+            // request — don't treat that as a hung scheduler.
+            bool ddtree_active = false;
             if (params_base.speculative.ddtree_mode) {
                 for (const auto & slot : slots) {
-                    if (slot.state == SLOT_STATE_GENERATING && slot.spec_driver &&
-                        slot.ddtree_root_tok != LLAMA_TOKEN_NULL && slot.has_next_token) {
-                        has_ddtree_generating = true;
+                    if (slot.spec_driver != nullptr ||
+                        slot.state == SLOT_STATE_PROCESSING_PROMPT ||
+                        slot.state == SLOT_STATE_DONE_PROMPT ||
+                        slot.state == SLOT_STATE_STARTED ||
+                        slot.state == SLOT_STATE_GENERATING) {
+                        ddtree_active = true;
                         break;
                     }
                 }
             }
 
-            if (!has_ddtree_generating) {
+            if (!ddtree_active) {
                 SRV_WRN("%s", "no tokens to decode\n");
 
                 if (++n_empty_consecutive > 3) {
