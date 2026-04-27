@@ -292,7 +292,12 @@ static std::vector<llama_token> run_spec(
             break;
         }
 
-        for (llama_token t : accepted) {
+        // Driver returns [committed_tokens..., bonus]. The bonus is the next
+        // step's root_token and is NOT yet in the KV cache, so it's not part
+        // of the committed output and doesn't advance committed_pos.
+        const int32_t n_committed = (int32_t)accepted.size() - 1;
+        for (int32_t i = 0; i < n_committed; ++i) {
+            llama_token t = accepted[i];
             out.push_back(t);
             if (t == QWEN35_EOS) {
                 hit_eos = true;
@@ -303,8 +308,8 @@ static std::vector<llama_token> run_spec(
             }
         }
 
-        root_token    = accepted.back();
-        committed_pos += (llama_pos)accepted.size();
+        root_token    = accepted.back(); // bonus, fed as next step's tree[0]
+        committed_pos += (llama_pos)n_committed;
     }
 
     llama_speculative_tree_driver_free(driver);
