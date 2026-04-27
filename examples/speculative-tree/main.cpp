@@ -216,6 +216,7 @@ int main(int argc, char ** argv) {
     llama_pos committed_pos = (llama_pos)prompt_tokens.size();
 
     // ── Build DDTree driver ───────────────────────────────────────────────────
+    // Must be done before calling ingest_prompt_capture so the driver is initialized.
     llama_ddtree_params ddparams;
     ddparams.budget     = cli.ddtree_budget;
     ddparams.temp       = cli.temp;
@@ -228,6 +229,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: failed to init speculative tree driver\n");
         return 1;
     }
+
+    // Ingest the prompt prefill capture into the driver's ring buffer.
+    llama_speculative_tree_driver_ingest_prompt_capture(driver, (int32_t)prompt_tokens.size());
 
     // ── Generation loop ───────────────────────────────────────────────────────
     std::vector<llama_token> generated;

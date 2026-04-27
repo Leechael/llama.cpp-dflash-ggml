@@ -51,3 +51,11 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
         llama_speculative_tree_driver * d,
         llama_token                     root_token,
         llama_pos                       committed_pos);
+
+// Ingest the most recent target_ctx capture as the initial ring contents.
+// Call this AFTER the chain-mode prompt prefill that primed target capture,
+// BEFORE the first spec step.
+// n_prompt_tokens: number of tokens in the prompt that were decoded in the prefill batch.
+void llama_speculative_tree_driver_ingest_prompt_capture(
+        llama_speculative_tree_driver * d,
+        int32_t                         n_prompt_tokens);
