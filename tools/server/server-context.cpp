@@ -2891,6 +2891,35 @@ private:
             // on successful decode, restore the original batch size
             n_batch = llama_n_batch(ctx);
 
+            // DDTree: incrementally ingest the just-decoded ubatch's hidden capture
+            // into each prompt-processing slot's ring buffer. The capture buffer is
+            // overwritten on every llama_decode, so we MUST consume it before the
+            // next inner-loop iteration. Phase 5 is single-slot, so the entire
+            // batch_view belongs to one slot.
+            if (params_base.speculative.ddtree_mode && ctx_ddtree_dft) {
+                for (auto & slot : slots) {
+                    if (slot.state != SLOT_STATE_PROCESSING_PROMPT &&
+                        slot.state != SLOT_STATE_DONE_PROMPT) {
+                        continue;
+                    }
+                    if (slot.spec_driver == nullptr) {
+                        llama_ddtree_params dp;
+                        dp.budget     = params_base.speculative.ddtree_budget;
+                        dp.temp       = params_base.speculative.ddtree_temp;
+                        dp.chain_seed = params_base.speculative.ddtree_chain_seed;
+                        dp.block_size = 16;
+                        slot.spec_driver = llama_speculative_tree_driver_init(ctx, ctx_ddtree_dft, dp);
+                        if (!slot.spec_driver) {
+                            SLT_ERR(slot, "%s", "failed to allocate DDTree driver during prompt processing\n");
+                            continue;
+                        }
+                    }
+                    // Append n_tokens columns from this decode's capture buffer to the ring.
+                    llama_speculative_tree_driver_ingest_prompt_capture(
+                        slot.spec_driver, (int32_t)n_tokens);
+                }
+            }
+
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
@@ -2948,17 +2977,12 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (params_base.speculative.ddtree_mode && ctx_ddtree_dft) {
-                        // DDTree: build driver and ingest the prompt prefill capture.
-                        // The driver must be freed in slot.reset() (called from slot.release()).
-                        llama_ddtree_params ddparams;
-                        ddparams.budget     = params_base.speculative.ddtree_budget;
-                        ddparams.temp       = params_base.speculative.ddtree_temp;
-                        ddparams.chain_seed = params_base.speculative.ddtree_chain_seed;
-                        ddparams.block_size = 16; // dflash-draft fixed block size
-
-                        slot.spec_driver = llama_speculative_tree_driver_init(ctx, ctx_ddtree_dft, ddparams);
+                        // DDTree: the driver was lazy-allocated and the ring was filled
+                        // incrementally during prompt prefill (one ingest per inner-loop
+                        // ubatch decode). If something went wrong upstream we may not
+                        // have a driver here — fall back to EOS.
                         if (!slot.spec_driver) {
-                            SLT_ERR(slot, "%s", "failed to init DDTree driver, falling back to EOS\n");
+                            SLT_ERR(slot, "%s", "DDTree driver missing at GENERATING transition\n");
                             slot.stop = STOP_TYPE_EOS;
                             slot.has_next_token = false;
                             slot.print_timings();
@@ -2967,10 +2991,6 @@ private:
                             slot.release();
                             continue;
                         }
-
-                        // Ingest the prompt prefill into the driver's ring buffer.
-                        llama_speculative_tree_driver_ingest_prompt_capture(
-                            slot.spec_driver, (int32_t)slot.prompt.tokens.size());
 
                         // Greedy-sample the first generated token from the last prompt logit.
                         const int tok_idx = slot.i_batch - i;
