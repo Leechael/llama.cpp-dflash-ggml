@@ -260,18 +260,26 @@ int main(int argc, char ** argv) {
                     "check that llama_set_capture_hidden is wired in the graph builder");
             }
 
-            // Validate shape: expected [feat_dim, n_tokens] or [n_tokens, feat_dim].
-            // The roadmap specifies [5*hidden, n_tokens] stored as ne[0]=feat_dim, ne[1]=n_tokens.
+            // Validate shape. The implementation in qwen35.cpp allocates
+            // [n_embd, 5*n_tokens] (slots stacked along ne[1]), so accept both
+            // possible layouts and pick the one that matches.
             const int64_t ne0 = cap_tensor->ne[0];
             const int64_t ne1 = cap_tensor->ne[1];
-            if (ne0 != (int64_t)feat_dim || ne1 != (int64_t)n_prompt) {
+            const bool layout_stacked_ne1 =
+                ne0 == (int64_t)hidden_dim && ne1 == (int64_t)5 * n_prompt;
+            const bool layout_stacked_ne0 =
+                ne0 == (int64_t)feat_dim && ne1 == (int64_t)n_prompt;
+            if (!layout_stacked_ne1 && !layout_stacked_ne0) {
                 throw std::runtime_error(
                     "hidden capture tensor shape mismatch: got [" +
                     std::to_string(ne0) + ", " + std::to_string(ne1) +
-                    "], expected [" + std::to_string(feat_dim) + ", " +
-                    std::to_string(n_prompt) + "]");
+                    "], expected [" + std::to_string(hidden_dim) + ", " +
+                    std::to_string(5 * n_prompt) + "] or [" +
+                    std::to_string(feat_dim) + ", " + std::to_string(n_prompt) + "]");
             }
-            LOG_INF("capture shape: [%lld, %lld] — OK\n", (long long)ne0, (long long)ne1);
+            LOG_INF("capture shape: [%lld, %lld] — OK (%s)\n",
+                    (long long)ne0, (long long)ne1,
+                    layout_stacked_ne1 ? "stacked along ne[1]" : "stacked along ne[0]");
 
             // Validate: no NaN/Inf and not all-zero.
             const float * cap_data = ggml_get_data_f32(cap_tensor);
