@@ -9751,7 +9751,18 @@ int llama_model_token_embd_lookup(
         return 0;
     }
 
-    // Quantized or unsupported dtype — not supported for direct host lookup.
+    // Quantized rows: fetch the raw bytes for one row and dequantize via the
+    // type's to_float trait. Required for Q4_K_M / Q5_K / etc. target models
+    // where tok_embd is stored quantized.
+    const auto * traits = ggml_get_type_traits(dtype);
+    if (traits != nullptr && traits->to_float != nullptr) {
+        const size_t row_bytes = ggml_row_size(dtype, n_embd);
+        std::vector<uint8_t> tmp(row_bytes);
+        ggml_backend_tensor_get(t, tmp.data(), (size_t)token * row_bytes, row_bytes);
+        traits->to_float(tmp.data(), out, n_embd);
+        return 0;
+    }
+
     return -1;
 }
 
