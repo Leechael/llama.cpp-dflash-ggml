@@ -309,6 +309,15 @@ if (LLAMA_BUILD_TESTS_QWEN35_TREE)
     # Note: NOT registered with llama_test / add_test — must be run manually.
 endif()
 
+# DDTree diagnostic: chain forward vs single tree-mode root forward.
+# Used to isolate whether the long-prompt ddtree bug is in the tree kernels
+# or above (driver / KV slot / capture). Same large GGUF requirement.
+option(LLAMA_BUILD_TESTS_QWEN35_ROOT_VS_CHAIN "Build DDTree root-vs-chain diagnostic (requires large GGUF)" OFF)
+if (LLAMA_BUILD_TESTS_QWEN35_ROOT_VS_CHAIN)
+    llama_build(test-qwen35-root-vs-chain.cpp)
+    # Manual run only.
+endif()
+
 # DDTree Phase 2 acceptance test: snapshot/restore symmetry.
 # Requires a 16+ GB Qwen3.5-27B GGUF not available in CI.
 # Requires the llama_seq_snapshot / llama_seq_restore / llama_seq_release API
