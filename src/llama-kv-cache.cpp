@@ -1721,23 +1721,53 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
 
-    // Tree-mode: write ancestor-only mask directly. Phase 1 assumes a single
-    // stream and no past KV, so KV slot j corresponds to tree-batch token j
-    // for j < n_tokens. n_kv may be padded above n_tokens; surplus columns
-    // stay -inf (treated as empty cells).
+    // Tree-mode mask: each query node attends to all past (committed) KV cells
+    // unconditionally, plus its tree ancestors (cells whose pos matches an
+    // ancestor's pos in the current ubatch).
     if (ubatch->parent_id != nullptr) {
-        GGML_ASSERT(n_stream == 1 && "tree-mode requires n_stream == 1 in Phase 1");
-        GGML_ASSERT(n_kv >= (int64_t) n_tokens && "tree-mode Phase 1 expects n_kv >= n_tokens");
+        GGML_ASSERT(n_stream == 1 && "tree-mode requires n_stream == 1 in Phase 4");
+
+        // Find the boundary between past KV and the current tree ubatch.
+        llama_pos tree_min_pos = std::numeric_limits<llama_pos>::max();
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            tree_min_pos = std::min(tree_min_pos, ubatch->pos[i]);
+        }
 
         std::fill(data, data + n_kv * n_tps, -INFINITY);
 
+        const llama_seq_id seq0    = ubatch->seq_id[0][0];
+        const auto &       cells   = v_cells.at(seq_to_stream[seq0]);
+
         for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
-            int32_t cur = (int32_t) i;
-            while (cur >= 0) {
-                data[i * n_kv + cur] = 0.0f;
+            // Collect ancestor positions for query i (positions of self + all ancestors in the tree).
+            llama_pos ancestor_pos[64];
+            int       n_anc = 0;
+            int32_t   cur   = (int32_t) i;
+            while (cur >= 0 && n_anc < 64) {
+                ancestor_pos[n_anc++] = ubatch->pos[cur];
                 const int32_t p = ubatch->parent_id[cur];
                 if (p < 0) break;
                 cur = p;
+            }
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j) || !cells.seq_has(j, seq0)) {
+                    continue;
+                }
+                const llama_pos p0 = cells.pos_get(j);
+                bool visible = false;
+                if (p0 < tree_min_pos) {
+                    // Past KV (prompt or earlier accepted tokens): always visible.
+                    visible = true;
+                } else {
+                    // Tree region: visible only when p0 matches an ancestor's pos.
+                    for (int k = 0; k < n_anc; ++k) {
+                        if (ancestor_pos[k] == p0) { visible = true; break; }
+                    }
+                }
+                if (visible) {
+                    data[i * n_kv + j] = 0.0f;
+                }
             }
         }
         return;
