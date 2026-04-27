@@ -331,3 +331,18 @@ if (LLAMA_BUILD_TESTS_DFLASH_DRAFT)
     llama_build(test-qwen35-chain-capture.cpp)
     # Note: NOT registered with llama_test / add_test — must be run manually.
 endif()
+
+# DDTree Phase 4 end-to-end speculative decode acceptance test.
+# Requires Qwen3.5-27B GGUF (~16 GB) and dflash-draft GGUF.  Not available in CI.
+# Requires Phase 4 API from the implementation agent:
+#   llama_speculative_tree_driver_init / _step / _free  (common/speculative-tree-driver.h)
+#   llama_set_target_feat_raw  (Phase 3 gap, llama.h)
+# Enable manually: cmake -DLLAMA_BUILD_TESTS_SPECULATIVE_TREE_E2E=ON ...
+option(LLAMA_BUILD_TESTS_SPECULATIVE_TREE_E2E
+    "Build DDTree Phase 4 end-to-end speculative decode acceptance test (requires large GGUFs)"
+    OFF)
+if (LLAMA_BUILD_TESTS_SPECULATIVE_TREE_E2E)
+    llama_build(test-speculative-tree-e2e.cpp)
+    # Note: NOT registered with llama_test / add_test — must be run manually.
+    # Both --target-model and --draft-model are required at runtime.
+endif()

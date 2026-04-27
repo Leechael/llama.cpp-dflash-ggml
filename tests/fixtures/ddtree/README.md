@@ -182,3 +182,67 @@ comparison against a Phase 1 chain golden dump):
 # Compare against Phase 1 chain baseline:
 python3 scripts/compare_logits.py /tmp/chain_golden.bin /tmp/nocapture_logits.bin --abs-tol 0 --rel-tol 0
 ```
+
+---
+
+# DDTree Phase 4 test fixtures
+
+## Build
+
+The Phase 4 end-to-end test binary is gated behind its own CMake option (off
+by default, not in ctest):
+
+```
+cmake -DLLAMA_BUILD_TESTS_SPECULATIVE_TREE_E2E=ON <other flags> ..
+make test-speculative-tree-e2e
+```
+
+Requires:
+- A Qwen3.5-27B GGUF (~16 GB).
+- A converted dflash-draft GGUF.
+- Phase 4 implementation API:
+  `llama_speculative_tree_driver_init` / `_step` / `_free`
+  (`common/speculative-tree-driver.h`) and `llama_set_target_feat_raw`
+  (Phase 3 gap; `llama.h`).
+
+## Test 4.A — Spec-decode token trajectory matches chain reference
+
+This is the canonical Phase 4 acceptance test.  With `--temp 0` (greedy),
+DDTree speculative decoding is lossless: the target verifies each draft token
+against its own argmax before accepting it.  The resulting token sequence MUST
+be bit-equal to a plain greedy chain decode from the same prompt.
+
+```bash
+./test-speculative-tree-e2e \
+    --target-model  /path/to/Qwen3.5-27B-Q4_K_M.gguf \
+    --draft-model   /path/to/draft.gguf \
+    --prompt-tokens fixtures/ddtree/short_prompt.bin \
+    --gen 64 \
+    --out-chain /tmp/chain.tokens \
+    --out-spec  /tmp/spec.tokens \
+    --ddtree-budget 22 \
+    --temp 0
+
+# The driver prints: chain_n=X spec_n=Y first_divergence=none bytes_match=Z/Z
+# Exit 0 = PASS.
+
+# Optional: offline comparison using the script:
+python3 scripts/compare_tokens.py /tmp/chain.tokens /tmp/spec.tokens
+# Exit 0 = all positions match AND n_a == n_b.
+```
+
+**Note**: `--temp 0` is required for the bit-equal guarantee.  Non-zero
+temperature introduces stochastic sampling, which makes the two sequences
+non-deterministic relative to each other.  With non-zero temp the comparison
+is informational only (the driver does not assert bit-equality).
+
+## Test 4.B — BLOCKED
+
+Test 4.B (comparison of the spec-decode token sequence against the output of
+the `test_dflash` daemon) is blocked on a Phase 0 prerequisite: the
+`test_dflash` daemon mode interface (`--daemon` flag) is not yet implemented.
+Until that flag lands, no golden `test_dflash` token stream can be produced
+for comparison.
+
+The chain-reference comparison in Test 4.A gives strong independent functional
+verification and is sufficient for Phase 4 sign-off.
