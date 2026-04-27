@@ -252,19 +252,17 @@ int main(int argc, char ** argv) {
             write_logits(out_logits_path, logits_capture.data(), 1, vocab_size);
             LOG_INF("Mode A: logits written to %s\n", out_logits_path.c_str());
 
-            // Read hidden capture tensor.
-            struct ggml_tensor * cap_tensor = llama_get_hidden_capture(ctx);
-            if (!cap_tensor) {
+            // Read hidden capture data (host-side, populated via ggml_backend_tensor_get_async).
+            int64_t ne0 = 0, ne1 = 0;
+            const float * cap_data = llama_get_hidden_capture_data(ctx, &ne0, &ne1);
+            if (!cap_data) {
                 throw std::runtime_error(
-                    "llama_get_hidden_capture returned NULL after capture decode; "
+                    "llama_get_hidden_capture_data returned NULL after capture decode; "
                     "check that llama_set_capture_hidden is wired in the graph builder");
             }
 
-            // Validate shape. The implementation in qwen35.cpp allocates
-            // [n_embd, 5*n_tokens] (slots stacked along ne[1]), so accept both
-            // possible layouts and pick the one that matches.
-            const int64_t ne0 = cap_tensor->ne[0];
-            const int64_t ne1 = cap_tensor->ne[1];
+            // Validate shape. qwen35.cpp allocates [n_embd, 5*n_tokens] (slots stacked
+            // along ne[1]); accept both layouts so the assertion stays portable.
             const bool layout_stacked_ne1 =
                 ne0 == (int64_t)hidden_dim && ne1 == (int64_t)5 * n_prompt;
             const bool layout_stacked_ne0 =
@@ -282,8 +280,7 @@ int main(int argc, char ** argv) {
                     layout_stacked_ne1 ? "stacked along ne[1]" : "stacked along ne[0]");
 
             // Validate: no NaN/Inf and not all-zero.
-            const float * cap_data = ggml_get_data_f32(cap_tensor);
-            const size_t cap_n     = (size_t)feat_dim * n_prompt;
+            const size_t cap_n = (size_t) ne0 * (size_t) ne1;
             bool any_nonzero = false;
             for (size_t k = 0; k < cap_n; ++k) {
                 float v = cap_data[k];

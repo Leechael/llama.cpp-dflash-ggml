@@ -1070,6 +1070,17 @@ ggml_tensor * llama_context::get_hidden_capture() const {
     return nullptr;
 }
 
+const float * llama_context::get_hidden_capture_data(int64_t * out_ne0, int64_t * out_ne1) const {
+    if (hidden_capture_host.empty()) {
+        if (out_ne0) *out_ne0 = 0;
+        if (out_ne1) *out_ne1 = 0;
+        return nullptr;
+    }
+    if (out_ne0) *out_ne0 = hidden_capture_ne0;
+    if (out_ne1) *out_ne1 = hidden_capture_ne1;
+    return hidden_capture_host.data();
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1340,6 +1351,22 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(logits.data != nullptr);
 
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+    }
+
+    // dflash hidden capture: pull the device tensor into host_capture_host so
+    // get_hidden_capture_data() can return a CPU pointer.
+    if (capture_hidden && res->t_hidden_capture != nullptr) {
+        ggml_tensor * t_cap = res->t_hidden_capture;
+        ggml_backend_t backend_cap = ggml_backend_sched_get_tensor_backend(sched.get(), t_cap);
+        GGML_ASSERT(backend_cap != nullptr);
+
+        const size_t cap_n = (size_t) t_cap->ne[0] * (size_t) t_cap->ne[1];
+        if (hidden_capture_host.size() < cap_n) {
+            hidden_capture_host.resize(cap_n);
+        }
+        hidden_capture_ne0 = t_cap->ne[0];
+        hidden_capture_ne1 = t_cap->ne[1];
+        ggml_backend_tensor_get_async(backend_cap, t_cap, hidden_capture_host.data(), 0, cap_n * sizeof(float));
     }
 
     // extract embeddings
@@ -3116,6 +3143,11 @@ void llama_set_capture_hidden(llama_context * ctx, bool enable) {
 ggml_tensor * llama_get_hidden_capture(llama_context * ctx) {
     ctx->synchronize();
     return ctx->get_hidden_capture();
+}
+
+const float * llama_get_hidden_capture_data(llama_context * ctx, int64_t * out_ne0, int64_t * out_ne1) {
+    ctx->synchronize();
+    return ctx->get_hidden_capture_data(out_ne0, out_ne1);
 }
 
 void llama_synchronize(llama_context * ctx) {
