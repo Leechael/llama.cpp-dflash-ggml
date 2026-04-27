@@ -14,6 +14,7 @@
 //   3. out_norm + shared lm_head → logits [vocab, block_size]
 
 #include "models.h"
+#include "llama-impl.h"  // LLAMA_TENSOR_NAME_FATTN
 
 llm_build_dflash_draft::llm_build_dflash_draft(
         const llama_model  & model,
@@ -155,6 +156,8 @@ llm_build_dflash_draft::llm_build_dflash_draft(
                                                   scale,
                                                   /*max_bias=*/0.0f,
                                                   /*logit_softcap=*/0.0f);
+        // Name the FA tensor so sched_reserve's auto_fa name-prefix assert passes.
+        cb(attn, LLAMA_TENSOR_NAME_FATTN, il);
         // attn: [n_embd_head, n_head, block_size, 1]
         attn = ggml_reshape_2d(ctx0, attn, n_embd_head * n_head, n_tokens);
         cb(attn, "attn_out", il);
