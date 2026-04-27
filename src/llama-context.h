@@ -113,6 +113,13 @@ struct llama_context {
     // Returns nullptr if capture is disabled or no decode has run.
     const float * get_hidden_capture_data(int64_t * out_ne0, int64_t * out_ne1) const;
 
+    // dflash draft target_feat injection API (Task 1).
+    // Stashes host pointer + dims so the next llama_decode() on this draft context
+    // can copy the data into the dflash_target_feat_raw GGML input tensor.
+    // committed_pos is the number of tokens committed in the target context so far.
+    void set_target_feat_raw(const float * data, int64_t n_embd_fc, int64_t ctx_len,
+                             int64_t committed_pos);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -358,6 +365,16 @@ private:
     std::vector<float> hidden_capture_host;
     int64_t            hidden_capture_ne0 = 0;
     int64_t            hidden_capture_ne1 = 0;
+
+    // dflash draft target_feat injection: stashed by llama_set_target_feat_raw() before
+    // llama_decode() on the draft context. The dflash-draft graph input reads from these
+    // fields in set_input() and copies them into the host-pinned GGML input tensors.
+    // Non-owning pointer — caller (speculative-tree-driver) owns the lifetime.
+    // Mutable so graph_params() (a const method) can take their address for the param struct.
+    mutable const float * pending_target_feat_raw      = nullptr;
+    mutable int64_t       pending_target_feat_n_embd_fc = 0;
+    mutable int64_t       pending_target_feat_ctx_len   = 0;
+    mutable int64_t       pending_draft_committed_pos   = 0;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

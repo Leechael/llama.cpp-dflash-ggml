@@ -911,6 +911,46 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_target_feat::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    // host_data, n_embd_fc, ctx_len are stashed by llama_set_target_feat_raw() before decode.
+    const float * data    = *host_data_ptr;
+    const int64_t fc      = *n_embd_fc_ptr;
+    const int64_t ctx_len = *ctx_len_ptr;
+    const int64_t cpos    = *committed_pos_ptr;
+
+    // Sanity: if this graph input exists, the caller must have supplied data.
+    GGML_ASSERT(data != nullptr &&
+                "dflash-draft: llama_set_target_feat_raw() must be called before llama_decode()");
+
+    if (inp_target_feat_raw) {
+        GGML_ASSERT(inp_target_feat_raw->ne[0] == fc);
+        GGML_ASSERT(inp_target_feat_raw->ne[1] == ctx_len);
+        ggml_backend_tensor_set(inp_target_feat_raw, data, 0, (size_t)fc * ctx_len * sizeof(float));
+    }
+
+    // pos_q: [committed_pos .. committed_pos + block_size)
+    if (inp_pos_q) {
+        const int64_t block_size = inp_pos_q->ne[0];
+        std::vector<int32_t> pos_q(block_size);
+        for (int64_t i = 0; i < block_size; ++i) {
+            pos_q[i] = (int32_t)(cpos + i);
+        }
+        ggml_backend_tensor_set(inp_pos_q, pos_q.data(), 0, block_size * sizeof(int32_t));
+    }
+
+    // pos_k: [0 .. ctx_len + block_size)
+    if (inp_pos_k) {
+        const int64_t total_k = inp_pos_k->ne[0];
+        std::vector<int32_t> pos_k(total_k);
+        for (int64_t i = 0; i < total_k; ++i) {
+            pos_k[i] = (int32_t)i;
+        }
+        ggml_backend_tensor_set(inp_pos_k, pos_k.data(), 0, total_k * sizeof(int32_t));
+    }
+}
+
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
     inputs.emplace_back(std::move(input));
     return inputs.back().get();
@@ -964,6 +1004,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     capture_hidden   (params.capture_hidden),
+    pending_target_feat_raw_ptr      (params.pending_target_feat_raw_ptr),
+    pending_target_feat_n_embd_fc_ptr(params.pending_target_feat_n_embd_fc_ptr),
+    pending_target_feat_ctx_len_ptr  (params.pending_target_feat_ctx_len_ptr),
+    pending_draft_committed_pos_ptr  (params.pending_draft_committed_pos_ptr),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -1733,6 +1777,35 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
     res->add_input(std::move(inp));
 
     return cur;
+}
+
+llm_graph_input_target_feat * llm_graph_context::build_inp_target_feat(int64_t n_embd_fc, int64_t ctx_len) const {
+    // The graph context holds non-owning pointers into the llama_context's pending_target_feat
+    // fields, propagated via llm_graph_params. The llama_context outlives every graph invocation,
+    // so the pointer lifetime is safe within a single decode call.
+    GGML_ASSERT(pending_target_feat_raw_ptr != nullptr &&
+                "build_inp_target_feat called without pending pointers wired in llm_graph_params");
+    auto inp = std::make_unique<llm_graph_input_target_feat>(
+        pending_target_feat_raw_ptr,
+        pending_target_feat_n_embd_fc_ptr,
+        pending_target_feat_ctx_len_ptr,
+        pending_draft_committed_pos_ptr);
+
+    const int64_t block_size = n_tokens; // == dflash_block_size at draft invocation time
+
+    inp->inp_target_feat_raw = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_fc, ctx_len);
+    ggml_set_name(inp->inp_target_feat_raw, "dflash_target_feat_raw");
+    ggml_set_input(inp->inp_target_feat_raw);
+
+    inp->inp_pos_q = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, block_size);
+    ggml_set_name(inp->inp_pos_q, "dflash_pos_q");
+    ggml_set_input(inp->inp_pos_q);
+
+    inp->inp_pos_k = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx_len + block_size);
+    ggml_set_name(inp->inp_pos_k, "dflash_pos_k");
+    ggml_set_input(inp->inp_pos_k);
+
+    return (llm_graph_input_target_feat *) res->add_input(std::move(inp));
 }
 
 ggml_tensor * llm_graph_context::build_inp_attn_scale() const {

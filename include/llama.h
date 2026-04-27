@@ -809,6 +809,19 @@ extern "C" {
     LLAMA_API bool                  llama_seq_restore (struct llama_context * ctx, llama_mem_snapshot_id snap_id);
     LLAMA_API void                  llama_seq_release (struct llama_context * ctx, llama_mem_snapshot_id snap_id);
 
+    // Compact the KV cache after a tree-verify forward pass.
+    // Copies K/V rows accepted_dfs[0..commit_n) to spine slots [0..commit_n),
+    // then truncates the logical cache length to commit_n.
+    // No-op on non-KV memory types (e.g. pure SSM models).
+    // Only safe to call immediately after a tree-batch llama_decode() while the
+    // KV slots [0..N) still hold the unsorted tree verification results.
+    LLAMA_API void llama_kv_cache_seq_compact_tree(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            const int32_t        * accepted_dfs,
+            int32_t                n_accepted,
+            int32_t                commit_n);
+
     //
     // State / sessions
     //
@@ -1034,6 +1047,19 @@ extern "C" {
     LLAMA_API const float * llama_get_hidden_capture_data(struct llama_context * ctx,
                                                           int64_t * out_ne0,
                                                           int64_t * out_ne1);
+
+    // dflash draft target_feat injection (Task 1 Phase 4 gap fix).
+    // Must be called on the draft context before llama_decode() when running a
+    // dflash-draft (LLM_ARCH_DFLASH_DRAFT) model. The driver supplies a packed
+    // [5*n_embd, ctx_len] F32 host buffer with per-layer hidden captures from the
+    // target model. committed_pos is the number of tokens already committed in the
+    // target context; it drives the RoPE position indices for Q and K in the draft.
+    // The data pointer is non-owning; it must remain valid until llama_decode() returns.
+    LLAMA_API void llama_set_target_feat_raw(struct llama_context * ctx,
+                                             const float           * data,
+                                             int64_t                 n_embd_fc,
+                                             int64_t                 ctx_len,
+                                             int64_t                 committed_pos);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
