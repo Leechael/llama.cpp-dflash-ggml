@@ -24,9 +24,11 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
                                             n_embd,
                                             (int64_t)5 * n_tokens);
         ggml_set_name(hidden_cap_buf, "dflash_hidden_cap_buf");
-        // The buffer is a graph OUTPUT — set_outputs() in llama-graph
-        // marks it via ggml_set_output so the GPU writes get synced
-        // back to host memory after the forward pass.
+        // INPUT flag is required for ggml-alloc to assign the leaf a backend
+        // (the OUTPUT-only path leaves backend_id = -1 and asserts in gallocr).
+        // OUTPUT flag is added by llm_graph_result::set_outputs() so backend
+        // writes get synced back to host memory after the forward pass.
+        ggml_set_input(hidden_cap_buf);
         res->t_hidden_capture = hidden_cap_buf;
     }
 
