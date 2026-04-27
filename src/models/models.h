@@ -197,6 +197,10 @@ struct llm_build_dbrx : public llm_graph_context {
     llm_build_dbrx(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_dflash_draft : public llm_graph_context {
+    llm_build_dflash_draft(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_deci : public llm_graph_context {
     llm_build_deci(const llama_model & model, const llm_graph_params & params);
 };

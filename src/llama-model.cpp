@@ -16,6 +16,7 @@
 #include "models/models.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -2932,6 +2933,21 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     case 45: type = LLM_TYPE_196B_A11B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
+            } break;
+        case LLM_ARCH_DFLASH_DRAFT:
+            {
+                // Standard transformer hparams are read from GGUF normally (n_layer=5,
+                // n_embd=5120, n_head=32, n_head_kv=8, n_embd_head=128, n_ff=2048).
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                // dflash-draft specific metadata keys
+                ml.get_arr("dflash_draft.target_capture_layers",
+                            hparams.dflash_target_capture_layers, false);
+                ml.get_key("dflash_draft.target_n_embd", hparams.dflash_target_n_embd, false);
+                ml.get_key("dflash_draft.mask_token_id", hparams.dflash_mask_token_id, false);
+                ml.get_key("dflash_draft.block_size",    hparams.dflash_block_size,    false);
+
+                type = LLM_TYPE_UNKNOWN; // draft is a small auxiliary model, no standard type
             } break;
         default: throw std::runtime_error("unsupported model architecture: " + arch_name());
     }
@@ -7971,6 +7987,41 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
                     }
                 } break;
+            case LLM_ARCH_DFLASH_DRAFT:
+                {
+                    // dflash-draft: 5-layer non-causal speculative decoder.
+                    // token_embd and lm_head are NOT loaded — they are shared from the target model at runtime.
+                    // out_norm maps to model.output_norm; fc and hidden_norm are stored in dflash_fc / dflash_hidden_norm.
+                    const int64_t n_draft_fc_in = (int64_t)5 * n_embd; // 5 * hidden = 25600 for 27B
+
+                    // Top-level: feature-fusion projection and norms
+                    dflash_fc          = create_tensor(tn(LLM_TENSOR_DFLASH_FC,          "weight"), {n_draft_fc_in, n_embd}, 0);
+                    dflash_hidden_norm = create_tensor(tn(LLM_TENSOR_DFLASH_HIDDEN_NORM, "weight"), {n_embd}, 0);
+                    output_norm        = create_tensor(tn(LLM_TENSOR_DFLASH_OUT_NORM,    "weight"), {n_embd}, 0);
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        // Per-layer pre-norms
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, 0);
+
+                        // Attention projections; Q projects to n_head * n_embd_head_k
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa}, 0);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa}, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                        // Per-head Q/K norms (qwen3-style)
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+
+                        // SwiGLU FFN; intermediate = n_ff (2048 for 27B draft)
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff,   n_embd}, 0);
+                    }
+                } break;
             default:
                 throw std::runtime_error("unknown architecture");
         }
@@ -8629,6 +8680,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_LLADA:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
+        case LLM_ARCH_DFLASH_DRAFT: // non-causal draft: no autoregressive KV cache needed
             {
                 res = nullptr;
             } break;
@@ -9259,6 +9311,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_step35_iswa>(*this, params);
             } break;
+        case LLM_ARCH_DFLASH_DRAFT:
+            {
+                llm = std::make_unique<llm_build_dflash_draft>(*this, params);
+            } break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -9511,6 +9567,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_DFLASH_DRAFT:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -9656,6 +9713,46 @@ bool llama_model_is_hybrid(const llama_model * model) {
 
 bool llama_model_is_diffusion(const llama_model * model) {
     return llm_arch_is_diffusion(model->arch);
+}
+
+int llama_model_token_embd_lookup(
+        const llama_model * model,
+        llama_token         token,
+        float             * out,
+        int64_t             out_n) {
+    const ggml_tensor * t = model->tok_embd;
+    if (!t) {
+        return -1;
+    }
+
+    const int64_t n_embd  = t->ne[0];   // rows in ggml layout = embedding dim
+    const int64_t n_vocab = t->ne[1];
+
+    if (token < 0 || (int64_t)token >= n_vocab) {
+        return -1;
+    }
+    if (out_n < n_embd) {
+        return -1;
+    }
+
+    const ggml_type dtype = t->type;
+
+    if (dtype == GGML_TYPE_F32) {
+        const size_t row_bytes = (size_t)n_embd * sizeof(float);
+        ggml_backend_tensor_get(t, out, (size_t)token * row_bytes, row_bytes);
+        return 0;
+    }
+
+    if (dtype == GGML_TYPE_F16) {
+        const size_t row_bytes = (size_t)n_embd * sizeof(ggml_fp16_t);
+        std::vector<ggml_fp16_t> tmp(n_embd);
+        ggml_backend_tensor_get(t, tmp.data(), (size_t)token * row_bytes, row_bytes);
+        ggml_fp16_to_fp32_row(tmp.data(), out, n_embd);
+        return 0;
+    }
+
+    // Quantized or unsupported dtype — not supported for direct host lookup.
+    return -1;
 }
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {

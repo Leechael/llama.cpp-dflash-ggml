@@ -105,6 +105,10 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // dflash hidden capture API
+    void          set_capture_hidden(bool enable);
+    ggml_tensor * get_hidden_capture() const;
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -339,6 +343,10 @@ private:
     ggml_backend_buffer_ptr buf_output;
 
     bool has_evaluated_once = false;
+
+    // dflash hidden capture: when true, qwen35 forward writes captured hidden states
+    // into a graph output tensor; accessible via get_hidden_capture() after decode.
+    bool capture_hidden = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

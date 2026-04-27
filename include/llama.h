@@ -651,6 +651,16 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    // Copy one token-embedding row from model->tok_embd into caller-supplied buffer.
+    // out_n must be >= model->hparams.n_embd. The embedding is returned as F32
+    // regardless of the on-disk storage type (conversion happens on the backend).
+    // Returns 0 on success, -1 if token is out of range or tok_embd is unavailable.
+    LLAMA_API int llama_model_token_embd_lookup(
+            const struct llama_model * model,
+            llama_token                token,
+            float                    * out,
+            int64_t                    out_n);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,
@@ -1008,6 +1018,13 @@ extern "C" {
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+
+    // dflash hidden capture: when enabled, qwen35 forward writes per-layer hidden states
+    // for the 5 dflash target capture layers into an output tensor readable via
+    // llama_get_hidden_capture() after llama_decode(). Toggling this triggers a graph
+    // reserve. If disabled (default), behavior is byte-for-byte identical to baseline.
+    LLAMA_API void           llama_set_capture_hidden(struct llama_context * ctx, bool enable);
+    LLAMA_API struct ggml_tensor * llama_get_hidden_capture(struct llama_context * ctx);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

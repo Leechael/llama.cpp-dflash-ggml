@@ -212,6 +212,13 @@ struct llama_hparams {
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
 
+    // dflash-draft specific (27B-specific for now: 5-layer draft targeting Qwen3.5-27B)
+    // target_capture_layers: indices into target model layers to capture hidden states from
+    std::array<uint32_t, 5> dflash_target_capture_layers = {1, 16, 31, 46, 61};
+    uint32_t dflash_target_n_embd  = 5120;  // target hidden dim (n_embd of target model)
+    uint32_t dflash_mask_token_id  = 248070; // mask token id for noise embedding lookup
+    uint32_t dflash_block_size     = 16;    // number of noise tokens per spec step
+
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
     llama_token dec_start_token_id = LLAMA_TOKEN_NULL;

@@ -394,6 +394,9 @@ namespace GGUFMeta {
 
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
 
+    // Explicit instantiation for dflash-draft: target_capture_layers is a fixed 5-element array.
+    template bool llama_model_loader::get_arr<uint32_t, 5>(const std::string & key, std::array<uint32_t, 5> & result, bool required);
+
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
         auto it = kv_overrides.find(key);

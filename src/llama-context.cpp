@@ -1054,6 +1054,22 @@ void llama_context::set_causal_attn(bool value) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_capture_hidden(bool enable) {
+    LLAMA_LOG_DEBUG("%s: enable = %d\n", __func__, enable);
+    if (capture_hidden == enable) {
+        return;
+    }
+    capture_hidden = enable;
+    sched_need_reserve = true; // graph topology changes when capture is toggled
+}
+
+ggml_tensor * llama_context::get_hidden_capture() const {
+    if (gf_res_prev && gf_res_prev->t_hidden_capture) {
+        return gf_res_prev->t_hidden_capture;
+    }
+    return nullptr;
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -2172,9 +2188,10 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
+        /*.n_outputs      =*/ n_outputs,
+        /*.cb             =*/ graph_get_cb(),
+        /*.res            =*/ res,
+        /*.capture_hidden =*/ capture_hidden,
     };
 }
 
@@ -3090,6 +3107,15 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_capture_hidden(llama_context * ctx, bool enable) {
+    ctx->set_capture_hidden(enable);
+}
+
+ggml_tensor * llama_get_hidden_capture(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_hidden_capture();
 }
 
 void llama_synchronize(llama_context * ctx) {

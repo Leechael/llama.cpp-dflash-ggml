@@ -14,6 +14,20 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    // dflash hidden capture buffer: [5*n_embd, n_tokens] F32.
+    // Allocated only when capture_hidden=true; nullptr otherwise (no overhead).
+    // Buffer layout: capture_idx * n_embd occupies rows [capture_idx*n_embd, (capture_idx+1)*n_embd).
+    // n_tokens in the column dimension matches the current ubatch.
+    ggml_tensor * hidden_cap_buf = nullptr;
+    if (capture_hidden) {
+        hidden_cap_buf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
+                                            n_embd,
+                                            (int64_t)5 * n_tokens);
+        ggml_set_name(hidden_cap_buf, "dflash_hidden_cap_buf");
+        ggml_set_input(hidden_cap_buf);
+        res->t_hidden_capture = hidden_cap_buf;
+    }
+
     inpL = build_inp_embd(model.tok_embd);
 
     cb(inpL, "model.input_embed", -1);
@@ -68,6 +82,27 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_ffn", il);
+
+        // dflash hidden capture: if enabled, check whether this layer is in the
+        // target_capture_layers list and copy the post-FFN residual hidden states
+        // into the corresponding slot of hidden_cap_buf.
+        // Critical invariant: this block is NOT entered when capture_hidden==false,
+        // so the baseline qwen35 forward is byte-for-byte unchanged.
+        if (capture_hidden && hidden_cap_buf) {
+            const auto & cl = hparams.dflash_target_capture_layers;
+            for (int k = 0; k < 5; ++k) {
+                if ((int)cl[k] == il) {
+                    // dst_view: [n_embd, n_tokens] at row offset k*n_tokens in the buffer
+                    ggml_tensor * dst_view = ggml_view_2d(ctx0, hidden_cap_buf,
+                        n_embd,   n_tokens,
+                        hidden_cap_buf->nb[1],
+                        (size_t)k * n_tokens * n_embd * ggml_element_size(hidden_cap_buf));
+                    ggml_tensor * src_2d = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_2d, dst_view));
+                    break;
+                }
+            }
+        }
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
