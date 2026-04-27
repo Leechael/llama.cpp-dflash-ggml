@@ -274,6 +274,9 @@ static std::vector<llama_token> run_spec(
         throw std::runtime_error("spec: llama_speculative_tree_driver_init returned NULL");
     }
 
+    // Ingest the prompt prefill capture into the driver's ring buffer.
+    llama_speculative_tree_driver_ingest_prompt_capture(driver, (int32_t)prompt.size());
+
     std::vector<llama_token> out;
     out.reserve(gen);
 

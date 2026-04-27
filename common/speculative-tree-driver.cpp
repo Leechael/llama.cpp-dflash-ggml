@@ -50,6 +50,14 @@ struct llama_speculative_tree_driver {
     // Scratch buffer for packed target_feat: [5*n_embd, ctx_len]
     std::vector<float> target_feat_buf;
 
+    // Cumulative target_feat ring buffer, [5*n_embd, target_feat_cap]
+    // Stored column-major: column t = position t, rows = [l*n_embd .. (l+1)*n_embd) for layer l.
+    // i.e. ring[col * target_feat_n_embd_fc + l*n_embd .. +n_embd] = layer l at committed pos col.
+    std::vector<float> target_feat_ring; // size = target_feat_n_embd_fc * target_feat_cap
+    int64_t target_feat_n_committed = 0; // total committed positions appended to the ring
+    int64_t target_feat_n_embd_fc   = 0; // = 5 * n_embd
+    int64_t target_feat_cap         = 8192; // max ring depth (linear buffer, no rotation for now)
+
     // Scratch buffers
     std::vector<float>   top_log_probs; // [block_size-1, K]
     std::vector<int32_t> top_token_ids; // [block_size-1, K]
@@ -89,6 +97,11 @@ llama_speculative_tree_driver * llama_speculative_tree_driver_init(
     d->block_size    = (int64_t)params.block_size; // from llama_ddtree_params (default 16)
     d->mask_token_id = 248070; // dflash-draft MASK token
 
+    // Initialize cumulative target_feat ring buffer.
+    d->target_feat_n_embd_fc   = 5 * d->n_embd;
+    d->target_feat_n_committed = 0;
+    d->target_feat_ring.assign((size_t)d->target_feat_n_embd_fc * d->target_feat_cap, 0.0f);
+
     return d;
 }
 
@@ -115,6 +128,63 @@ static void pack_target_feat(
             memcpy(dst, src, (size_t)n_embd * sizeof(float));
         }
     }
+}
+
+// Append hidden capture data from target_ctx into the driver's ring buffer.
+// dfs_indices: if non-NULL, selects which capture columns to ingest (the DFS accepted indices).
+//              if NULL, ingest the first n_dfs columns linearly (prompt prefill path).
+// n_dfs: number of columns to ingest.
+static void driver_ingest_capture(llama_speculative_tree_driver * d,
+                                  const int32_t * dfs_indices,
+                                  int32_t         n_dfs) {
+    int64_t ne0 = 0, ne1 = 0;
+    const float * capture = llama_get_hidden_capture_data(d->target_ctx, &ne0, &ne1);
+    if (!capture || ne0 == 0 || ne1 == 0) {
+        LOG_ERR("%s: no hidden capture data available\n", __func__);
+        return;
+    }
+    // capture layout: [n_embd, 5*n_tokens] → ne0=n_embd, ne1=5*n_tokens
+    const int64_t n_embd  = ne0;
+    const int64_t n_tokens = ne1 / 5; // number of decoded positions in this capture
+
+    if (n_embd != d->n_embd) {
+        LOG_ERR("%s: capture n_embd=%lld != driver n_embd=%lld\n",
+                __func__, (long long)n_embd, (long long)d->n_embd);
+        return;
+    }
+
+    for (int32_t i = 0; i < n_dfs; ++i) {
+        // Source column index in the capture buffer (within each layer's block).
+        const int64_t src_col = (dfs_indices != nullptr) ? (int64_t)dfs_indices[i] : (int64_t)i;
+
+        // Destination ring column (linear, no rotation in first cut).
+        const int64_t dst_col = d->target_feat_n_committed + (int64_t)i;
+        if (dst_col >= d->target_feat_cap) {
+            LOG_ERR("%s: target_feat ring full (cap=%lld); aborting ingest\n",
+                    __func__, (long long)d->target_feat_cap);
+            break;
+        }
+
+        for (int64_t l = 0; l < 5; ++l) {
+            // Source: layer l's block starts at column l*n_tokens; pick column src_col within it.
+            const float * src = capture + (l * n_tokens + src_col) * n_embd;
+            // Destination: ring column dst_col, row l*n_embd.
+            float * dst = d->target_feat_ring.data() + dst_col * d->target_feat_n_embd_fc + l * n_embd;
+            memcpy(dst, src, (size_t)n_embd * sizeof(float));
+        }
+    }
+
+    d->target_feat_n_committed += (int64_t)n_dfs;
+    if (d->target_feat_n_committed > d->target_feat_cap) {
+        d->target_feat_n_committed = d->target_feat_cap; // clamp
+    }
+}
+
+void llama_speculative_tree_driver_ingest_prompt_capture(
+        llama_speculative_tree_driver * d,
+        int32_t n_prompt_tokens) {
+    // Prompt prefill capture is laid out linearly; ingest columns 0..n_prompt_tokens-1.
+    driver_ingest_capture(d, nullptr, n_prompt_tokens);
 }
 
 std::vector<llama_token> llama_speculative_tree_driver_step(
@@ -152,31 +222,27 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
         }
     }
 
-    // ── Step 2: slice and pack target_feat ────────────────────────────────────
-    // Read hidden capture: [n_embd, 5*n_total] F32 host buffer.
-    int64_t cap_ne0 = 0, cap_ne1 = 0;
-    const float * capture = llama_get_hidden_capture_data(d->target_ctx, &cap_ne0, &cap_ne1);
-    if (!capture || cap_ne0 == 0 || cap_ne1 == 0) {
-        LOG_ERR("%s: no hidden capture data available; call llama_decode on target first\n",
+    // ── Step 2: slice and pack target_feat from the cumulative ring buffer ────
+    // The ring holds columns 0..target_feat_n_committed-1 in order.
+    // We use the most recent ctx_len columns.
+    const int64_t n_committed = d->target_feat_n_committed;
+    if (n_committed == 0) {
+        LOG_ERR("%s: target_feat ring is empty; call llama_speculative_tree_driver_ingest_prompt_capture first\n",
                         __func__);
         return {};
     }
-    // cap_ne0 == n_embd, cap_ne1 == 5 * n_total
-    const int64_t n_total = cap_ne1 / 5;
-    if (cap_ne0 != n_embd || n_total <= 0) {
-        LOG_ERR("%s: unexpected capture shape [%lld, %lld], n_embd=%lld\n",
-                        __func__, (long long)cap_ne0, (long long)cap_ne1, (long long)n_embd);
-        return {};
-    }
-    const int64_t ctx_len = std::min((int64_t)committed_pos, (int64_t)DRAFT_CTX_MAX);
-    if (ctx_len > n_total) {
-        LOG_ERR("%s: ctx_len=%lld > n_total=%lld (capture buffer too small)\n",
-                        __func__, (long long)ctx_len, (long long)n_total);
-        return {};
-    }
+    const int64_t ctx_len = std::min(n_committed, (int64_t)DRAFT_CTX_MAX);
+    const int64_t ring_start = n_committed - ctx_len; // first ring column to include
 
+    // Copy the selected columns from the ring into a contiguous [5*n_embd, ctx_len] buffer
+    // where the output is column-major: out[t * 5*n_embd + l*n_embd .. +n_embd] = layer l at pos t.
     d->target_feat_buf.resize((size_t)5 * n_embd * ctx_len);
-    pack_target_feat(capture, n_embd, n_total, ctx_len, d->target_feat_buf.data());
+    for (int64_t t = 0; t < ctx_len; ++t) {
+        const int64_t ring_col = ring_start + t;
+        const float * ring_src = d->target_feat_ring.data() + ring_col * d->target_feat_n_embd_fc;
+        float * dst = d->target_feat_buf.data() + t * 5 * n_embd;
+        memcpy(dst, ring_src, (size_t)5 * n_embd * sizeof(float));
+    }
 
     // ── Step 3: draft forward ─────────────────────────────────────────────────
     // Inject target_feat into draft context and run llama_decode with noise embeddings.
@@ -301,6 +367,11 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
 
     const int accept_depth = (int)accepted_dfs.size(); // includes root node (index 0)
     const int commit_n     = accept_depth; // root is always committed
+
+    // ── Step 8b: ingest accepted hidden states into the cumulative ring ───────
+    // The tree forward populated the capture buffer with hidden states for all N tree nodes.
+    // We keep only the accepted_dfs columns and append them to the ring.
+    driver_ingest_capture(d, accepted_dfs.data(), (int32_t)commit_n);
 
     // ── Step 9: compact KV cache and rollback recurrent state ─────────────────
     // KV compaction: copies K/V rows from accepted_dfs[0..commit_n) to spine [0..commit_n).
