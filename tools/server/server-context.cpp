@@ -2328,7 +2328,16 @@ private:
                                 continue;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            // DDTree mode requires the full prompt to flow through the
+                            // capture-enabled forward so the driver's target_feat ring
+                            // can be populated. Prompt cache hits skip that decode and
+                            // leave the ring incomplete, causing garbage output on
+                            // long Claude-Code-style prompts. Force a full re-decode
+                            // for DDTree slots until ggml_ssm_conv_tree_persist (and
+                            // a proper cache-aware ingest path) lands.
+                            const bool skip_prompt_cache = params_base.speculative.ddtree_mode;
+
+                            if (slot.task->params.cache_prompt && !skip_prompt_cache) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
