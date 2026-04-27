@@ -9,6 +9,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "speculative-tree-driver.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -57,6 +58,11 @@ struct server_slot {
     mtmd_context * mctx = nullptr;
 
     common_speculative * spec = nullptr;
+
+    // DDTree speculative decoding state (Phase 5); null when ddtree_mode is off
+    llama_speculative_tree_driver * spec_driver     = nullptr;
+    llama_token                     ddtree_root_tok = LLAMA_TOKEN_NULL; // bonus token from prev step / first sampled
+    llama_pos                       ddtree_committed_pos = 0;           // KV positions committed so far
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -186,6 +192,14 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+
+        // free DDTree driver if one was created for this request
+        if (spec_driver) {
+            llama_speculative_tree_driver_free(spec_driver);
+            spec_driver = nullptr;
+        }
+        ddtree_root_tok      = LLAMA_TOKEN_NULL;
+        ddtree_committed_pos = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -563,6 +577,11 @@ private:
 
     llama_model_ptr model_dft;
 
+    // DDTree draft context — separate from the chain-mode draft since it needs
+    // different n_ctx / n_batch sizing (small, fixed to draft block_size).
+    // Null when ddtree_mode is off.
+    llama_context * ctx_ddtree_dft = nullptr;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -600,6 +619,16 @@ private:
         for (server_slot & slot : slots) {
             common_speculative_free(slot.spec);
             slot.spec = nullptr;
+
+            if (slot.spec_driver) {
+                llama_speculative_tree_driver_free(slot.spec_driver);
+                slot.spec_driver = nullptr;
+            }
+        }
+
+        if (ctx_ddtree_dft) {
+            llama_free(ctx_ddtree_dft);
+            ctx_ddtree_dft = nullptr;
         }
 
         llama_batch_free(batch);
@@ -691,6 +720,32 @@ private:
 
             params_base.speculative.model_dft = model_dft.get();
             params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+
+            // DDTree mode: create a dedicated draft context with the sizing the
+            // dflash-draft model expects (small n_ctx, small n_batch = block_size).
+            if (params_base.speculative.ddtree_mode) {
+                // Phase 5: single-slot only — enforce this up front.
+                if (params_base.n_parallel > 1) {
+                    fprintf(stderr, "DDTree mode supports only --parallel 1 in Phase 5\n");
+                    return false;
+                }
+
+                llama_context_params cparams_ddft = llama_context_default_params();
+                cparams_ddft.n_ctx   = 2048 + 16; // DRAFT_CTX_MAX + block_size
+                cparams_ddft.n_batch = 16;         // one block per decode
+
+                ctx_ddtree_dft = llama_init_from_model(model_dft.get(), cparams_ddft);
+                if (!ctx_ddtree_dft) {
+                    SRV_ERR("%s", "failed to create DDTree draft context\n");
+                    return false;
+                }
+                SRV_INF("%s", "DDTree draft context initialized\n");
+
+                // Enable hidden capture on the target context so the driver can
+                // read intermediate layer features for tree scoring.
+                llama_set_capture_hidden(ctx, true);
+                SRV_INF("%s", "DDTree: hidden capture enabled on target context\n");
+            }
         }
 
         std::string & mmproj_path = params_base.mmproj.path;
@@ -2091,6 +2146,15 @@ private:
                 continue;
             }
 
+            // DDTree slots drive their own batch submissions internally via the driver.
+            // Skip the normal token-addition and batch-decode path for them.
+            if (params_base.speculative.ddtree_mode && slot.spec_driver) {
+                if (!slot_batched) {
+                    slot_batched = &slot;
+                }
+                continue;
+            }
+
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
                 slot_batched = &slot;
@@ -2713,10 +2777,25 @@ private:
         }
 
         if (batch.n_tokens == 0) {
-            SRV_WRN("%s", "no tokens to decode\n");
+            // DDTree slots don't put tokens in the main batch (driver handles its own decodes).
+            // Check if any DDTree slot is actively generating before counting as empty.
+            bool has_ddtree_generating = false;
+            if (params_base.speculative.ddtree_mode) {
+                for (const auto & slot : slots) {
+                    if (slot.state == SLOT_STATE_GENERATING && slot.spec_driver &&
+                        slot.ddtree_root_tok != LLAMA_TOKEN_NULL && slot.has_next_token) {
+                        has_ddtree_generating = true;
+                        break;
+                    }
+                }
+            }
 
-            if (++n_empty_consecutive > 3) {
-                GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
+            if (!has_ddtree_generating) {
+                SRV_WRN("%s", "no tokens to decode\n");
+
+                if (++n_empty_consecutive > 3) {
+                    GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
+                }
             }
         } else {
             n_empty_consecutive = 0;
@@ -2853,11 +2932,61 @@ private:
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
 
+                    if (params_base.speculative.ddtree_mode && ctx_ddtree_dft) {
+                        // DDTree: build driver and ingest the prompt prefill capture.
+                        // The driver must be freed in slot.reset() (called from slot.release()).
+                        llama_ddtree_params ddparams;
+                        ddparams.budget     = params_base.speculative.ddtree_budget;
+                        ddparams.temp       = params_base.speculative.ddtree_temp;
+                        ddparams.chain_seed = params_base.speculative.ddtree_chain_seed;
+                        ddparams.block_size = 16; // dflash-draft fixed block size
+
+                        slot.spec_driver = llama_speculative_tree_driver_init(ctx, ctx_ddtree_dft, ddparams);
+                        if (!slot.spec_driver) {
+                            SLT_ERR(slot, "%s", "failed to init DDTree driver, falling back to EOS\n");
+                            slot.stop = STOP_TYPE_EOS;
+                            slot.has_next_token = false;
+                            slot.print_timings();
+                            send_final_response(slot);
+                            metrics.on_prediction(slot);
+                            slot.release();
+                            continue;
+                        }
+
+                        // Ingest the prompt prefill into the driver's ring buffer.
+                        llama_speculative_tree_driver_ingest_prompt_capture(
+                            slot.spec_driver, (int32_t)slot.prompt.tokens.size());
+
+                        // Greedy-sample the first generated token from the last prompt logit.
+                        const int tok_idx = slot.i_batch - i;
+                        const float * logits = llama_get_logits_ith(ctx, tok_idx);
+                        const int n_vocab = llama_vocab_n_tokens(vocab);
+                        llama_token first_tok = 0;
+                        float best = logits[0];
+                        for (int v = 1; v < n_vocab; ++v) {
+                            if (logits[v] > best) { best = logits[v]; first_tok = (llama_token)v; }
+                        }
+
+                        slot.ddtree_root_tok      = first_tok;
+                        slot.ddtree_committed_pos = (llama_pos)slot.prompt.tokens.size();
+                        slot.i_batch              = -1;
+
+                        slot.t_start_generation  = ggml_time_us();
+                        slot.t_prompt_processing  = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                        metrics.on_prompt_eval(slot);
+                        continue; // will be handled in the DDTree generation loop below
+                    }
+
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
+                }
+
+                // DDTree slots run their driver step outside this loop (after llama_decode)
+                if (params_base.speculative.ddtree_mode && slot.spec_driver) {
+                    continue;
                 }
 
                 if (slot.i_batch_dft.size() > 0) {
@@ -2959,6 +3088,75 @@ private:
                 }
 
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
+            }
+        }
+
+        // DDTree generation: run one spec-decode step per slot, after the main llama_decode.
+        // The driver calls llama_decode on ctx internally (tree-mode batch), so it must run
+        // outside the main decode loop.
+        if (params_base.speculative.ddtree_mode) {
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING || !slot.spec_driver) {
+                    continue;
+                }
+                if (slot.ddtree_root_tok == LLAMA_TOKEN_NULL || !slot.has_next_token) {
+                    continue;
+                }
+
+                auto accepted = llama_speculative_tree_driver_step(
+                    slot.spec_driver, slot.ddtree_root_tok, slot.ddtree_committed_pos);
+
+                if (accepted.empty()) {
+                    SLT_ERR(slot, "%s", "DDTree driver step returned empty result, treating as EOS\n");
+                    slot.stop = STOP_TYPE_EOS;
+                    slot.has_next_token = false;
+                    slot.print_timings();
+                    send_final_response(slot);
+                    metrics.on_prediction(slot);
+                    slot.release();
+                    continue;
+                }
+
+                // accepted: [root_echo, draft_accepted..., bonus]
+                // commit everything except the bonus token
+                const int n_committed = (int)accepted.size() - 1;
+
+                const int64_t t_current = ggml_time_us();
+                slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+
+                bool slot_done = false;
+                for (int ai = 0; ai < n_committed; ++ai) {
+                    const llama_token tok = accepted[ai];
+
+                    slot.n_decoded += 1;
+
+                    completion_token_output result;
+                    result.tok          = tok;
+                    result.text_to_send = common_token_to_piece(ctx, tok, accept_special_token(slot, tok));
+                    result.prob         = 1.0f;
+
+                    // update sampler history so repetition penalties remain correct
+                    common_sampler_accept(slot.smpl.get(), tok, true);
+
+                    // track position in prompt token list
+                    slot.prompt.tokens.push_back(tok);
+
+                    if (!process_token(result, slot)) {
+                        slot.print_timings();
+                        send_final_response(slot);
+                        metrics.on_prediction(slot);
+                        slot.release();
+                        slot_done = true;
+                        break;
+                    }
+                }
+
+                if (!slot_done) {
+                    slot.ddtree_root_tok      = accepted.back(); // bonus = next root
+                    slot.ddtree_committed_pos += (llama_pos)n_committed;
+                    slot.n_draft_total        += params_base.speculative.ddtree_budget;
+                    slot.n_draft_accepted     += n_committed - 1; // root was not a draft, rest were
+                }
             }
         }
 

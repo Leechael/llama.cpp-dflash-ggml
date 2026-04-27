@@ -246,3 +246,87 @@ for comparison.
 
 The chain-reference comparison in Test 4.A gives strong independent functional
 verification and is sufficient for Phase 4 sign-off.
+
+---
+
+# DDTree Phase 5 test fixtures
+
+Phase 5 integrates the DDTree driver into `llama-server` as a selectable
+speculative-decode mode (`--speculative-mode ddtree`).  There are no new
+binary test fixtures; validation is done via two shell scripts in the
+super-repo `scripts/` directory that run against the server on Castle.
+
+## New CLI flags (impl agent deliverables)
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--speculative-mode {chain,ddtree}` | string | chain | selects speculative backend |
+| `--ddtree-budget N` | int | 22 | max draft tokens per tree step |
+| `--ddtree-temp F` | float | 0.0 | draft sampling temperature |
+| `--ddtree-no-chain-seed` | bool flag | off | disable chain-seed warmup |
+
+These flags are parsed in `common/arg.cpp`.  The HTTP API surface is
+unchanged: same OpenAI-compatible `/v1/chat/completions` and
+`/v1/messages` endpoints, SSE streaming, `tool_use`, and
+`reasoning_content` all work identically to chain mode.
+
+Only `--parallel 1` (single slot) is supported in Phase 5.
+
+## Test 5.A — Smoke test (primary acceptance)
+
+Run from the local mac:
+
+```bash
+# Default (port 8003, single prompt)
+./repo/scripts/run_server_ddtree_castle.sh
+
+# Custom port and prompt
+./repo/scripts/run_server_ddtree_castle.sh 8003 "Write a haiku."
+```
+
+What the script does:
+
+1. Verifies the `llama-server` binary exists on Castle.
+2. Kills any leftover DDTree-mode server (idempotent).
+3. Starts the server via `nohup` on Castle, logging to `/tmp/ddtree_server.log`.
+4. Polls `/health` up to 60 s (2 s interval).
+5. Sends one non-streaming `POST /v1/chat/completions` and validates
+   `choices[0].message.content` is non-empty.
+6. Sends one streaming request and confirms SSE `data:` lines arrive.
+7. Prints the last 50 lines of the server log.
+8. Stops the server.
+9. Exits 0 (SMOKE PASS) or non-zero (SMOKE FAIL).
+
+## Test 5.B — Mode comparison (optional / informational)
+
+```bash
+./repo/scripts/compare_server_modes_castle.sh
+# or with a custom prompt:
+./repo/scripts/compare_server_modes_castle.sh "Describe the sky in exactly 32 tokens."
+```
+
+Starts both a chain-mode server (port 8001) and a DDTree-mode server
+(port 8003) on Castle, sends the same greedy (`temperature: 0`,
+`max_tokens: 32`) prompt to each, and reports the first word-level
+divergence index.
+
+**Expected outcome**: divergence at word index >= 17.  This matches the
+Phase 4 finding that chain and DDTree outputs are bit-equal up to
+approximately 17 tokens per speculative-step boundary, then diverge due
+to KV-cache / conversation-state differences in the server slot state
+machine.  Divergence at or above that threshold is not a regression.
+Early divergence (word index < 17) warrants investigation.
+
+The script always exits 0; the comparison is informational.
+
+## Phase 5 acceptance criteria
+
+Phase 5 acceptance is **smoke level only**:
+
+- `run_server_ddtree_castle.sh` exits 0 (SMOKE PASS).
+- Non-streaming completion returns valid JSON with non-empty content.
+- SSE streaming delivers at least one `data:` chunk.
+
+Full production replacement of `dflash/scripts/server.py` (pointing
+Claude Code at `http://castle.local:8002/v1`) is the user's **manual**
+validation step and is outside automated testing scope.
