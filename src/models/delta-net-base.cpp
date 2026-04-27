@@ -428,14 +428,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * b,
         ggml_tensor * s,
         int           il) {
-    // dispatch to tree variant when parent_ids are available.
-    // LLAMA_DDTREE_FORCE_CHAIN_KERNEL=1 forces the chain kernel; diagnostic only
-    // (sibling/cousin tokens become wrong, root stays equivalent).
-    static const bool s_ddtree_force_chain_kernel = []{
-        const char * e = getenv("LLAMA_DDTREE_FORCE_CHAIN_KERNEL");
-        return e && e[0] == '1';
-    }();
-    if (parent_ids != nullptr && !s_ddtree_force_chain_kernel) {
+    // dispatch to tree variant when parent_ids are available
+    if (parent_ids != nullptr) {
         // Phase 2.4: fetch per-layer persist buffer from graph context if allocated
         ggml_tensor * persist_inter = nullptr;
         if (dflash_persist_inter_l != nullptr && il >= 0 &&
