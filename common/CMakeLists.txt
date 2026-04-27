@@ -90,6 +90,8 @@ add_library(${TARGET} STATIC
     sampling.h
     speculative.cpp
     speculative.h
+    speculative-tree.cpp
+    speculative-tree.h
     unicode.cpp
     unicode.h
     jinja/lexer.cpp
