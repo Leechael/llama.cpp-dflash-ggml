@@ -159,9 +159,25 @@ static void driver_ingest_capture(llama_speculative_tree_driver * d,
         return;
     }
 
-    for (int32_t i = 0; i < n_dfs; ++i) {
+    // Clamp n_dfs to what the capture actually contains. The server may call
+    // ingest_prompt_capture(slot.prompt_size) when only the new (uncached) tail
+    // of the prompt actually went through llama_decode — the capture only holds
+    // the most recent decode's columns. Out-of-range reads here would be UB.
+    int32_t n_to_ingest = n_dfs;
+    if (dfs_indices == nullptr && n_to_ingest > (int32_t)n_tokens) {
+        LOG_WRN("%s: requested n_dfs=%d but capture only has n_tokens=%lld; clamping (ring will be incomplete)\n",
+                __func__, n_dfs, (long long)n_tokens);
+        n_to_ingest = (int32_t)n_tokens;
+    }
+
+    for (int32_t i = 0; i < n_to_ingest; ++i) {
         // Source column index in the capture buffer (within each layer's block).
         const int64_t src_col = (dfs_indices != nullptr) ? (int64_t)dfs_indices[i] : (int64_t)i;
+        if (src_col < 0 || src_col >= n_tokens) {
+            LOG_ERR("%s: src_col=%lld out of capture range [0, %lld)\n",
+                    __func__, (long long)src_col, (long long)n_tokens);
+            break;
+        }
 
         // Destination ring column (linear, no rotation in first cut).
         const int64_t dst_col = d->target_feat_n_committed + (int64_t)i;
@@ -180,9 +196,9 @@ static void driver_ingest_capture(llama_speculative_tree_driver * d,
         }
     }
 
-    d->target_feat_n_committed += (int64_t)n_dfs;
+    d->target_feat_n_committed += (int64_t)n_to_ingest;
     if (d->target_feat_n_committed > d->target_feat_cap) {
-        d->target_feat_n_committed = d->target_feat_cap; // clamp
+        d->target_feat_n_committed = d->target_feat_cap;
     }
 }
 
