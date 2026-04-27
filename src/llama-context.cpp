@@ -3606,16 +3606,10 @@ bool llama_context::dflash_rollback_ssm_to_dfs(llama_seq_id seq_id, int32_t acce
 
     const int64_t n_embd_s = (int64_t)hparams.n_embd_s();
 
-    // One column in the persist buffer = n_embd_s F16 elements.
-    const size_t col_bytes = (size_t)n_embd_s * sizeof(ggml_fp16_t);
-    const size_t src_offset = (size_t)accepted_dfs_node * col_bytes;
-
-    // The SSM state tensor is [n_embd_s, mem_size]. The tail cell's row is at
-    // cell_id * n_embd_s elements, i.e. cell_id * col_bytes bytes from the tensor base.
-    const size_t dst_offset = (size_t)cell_id * col_bytes;
-
-    // Bounce through host memory: get from persist, set into s_l.
-    std::vector<uint8_t> bounce(col_bytes);
+    // Persist tensor is F16; s_state may be F32 (Qwen3.5 hybrid stores SSM in F32).
+    // Bounce through host memory and convert if needed.
+    std::vector<ggml_fp16_t> bounce_f16((size_t)n_embd_s);
+    std::vector<float>       bounce_f32((size_t)n_embd_s);
 
     for (int il = 0; il < n_layer; ++il) {
         if (!hparams.is_recurrent(il)) { continue; }
@@ -3623,7 +3617,6 @@ bool llama_context::dflash_rollback_ssm_to_dfs(llama_seq_id seq_id, int32_t acce
         ggml_tensor * s_state = (il < (int32_t)mem_recr->s_l.size()) ? mem_recr->s_l[il] : nullptr;
         if (!persist || !s_state) { continue; }
 
-        // Verify column is within the allocated buffer capacity.
         if (accepted_dfs_node >= dflash_persist_max_n_tokens) {
             LLAMA_LOG_WARN("%s: accepted_dfs_node=%d >= persist capacity=%lld at il=%d\n",
                            __func__, (int)accepted_dfs_node,
@@ -3631,12 +3624,23 @@ bool llama_context::dflash_rollback_ssm_to_dfs(llama_seq_id seq_id, int32_t acce
             continue;
         }
 
-        // Verify state element sizes match (both F16).
-        GGML_ASSERT(persist->type == GGML_TYPE_F16);
-        GGML_ASSERT(s_state->type == GGML_TYPE_F16);
+        GGML_ASSERT(persist->type == GGML_TYPE_F16 && "persist buffer must be F16 (matches kernel write)");
 
-        ggml_backend_tensor_get(persist, bounce.data(), src_offset, col_bytes);
-        ggml_backend_tensor_set(s_state, bounce.data(), dst_offset, col_bytes);
+        const size_t persist_col_bytes = (size_t)n_embd_s * sizeof(ggml_fp16_t);
+        const size_t persist_offset    = (size_t)accepted_dfs_node * persist_col_bytes;
+        ggml_backend_tensor_get(persist, bounce_f16.data(), persist_offset, persist_col_bytes);
+
+        const size_t state_row_bytes = ggml_row_size(s_state->type, n_embd_s);
+        const size_t state_offset    = (size_t)cell_id * state_row_bytes;
+
+        if (s_state->type == GGML_TYPE_F16) {
+            ggml_backend_tensor_set(s_state, bounce_f16.data(), state_offset, state_row_bytes);
+        } else if (s_state->type == GGML_TYPE_F32) {
+            ggml_fp16_to_fp32_row(bounce_f16.data(), bounce_f32.data(), n_embd_s);
+            ggml_backend_tensor_set(s_state, bounce_f32.data(), state_offset, state_row_bytes);
+        } else {
+            GGML_ABORT("dflash_rollback_ssm_to_dfs: unsupported s_state type");
+        }
     }
 
     return true;
