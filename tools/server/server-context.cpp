@@ -2917,8 +2917,6 @@ private:
                     // Append n_tokens columns from this decode's capture buffer to the ring.
                     llama_speculative_tree_driver_ingest_prompt_capture(
                         slot.spec_driver, (int32_t)n_tokens);
-                    SLT_INF(slot, "DDTree: ingested %d cols (ubatch i=%d, n_batch=%d)\n",
-                            (int)n_tokens, (int)i, (int)batch.n_tokens);
                 }
             }
 

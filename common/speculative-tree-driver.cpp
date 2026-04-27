@@ -256,14 +256,6 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     const int64_t ctx_len = std::min(n_committed, (int64_t)DRAFT_CTX_MAX);
     const int64_t ring_start = n_committed - ctx_len; // first ring column to include
 
-    static int dbg_step = 0;
-    if (dbg_step < 3) {
-        LOG_INF("ddtree-step[%d]: n_committed=%lld committed_pos=%d ctx_len=%lld ring_start=%lld\n",
-                dbg_step, (long long)n_committed, (int)committed_pos,
-                (long long)ctx_len, (long long)ring_start);
-        ++dbg_step;
-    }
-
     // Copy the selected columns from the ring into a contiguous [5*n_embd, ctx_len] buffer
     // where the output is column-major: out[t * 5*n_embd + l*n_embd .. +n_embd] = layer l at pos t.
     d->target_feat_buf.resize((size_t)5 * n_embd * ctx_len);
