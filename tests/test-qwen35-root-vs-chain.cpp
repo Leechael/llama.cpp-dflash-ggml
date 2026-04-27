@@ -143,9 +143,11 @@ static std::vector<float> run_chain_then_tree_root(llama_model * model,
     tbatch.seq_id[0][0] = 0;
     tbatch.parent_id[0] = -1;
     tbatch.logits[0]    = 1;
-    // siblings: identical token, depth 1, parent = root (flat index 0)
+    // siblings: depth 1, parent = root, token taken from prompt history (cyclic)
+    // so the tree batch has *distinct* tokens like a real spec verify ubatch.
     for (int i = 1; i < n_nodes; ++i) {
-        tbatch.token[i]     = (llama_token)tokens[n_prefix];
+        const int src = (n_prefix - 1 - i + (int)tokens.size()) % (int)tokens.size();
+        tbatch.token[i]     = (llama_token)tokens[(src < 0 ? src + (int)tokens.size() : src)];
         tbatch.pos[i]       = n_prefix + 1;
         tbatch.n_seq_id[i]  = 1;
         tbatch.seq_id[i][0] = 0;
