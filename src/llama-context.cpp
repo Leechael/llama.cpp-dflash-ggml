@@ -1082,6 +1082,97 @@ const float * llama_context::get_hidden_capture_data(int64_t * out_ne0, int64_t 
     return hidden_capture_host.data();
 }
 
+ggml_tensor * llama_context::dflash_get_persist_inter(int32_t il) const {
+    if (il < 0 || il >= (int32_t)dflash_persist_inter_l.size()) {
+        return nullptr;
+    }
+    return dflash_persist_inter_l[il];
+}
+
+void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
+    if (model.arch != LLM_ARCH_QWEN35) {
+        return; // only Qwen3.5 uses delta-net recurrent layers
+    }
+    if (n_tokens <= dflash_persist_max_n_tokens) {
+        return; // already large enough
+    }
+
+    // Derive SSM dimensions from hparams (same as build_layer_attn_linear).
+    const auto & hparams = model.hparams;
+    const int64_t d_inner   = hparams.ssm_d_inner;
+    const int64_t num_v_heads = hparams.ssm_dt_rank;    // H_v
+    const int64_t head_v_dim  = d_inner / num_v_heads;  // S_v
+    const int32_t n_layer    = (int32_t)hparams.n_layer;
+
+    // Release existing allocation before reallocating.
+    dflash_persist_inter_l.clear();
+    dflash_persist_inter_buf.reset();
+    dflash_persist_inter_ctx.reset();
+
+    // Allocate one ggml context to hold all layer tensors.
+    struct ggml_init_params init_params = {
+        /* mem_size   = */ ggml_tensor_overhead() * (size_t)n_layer + 1024,
+        /* mem_buffer = */ nullptr,
+        /* no_alloc   = */ true,
+    };
+    dflash_persist_inter_ctx.reset(ggml_init(init_params));
+    if (!dflash_persist_inter_ctx) {
+        LLAMA_LOG_ERROR("%s: failed to create ggml context for persist buffers\n", __func__);
+        return;
+    }
+
+    dflash_persist_inter_l.resize(n_layer, nullptr);
+
+    // Determine the buffer type: use the device backend of the first recurrent layer's
+    // SSM state tensor so the persist buffer lives on the same device.
+    auto * raw_mem   = memory.get();
+    auto * mem_recr  = dynamic_cast<llama_memory_recurrent *>(raw_mem);
+    if (!mem_recr) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(raw_mem)) {
+            mem_recr = hyb->get_mem_recr();
+        }
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (mem_recr) {
+        for (int il = 0; il < n_layer; ++il) {
+            if (hparams.is_recurrent(il) && mem_recr->s_l[il] != nullptr &&
+                    mem_recr->s_l[il]->buffer != nullptr) {
+                buft = ggml_backend_buffer_get_type(mem_recr->s_l[il]->buffer);
+                break;
+            }
+        }
+    }
+
+    for (int il = 0; il < n_layer; ++il) {
+        if (!hparams.is_recurrent(il)) {
+            continue; // full-attn layer — no persist buffer needed
+        }
+        // Shape [S_v, S_v, H_v, n_tokens] F16 — matches ggml_gated_delta_net_tree_persist output
+        ggml_tensor * t = ggml_new_tensor_4d(dflash_persist_inter_ctx.get(),
+                GGML_TYPE_F16, head_v_dim, head_v_dim, num_v_heads, n_tokens);
+        ggml_format_name(t, "dflash_persist_il%d", il);
+        dflash_persist_inter_l[il] = t;
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(
+            dflash_persist_inter_ctx.get(), buft);
+    if (!buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate persist buffers (n_tokens=%lld)\n",
+                        __func__, (long long)n_tokens);
+        dflash_persist_inter_l.assign(n_layer, nullptr);
+        dflash_persist_inter_ctx.reset();
+        return;
+    }
+    ggml_backend_buffer_clear(buf, 0);
+    dflash_persist_inter_buf.reset(buf);
+    dflash_persist_max_n_tokens = n_tokens;
+
+    LLAMA_LOG_INFO("%s: allocated dflash persist buffers: %d layers, %lld tokens, %.2f MiB\n",
+                   __func__, n_layer, (long long)n_tokens,
+                   (double)ggml_backend_buffer_get_size(buf) / (1024.0 * 1024.0));
+}
+
 void llama_context::set_target_feat_raw(const float * data, int64_t n_embd_fc, int64_t ctx_len,
                                         int64_t committed_pos) {
     // Stash non-owning pointer and dims; read by llm_graph_input_target_feat::set_input().
@@ -1598,6 +1689,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: parent_id (tree-mode batch) is only supported for LLM_ARCH_QWEN35, got arch=%d\n",
                         __func__, (int) model.arch);
         return -1;
+    }
+
+    // Phase 2.4: ensure SSM persist buffers are large enough for this tree batch.
+    // Must happen before graph_params() so the pointer is valid when building the graph.
+    if (batch_inp.parent_id != nullptr) {
+        ensure_dflash_persist_capacity((int64_t)batch_inp.n_tokens);
     }
 
     if (batch_inp.n_tokens == 0) {
@@ -2251,6 +2348,10 @@ llm_graph_params llama_context::graph_params(
         /*.pending_target_feat_n_embd_fc_ptr =*/ &pending_target_feat_n_embd_fc,
         /*.pending_target_feat_ctx_len_ptr   =*/ &pending_target_feat_ctx_len,
         /*.pending_draft_committed_pos_ptr   =*/ &pending_draft_committed_pos,
+        // Phase 2.4: pass persist buffer vector when in tree mode (parent_id is set).
+        // Non-null only after ensure_dflash_persist_capacity() ran in decode().
+        /*.dflash_persist_inter_l =*/ (!dflash_persist_inter_l.empty() && ubatch.parent_id != nullptr)
+                                        ? &dflash_persist_inter_l : nullptr,
     };
 }
 
@@ -3190,6 +3291,14 @@ void llama_set_target_feat_raw(llama_context * ctx,
     ctx->set_target_feat_raw(data, n_embd_fc, ctx_len, committed_pos);
 }
 
+bool llama_dflash_rollback_ssm_to_dfs(
+        struct llama_context * ctx,
+        llama_seq_id           seq_id,
+        int32_t                accepted_dfs_node) {
+    ctx->synchronize(); // ensure the tree-mode decode kernel has completed
+    return ctx->dflash_rollback_ssm_to_dfs(seq_id, accepted_dfs_node);
+}
+
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
 }
@@ -3465,6 +3574,72 @@ void llama_seq_release(struct llama_context * ctx, llama_mem_snapshot_id snap_id
     if (mem) {
         mem->release(snap_id);
     }
+}
+
+bool llama_context::dflash_rollback_ssm_to_dfs(llama_seq_id seq_id, int32_t accepted_dfs_node) {
+    if (dflash_persist_inter_l.empty()) {
+        LLAMA_LOG_WARN("%s: persist buffers not allocated (no tree-mode decode has run)\n", __func__);
+        return false;
+    }
+
+    // Resolve the recurrent memory module.
+    auto * raw_mem  = memory.get();
+    auto * mem_recr = dynamic_cast<llama_memory_recurrent *>(raw_mem);
+    if (!mem_recr) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(raw_mem)) {
+            mem_recr = hyb->get_mem_recr();
+        }
+    }
+    if (!mem_recr) {
+        LLAMA_LOG_WARN("%s: no recurrent memory module; rollback is a no-op\n", __func__);
+        return false;
+    }
+
+    const auto & hparams  = model.hparams;
+    const int32_t n_layer = (int32_t)hparams.n_layer;
+    const int32_t cell_id = (seq_id >= 0 && seq_id < (int32_t)mem_recr->cells.size())
+                                ? mem_recr->cells[seq_id].tail : -1;
+    if (cell_id < 0) {
+        LLAMA_LOG_WARN("%s: seq_id=%d has no tail cell; rollback skipped\n", __func__, (int)seq_id);
+        return false;
+    }
+
+    const int64_t n_embd_s = (int64_t)hparams.n_embd_s();
+
+    // One column in the persist buffer = n_embd_s F16 elements.
+    const size_t col_bytes = (size_t)n_embd_s * sizeof(ggml_fp16_t);
+    const size_t src_offset = (size_t)accepted_dfs_node * col_bytes;
+
+    // The SSM state tensor is [n_embd_s, mem_size]. The tail cell's row is at
+    // cell_id * n_embd_s elements, i.e. cell_id * col_bytes bytes from the tensor base.
+    const size_t dst_offset = (size_t)cell_id * col_bytes;
+
+    // Bounce through host memory: get from persist, set into s_l.
+    std::vector<uint8_t> bounce(col_bytes);
+
+    for (int il = 0; il < n_layer; ++il) {
+        if (!hparams.is_recurrent(il)) { continue; }
+        ggml_tensor * persist = dflash_persist_inter_l[il];
+        ggml_tensor * s_state = (il < (int32_t)mem_recr->s_l.size()) ? mem_recr->s_l[il] : nullptr;
+        if (!persist || !s_state) { continue; }
+
+        // Verify column is within the allocated buffer capacity.
+        if (accepted_dfs_node >= dflash_persist_max_n_tokens) {
+            LLAMA_LOG_WARN("%s: accepted_dfs_node=%d >= persist capacity=%lld at il=%d\n",
+                           __func__, (int)accepted_dfs_node,
+                           (long long)dflash_persist_max_n_tokens, il);
+            continue;
+        }
+
+        // Verify state element sizes match (both F16).
+        GGML_ASSERT(persist->type == GGML_TYPE_F16);
+        GGML_ASSERT(s_state->type == GGML_TYPE_F16);
+
+        ggml_backend_tensor_get(persist, bounce.data(), src_offset, col_bytes);
+        ggml_backend_tensor_set(s_state, bounce.data(), dst_offset, col_bytes);
+    }
+
+    return true;
 }
 
 void llama_kv_cache_seq_compact_tree(

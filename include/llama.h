@@ -1061,6 +1061,20 @@ extern "C" {
                                              int64_t                 ctx_len,
                                              int64_t                 committed_pos);
 
+    // dflash Phase 2.4: persist-based SSM rollback after tree verify.
+    // After llama_kv_cache_seq_compact_tree(), call this to copy the SSM state
+    // captured at DFS node accepted_dfs_node from the persist buffer back into
+    // the live recurrent cache for seq_id, replacing the snapshot/restore/replay path.
+    // Must be called after the tree-mode llama_decode() and before the next decode.
+    // Returns true on success, false if persist buffers are unavailable.
+    // KNOWN LIMITATION: conv state is NOT rolled back (see Phase 2.4 Task 4 — option b).
+    // Conv-state divergence decays within ~K_conv tokens; the chain-vs-spec test may
+    // diverge by a few tokens at each tree boundary before reconverging.
+    LLAMA_API bool llama_dflash_rollback_ssm_to_dfs(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            int32_t                accepted_dfs_node);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
