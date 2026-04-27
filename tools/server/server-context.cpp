@@ -2976,6 +2976,10 @@ private:
                         slot.ddtree_root_tok      = first_tok;
                         slot.ddtree_committed_pos = (llama_pos)slot.prompt.tokens.size();
                         slot.i_batch              = -1;
+                        // slot.reset() doesn't touch has_next_token; if the previous
+                        // request ended on a stop condition the flag is still false,
+                        // and the DDTree gen block would skip this slot forever.
+                        slot.has_next_token       = true;
 
                         slot.t_start_generation  = ggml_time_us();
                         slot.t_prompt_processing  = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
