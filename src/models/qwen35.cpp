@@ -14,23 +14,14 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    // dflash hidden capture buffer: [5*n_embd, n_tokens] F32.
-    // Allocated only when capture_hidden=true; nullptr otherwise (no overhead).
-    // Buffer layout: capture_idx * n_embd occupies rows [capture_idx*n_embd, (capture_idx+1)*n_embd).
-    // n_tokens in the column dimension matches the current ubatch.
-    ggml_tensor * hidden_cap_buf = nullptr;
-    if (capture_hidden) {
-        hidden_cap_buf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
-                                            n_embd,
-                                            (int64_t)5 * n_tokens);
-        ggml_set_name(hidden_cap_buf, "dflash_hidden_cap_buf");
-        // INPUT flag is required for ggml-alloc to assign the leaf a backend
-        // (the OUTPUT-only path leaves backend_id = -1 and asserts in gallocr).
-        // OUTPUT flag is added by llm_graph_result::set_outputs() so backend
-        // writes get synced back to host memory after the forward pass.
-        ggml_set_input(hidden_cap_buf);
-        res->t_hidden_capture = hidden_cap_buf;
-    }
+    // dflash hidden capture: per-slot tensors collected during the forward pass.
+    // Slots are ggml_concat'd into a single [n_embd, 5*n_tokens] tensor AFTER
+    // the layer loop and registered as t_hidden_capture (OUTPUT).  This ensures
+    // the concat node is a real compute graph output that gallocr / the sched
+    // execute and sync back to the host — avoiding the INPUT-leaf + cpy-to-view
+    // pattern which silently produces all-zeros on GPU (cpy dst is CPU-pinned
+    // while the src lives on the device backend).
+    ggml_tensor * cap_slots[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
 
     inpL = build_inp_embd(model.tok_embd);
 
@@ -87,22 +78,16 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_ffn", il);
 
-        // dflash hidden capture: if enabled, check whether this layer is in the
-        // target_capture_layers list and copy the post-FFN residual hidden states
-        // into the corresponding slot of hidden_cap_buf.
+        // dflash hidden capture: stash cur in cap_slots[k] for later concat.
         // Critical invariant: this block is NOT entered when capture_hidden==false,
         // so the baseline qwen35 forward is byte-for-byte unchanged.
-        if (capture_hidden && hidden_cap_buf) {
+        if (capture_hidden) {
             const auto & cl = hparams.dflash_target_capture_layers;
             for (int k = 0; k < 5; ++k) {
                 if ((int)cl[k] == il) {
-                    // dst_view: [n_embd, n_tokens] at row offset k*n_tokens in the buffer
-                    ggml_tensor * dst_view = ggml_view_2d(ctx0, hidden_cap_buf,
-                        n_embd,   n_tokens,
-                        hidden_cap_buf->nb[1],
-                        (size_t)k * n_tokens * n_embd * ggml_element_size(hidden_cap_buf));
-                    ggml_tensor * src_2d = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
-                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_2d, dst_view));
+                    // ggml_cont ensures the slot is a standalone contiguous node
+                    // (cur may be a non-owning view after certain ops).
+                    cap_slots[k] = ggml_cont(ctx0, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens));
                     break;
                 }
             }
@@ -115,6 +100,24 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         inpL = cur;
     }
     cur = inpL;
+
+    // dflash hidden capture: concat the 5 collected slots along dim 1 into
+    // [n_embd, 5*n_tokens] and register as t_hidden_capture (OUTPUT).
+    // The concat result is a regular compute node — gallocr schedules it on the
+    // device backend and the sched syncs it to host after the forward pass.
+    if (capture_hidden) {
+        for (int k = 0; k < 5; ++k) {
+            GGML_ASSERT(cap_slots[k] != nullptr &&
+                "dflash_target_capture_layers must cover all 5 slots; check hparams");
+        }
+        ggml_tensor * cap = ggml_concat(ctx0, cap_slots[0], cap_slots[1], 1);
+        cap = ggml_concat(ctx0, cap, cap_slots[2], 1);
+        cap = ggml_concat(ctx0, cap, cap_slots[3], 1);
+        cap = ggml_concat(ctx0, cap, cap_slots[4], 1);
+        ggml_set_name(cap, "dflash_hidden_capture");
+        ggml_build_forward_expand(gf, cap);
+        res->t_hidden_capture = cap;
+    }
 
     // Final norm
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
