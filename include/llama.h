@@ -1026,6 +1026,15 @@ extern "C" {
     LLAMA_API void           llama_set_capture_hidden(struct llama_context * ctx, bool enable);
     LLAMA_API struct ggml_tensor * llama_get_hidden_capture(struct llama_context * ctx);
 
+    // Host-side accessor: returns a pointer into a context-owned CPU buffer that
+    // mirrors the device-side capture tensor after llama_decode(). The buffer is
+    // populated via ggml_backend_tensor_get_async during decode synchronization.
+    // Returns NULL when capture is disabled or no decode has run yet.
+    // out_ne0 / out_ne1 receive the tensor dimensions.
+    LLAMA_API const float * llama_get_hidden_capture_data(struct llama_context * ctx,
+                                                          int64_t * out_ne0,
+                                                          int64_t * out_ne1);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

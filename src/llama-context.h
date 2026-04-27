@@ -109,6 +109,10 @@ struct llama_context {
     void          set_capture_hidden(bool enable);
     ggml_tensor * get_hidden_capture() const;
 
+    // Host-side accessor: returns pointer into hidden_capture_host (always CPU).
+    // Returns nullptr if capture is disabled or no decode has run.
+    const float * get_hidden_capture_data(int64_t * out_ne0, int64_t * out_ne1) const;
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -347,6 +351,13 @@ private:
     // dflash hidden capture: when true, qwen35 forward writes captured hidden states
     // into a graph output tensor; accessible via get_hidden_capture() after decode.
     bool capture_hidden = false;
+
+    // host-side mirror of t_hidden_capture, populated via ggml_backend_tensor_get_async
+    // after each decode. get_hidden_capture_data() returns into this buffer so callers
+    // don't dereference device pointers.
+    std::vector<float> hidden_capture_host;
+    int64_t            hidden_capture_ne0 = 0;
+    int64_t            hidden_capture_ne1 = 0;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
