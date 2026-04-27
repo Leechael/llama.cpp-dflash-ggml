@@ -812,9 +812,10 @@ int64_t llm_graph_result::get_max_nodes() const {
 void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
-    t_logits      = nullptr;
-    t_embd        = nullptr;
-    t_embd_pooled = nullptr;
+    t_logits        = nullptr;
+    t_embd          = nullptr;
+    t_embd_pooled   = nullptr;
+    t_hidden_capture = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -852,6 +853,9 @@ void llm_graph_result::set_outputs() {
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
+    }
+    if (t_hidden_capture != nullptr) {
+        ggml_set_output(t_hidden_capture);
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
