@@ -580,6 +580,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // If true, qwen35 forward writes hidden states at dflash_target_capture_layers
+    // into t_hidden_capture on the result. No-op (zero overhead) when false.
+    bool capture_hidden = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -638,11 +642,12 @@ struct llm_graph_params {
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
-            arch  == other.arch  &&
-            gtype == other.gtype &&
-            cvec  == other.cvec  &&
-            loras == other.loras &&
-            cross == other.cross;
+            arch           == other.arch           &&
+            gtype          == other.gtype          &&
+            cvec           == other.cvec           &&
+            loras          == other.loras          &&
+            cross          == other.cross          &&
+            capture_hidden == other.capture_hidden;
     }
 };
 
@@ -653,9 +658,10 @@ public:
     virtual ~llm_graph_result() = default;
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
-    ggml_tensor * get_logits()      const { return t_logits; }
-    ggml_tensor * get_embd()        const { return t_embd; }
-    ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+    ggml_tensor * get_logits()         const { return t_logits; }
+    ggml_tensor * get_embd()           const { return t_embd; }
+    ggml_tensor * get_embd_pooled()    const { return t_embd_pooled; }
+    ggml_tensor * get_hidden_capture() const { return t_hidden_capture; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -679,11 +685,13 @@ public:
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
-    ggml_tensor * t_inp_tokens  = nullptr;
-    ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
-    ggml_tensor * t_logits      = nullptr;
-    ggml_tensor * t_embd        = nullptr;
-    ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_inp_tokens    = nullptr;
+    ggml_tensor * t_inp_embd      = nullptr; // [n_embd_inp, n_tokens]
+    ggml_tensor * t_logits        = nullptr;
+    ggml_tensor * t_embd          = nullptr;
+    ggml_tensor * t_embd_pooled   = nullptr;
+    // dflash hidden capture: [5*n_embd, n_tokens] F32, populated when capture_hidden=true in graph_params
+    ggml_tensor * t_hidden_capture = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -770,6 +778,9 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // dflash hidden capture: propagated from llm_graph_params::capture_hidden
+    const bool capture_hidden;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
