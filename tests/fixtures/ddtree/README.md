@@ -84,3 +84,101 @@ Requires `test_dflash --dump-state-at-commit`, a Phase 0 prerequisite not yet im
 ## Test 2.C — deferred
 
 Long-prompt OOM stress test deferred to Phase 5 server integration.
+
+---
+
+# DDTree Phase 3 test fixtures
+
+## Files
+
+- `dflash_draft_metadata_smoke.json` — expected GGUF metadata fields for a
+  converted dflash-draft model.  Used by `check_dflash_draft_gguf.py`.
+
+## Build
+
+Both Phase 3 test binaries are gated behind a single CMake option (off by
+default, not in ctest):
+
+```
+cmake -DLLAMA_BUILD_TESTS_DFLASH_DRAFT=ON <other flags> ..
+make test-dflash-draft test-qwen35-chain-capture
+```
+
+Requires:
+- A Qwen3.5-27B GGUF (~16 GB).
+- A converted dflash-draft GGUF (see conversion step below).
+- Phase 3 implementation API: `llama_model_token_embd_lookup`,
+  `llama_set_capture_hidden`, `llama_get_hidden_capture`.
+
+## Converting safetensors to dflash-draft GGUF
+
+The conversion script is written by the implementation agent in parallel.
+Once it lands at `repo/dflash/scripts/convert_dflash_draft.py`:
+
+```bash
+python repo/dflash/scripts/convert_dflash_draft.py \
+    /path/to/dflash_draft/model.safetensors \
+    -o /path/to/draft.gguf
+```
+
+Until the script lands this step is a TODO.
+
+## Validating the converted GGUF (Test 3.A)
+
+```bash
+python repo/scripts/check_dflash_draft_gguf.py \
+    /path/to/draft.gguf \
+    tests/fixtures/ddtree/dflash_draft_metadata_smoke.json
+# Exit 0: PASS. Exit 1: one line per discrepant field on stderr.
+```
+
+## Test 3.B — Draft forward bit-equal vs dflash reference
+
+BLOCKED on Phase 0 prerequisite: `test_dflash --dump-draft-output` flag is
+not yet implemented.  Until that flag lands, no golden reference exists and
+the end-to-end comparison cannot be run.
+
+The driver (`test-dflash-draft`) can still be used standalone to inspect
+draft logits:
+
+```bash
+./test-dflash-draft \
+    --target-model /path/to/Qwen3.5-27B-Q4_K_M.gguf \
+    --draft-model  /path/to/draft.gguf \
+    --last-tok     12345 \
+    --target-feat-bin /path/to/target_feat.bin \
+    --out-logits   /tmp/draft_logits.bin
+
+# Once the Phase 0 flag lands, compare against the dflash reference dump:
+python3 scripts/compare_logits.py /tmp/dflash_draft_golden.bin /tmp/draft_logits.bin
+```
+
+## Test 3.C — Hidden capture does not break chain mode
+
+Run both capture and no-capture modes in a single invocation.  The driver
+asserts logits are bit-equal and that the capture buffer contains valid
+(non-NaN, non-zero) values.
+
+```bash
+./test-qwen35-chain-capture \
+    --model        /path/to/Qwen3.5-27B-Q4_K_M.gguf \
+    --prompt-tokens fixtures/ddtree/short_prompt.bin \
+    --out-logits   /tmp/capture_logits.bin \
+    --out-capture  /tmp/capture_buf.bin
+# Exit 0: both assertions passed.
+```
+
+Regression-only mode (skips Mode A, writes no-capture logits for external
+comparison against a Phase 1 chain golden dump):
+
+```bash
+./test-qwen35-chain-capture \
+    --model        /path/to/Qwen3.5-27B-Q4_K_M.gguf \
+    --prompt-tokens fixtures/ddtree/short_prompt.bin \
+    --out-logits   /tmp/nocapture_logits.bin \
+    --out-capture  /dev/null \
+    --no-capture
+
+# Compare against Phase 1 chain baseline:
+python3 scripts/compare_logits.py /tmp/chain_golden.bin /tmp/nocapture_logits.bin --abs-tol 0 --rel-tol 0
+```

@@ -318,3 +318,15 @@ if (LLAMA_BUILD_TESTS_QWEN35_TREE_ROLLBACK)
     llama_build(test-qwen35-tree-rollback.cpp)
     # Note: NOT registered with llama_test / add_test — must be run manually.
 endif()
+
+# DDTree Phase 3 acceptance tests: dflash-draft forward + hidden-state capture.
+# Requires a 16+ GB Qwen3.5-27B GGUF and a converted dflash-draft GGUF.
+# Requires Phase 3 API from the implementation agent:
+#   llama_model_token_embd_lookup, llama_set_capture_hidden, llama_get_hidden_capture.
+# Enable manually: cmake -DLLAMA_BUILD_TESTS_DFLASH_DRAFT=ON ...
+option(LLAMA_BUILD_TESTS_DFLASH_DRAFT "Build DDTree Phase 3 dflash-draft and chain-capture acceptance tests (requires large GGUFs)" OFF)
+if (LLAMA_BUILD_TESTS_DFLASH_DRAFT)
+    llama_build(test-dflash-draft.cpp)
+    llama_build(test-qwen35-chain-capture.cpp)
+    # Note: NOT registered with llama_test / add_test — must be run manually.
+endif()
