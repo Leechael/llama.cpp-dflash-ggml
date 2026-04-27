@@ -1,0 +1,11 @@
+{
+  "expected_arch": "dflash-draft",
+  "expected_n_layer": 5,
+  "expected_n_embd": 5120,
+  "expected_n_head": 32,
+  "expected_n_head_kv": 8,
+  "expected_target_n_embd": 5120,
+  "expected_mask_token_id": 248070,
+  "expected_block_size": 16,
+  "expected_capture_layers": [1, 16, 31, 46, 61]
+}
