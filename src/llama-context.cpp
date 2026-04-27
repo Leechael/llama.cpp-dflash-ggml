@@ -3651,7 +3651,8 @@ void llama_kv_cache_seq_compact_tree(
         llama_seq_id           seq_id,
         const int32_t        * accepted_dfs,
         int32_t                n_accepted,
-        int32_t                commit_n) {
+        int32_t                commit_n,
+        int32_t                spine_start) {
     auto * raw_mem = ctx->get_memory();
     llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(raw_mem);
     if (!kv) {
@@ -3664,7 +3665,7 @@ void llama_kv_cache_seq_compact_tree(
         return;
     }
     std::vector<int32_t> dfs_vec(accepted_dfs, accepted_dfs + n_accepted);
-    kv->seq_compact_tree(seq_id, dfs_vec, commit_n);
+    kv->seq_compact_tree(seq_id, dfs_vec, commit_n, spine_start);
 }
 
 // llama state API

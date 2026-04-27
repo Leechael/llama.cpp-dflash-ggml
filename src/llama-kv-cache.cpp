@@ -611,9 +611,11 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 void llama_kv_cache::seq_compact_tree(
         llama_seq_id seq_id,
         const std::vector<int32_t> & accepted_dfs,
-        int32_t commit_n) {
+        int32_t commit_n,
+        int32_t spine_start) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(commit_n >= 0 && commit_n <= (int32_t) accepted_dfs.size());
+    GGML_ASSERT(spine_start >= 0);
 
     if (commit_n == 0) {
         return;
@@ -622,15 +624,17 @@ void llama_kv_cache::seq_compact_tree(
     const uint32_t strm = seq_to_stream[seq_id];
     auto & cells = v_cells[strm];
 
-    // Copy K/V rows from accepted_dfs[i] to spine slot i for all committed tokens.
-    // ggml_backend_tensor_copy doesn't follow view_src->buffer; use tensor_get/set
-    // with explicit offsets and a host bounce buffer (same pattern as the
-    // recurrent snapshot/restore path).
+    // accepted_dfs[i] is the tree-local DFS index of the i-th accepted node.
+    // The tree was placed at slots [spine_start, spine_start + N), so absolute
+    // src/dst slot indices need spine_start added.
+    //
+    // Copy K/V rows via ggml_backend_tensor_get/set with explicit offsets
+    // (ggml_backend_tensor_copy doesn't follow view_src->buffer).
     std::vector<uint8_t> bounce;
 
     for (int32_t i = 0; i < commit_n; ++i) {
-        const int32_t src_slot = accepted_dfs[i];
-        const int32_t dst_slot = i;
+        const int32_t src_slot = spine_start + accepted_dfs[i];
+        const int32_t dst_slot = spine_start + i;
 
         if (src_slot == dst_slot) {
             continue;
@@ -670,32 +674,41 @@ void llama_kv_cache::seq_compact_tree(
         }
     }
 
-    // Update cell metadata: move accepted cells to [0..commit_n), clear the rest.
-    // Snapshot positions from the accepted slots first to avoid aliasing.
+    // Update cell metadata: only touch the tree region [spine_start, spine_start+N).
+    // Past prompt cells (slots < spine_start) are left untouched.
+    //
+    // Snapshot positions from the accepted source slots first to avoid aliasing
+    // when src_slot < dst_slot.
     std::vector<llama_pos> accepted_pos(commit_n);
     for (int32_t i = 0; i < commit_n; ++i) {
-        const uint32_t src = (uint32_t) accepted_dfs[i];
+        const uint32_t src = (uint32_t) (spine_start + accepted_dfs[i]);
         accepted_pos[i] = cells.is_empty(src) ? -1 : cells.pos_get(src);
     }
 
-    // Clear all slots that are used by seq_id in this stream
+    // Clear all tree slots used by seq_id (i.e. cells with slot >= spine_start
+    // and pos >= the tree start position). To be conservative, scan the entire
+    // tree region width: assume the tree had at most max(accepted_dfs)+1 nodes,
+    // but we don't know N here — use the max of accepted_dfs as a lower bound
+    // and rely on the caller passing the correct spine_start. Clear all cells
+    // that belong to this seq with slot >= spine_start.
     const uint32_t kv_size = cells.size();
-    for (uint32_t slot = 0; slot < kv_size; ++slot) {
+    for (uint32_t slot = (uint32_t) spine_start; slot < kv_size; ++slot) {
         if (!cells.is_empty(slot) && cells.seq_has(slot, seq_id)) {
             cells.rm(slot);
         }
     }
 
-    // Set the spine slots [0..commit_n) with the accepted positions
+    // Set the spine slots [spine_start, spine_start+commit_n) with accepted positions
     for (int32_t i = 0; i < commit_n; ++i) {
         if (accepted_pos[i] >= 0) {
-            cells.pos_set((uint32_t) i, accepted_pos[i]);
-            cells.seq_add((uint32_t) i, seq_id);
+            const uint32_t slot = (uint32_t) (spine_start + i);
+            cells.pos_set(slot, accepted_pos[i]);
+            cells.seq_add(slot, seq_id);
         }
     }
 
-    // Reset the search head to zero since the spine is now at the front
-    v_heads[strm] = (uint32_t) commit_n;
+    // Search head moves to just past the spine.
+    v_heads[strm] = (uint32_t) (spine_start + commit_n);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {

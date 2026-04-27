@@ -372,11 +372,13 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     driver_ingest_capture(d, accepted_dfs.data(), (int32_t)commit_n);
 
     // ── Step 9: compact KV cache and rollback SSM state via persist buffers ───
-    // KV compaction: copies K/V rows from accepted_dfs[0..commit_n) to spine [0..commit_n).
-    // This is a no-op on pure SSM models.
+    // KV compaction: tree was placed at slots [committed_pos, committed_pos+N), so the
+    // spine starts at committed_pos. This preserves the prompt's KV slots [0, committed_pos).
+    // No-op on pure SSM models.
     llama_kv_cache_seq_compact_tree(d->target_ctx, 0,
                                     accepted_dfs.data(), (int32_t)accept_depth,
-                                    (int32_t)commit_n);
+                                    (int32_t)commit_n,
+                                    (int32_t)committed_pos);
 
     // SSM rollback (Phase 2.4): copy the SSM state from the persist buffer column at the
     // deepest accepted DFS node back into the live recurrent cache for seq_id=0.
