@@ -623,59 +623,49 @@ void llama_kv_cache::seq_compact_tree(
     auto & cells = v_cells[strm];
 
     // Copy K/V rows from accepted_dfs[i] to spine slot i for all committed tokens.
-    // We need a temporary ggml context just for creating non-owning row views.
-    const int32_t n_kv_layers = (int32_t) layers.size();
-    const size_t view_mem = size_t(4u * n_kv_layers * commit_n * ggml_tensor_overhead());
-
-    ggml_init_params view_params = {
-        /*.mem_size   =*/ view_mem,
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context_ptr view_ctx { ggml_init(view_params) };
+    // ggml_backend_tensor_copy doesn't follow view_src->buffer; use tensor_get/set
+    // with explicit offsets and a host bounce buffer (same pattern as the
+    // recurrent snapshot/restore path).
+    std::vector<uint8_t> bounce;
 
     for (int32_t i = 0; i < commit_n; ++i) {
         const int32_t src_slot = accepted_dfs[i];
         const int32_t dst_slot = i;
 
         if (src_slot == dst_slot) {
-            continue; // already in place
+            continue;
         }
 
         GGML_ASSERT(src_slot >= 0 && (uint32_t) src_slot < cells.size());
         GGML_ASSERT(dst_slot >= 0 && (uint32_t) dst_slot < cells.size());
 
         for (auto & layer : layers) {
-            // K: [n_embd_k_gqa, kv_size, n_stream] — copy row src_slot → row dst_slot within stream strm
             if (layer.k) {
-                const size_t k_row = layer.k->nb[1]; // bytes per row
-                const size_t k_stride_stream = layer.k->nb[2];
-                const size_t k_row_size = ggml_row_size(layer.k->type, layer.k->ne[0]);
+                const size_t k_row_bytes      = ggml_row_size(layer.k->type, layer.k->ne[0]);
+                const size_t k_row_stride     = layer.k->nb[1];
+                const size_t k_stride_stream  = layer.k->nb[2];
 
-                ggml_tensor * k_src = ggml_view_1d(view_ctx.get(), layer.k,
-                        layer.k->ne[0],
-                        strm * k_stride_stream + (size_t) src_slot * k_row);
-                ggml_tensor * k_dst = ggml_view_1d(view_ctx.get(), layer.k,
-                        layer.k->ne[0],
-                        strm * k_stride_stream + (size_t) dst_slot * k_row);
+                if (bounce.size() < k_row_bytes) bounce.resize(k_row_bytes);
 
-                ggml_backend_tensor_copy(k_src, k_dst);
+                const size_t src_off = strm * k_stride_stream + (size_t) src_slot * k_row_stride;
+                const size_t dst_off = strm * k_stride_stream + (size_t) dst_slot * k_row_stride;
+
+                ggml_backend_tensor_get(layer.k, bounce.data(), src_off, k_row_bytes);
+                ggml_backend_tensor_set(layer.k, bounce.data(), dst_off, k_row_bytes);
             }
 
-            // V: [n_embd_v_gqa, kv_size, n_stream] non-transposed, same row-wise layout as K.
-            // Transposed V ([kv_size, n_embd_v_gqa, n_stream]) needs per-column scatter — not supported here.
             if (layer.v && !v_trans) {
-                const size_t v_row = layer.v->nb[1];
-                const size_t v_stride_stream = layer.v->nb[2];
+                const size_t v_row_bytes      = ggml_row_size(layer.v->type, layer.v->ne[0]);
+                const size_t v_row_stride     = layer.v->nb[1];
+                const size_t v_stride_stream  = layer.v->nb[2];
 
-                ggml_tensor * v_src = ggml_view_1d(view_ctx.get(), layer.v,
-                        layer.v->ne[0],
-                        strm * v_stride_stream + (size_t) src_slot * v_row);
-                ggml_tensor * v_dst = ggml_view_1d(view_ctx.get(), layer.v,
-                        layer.v->ne[0],
-                        strm * v_stride_stream + (size_t) dst_slot * v_row);
+                if (bounce.size() < v_row_bytes) bounce.resize(v_row_bytes);
 
-                ggml_backend_tensor_copy(v_src, v_dst);
+                const size_t src_off = strm * v_stride_stream + (size_t) src_slot * v_row_stride;
+                const size_t dst_off = strm * v_stride_stream + (size_t) dst_slot * v_row_stride;
+
+                ggml_backend_tensor_get(layer.v, bounce.data(), src_off, v_row_bytes);
+                ggml_backend_tensor_set(layer.v, bounce.data(), dst_off, v_row_bytes);
             }
         }
     }
