@@ -1089,6 +1089,13 @@ ggml_tensor * llama_context::dflash_get_persist_inter(int32_t il) const {
     return dflash_persist_inter_l[il];
 }
 
+ggml_tensor * llama_context::dflash_get_persist_conv(int32_t il) const {
+    if (il < 0 || il >= (int32_t)dflash_persist_conv_l.size()) {
+        return nullptr;
+    }
+    return dflash_persist_conv_l[il];
+}
+
 void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
     if (model.arch != LLM_ARCH_QWEN35) {
         return; // only Qwen3.5 uses delta-net recurrent layers
@@ -1102,16 +1109,20 @@ void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
     const int64_t d_inner   = hparams.ssm_d_inner;
     const int64_t num_v_heads = hparams.ssm_dt_rank;    // H_v
     const int64_t head_v_dim  = d_inner / num_v_heads;  // S_v
+    const int64_t d_conv      = hparams.ssm_d_conv;
+    const int64_t conv_channels = d_inner + 2 * (int64_t)hparams.ssm_n_group * (int64_t)hparams.ssm_d_state;
     const int32_t n_layer    = (int32_t)hparams.n_layer;
 
     // Release existing allocation before reallocating.
     dflash_persist_inter_l.clear();
+    dflash_persist_conv_l.clear();
     dflash_persist_inter_buf.reset();
     dflash_persist_inter_ctx.reset();
 
-    // Allocate one ggml context to hold all layer tensors.
+    // Allocate one ggml context to hold all layer tensors (SSM + conv).
+    // Two tensors per recurrent layer; n_layer is an upper bound for either.
     struct ggml_init_params init_params = {
-        /* mem_size   = */ ggml_tensor_overhead() * (size_t)n_layer + 1024,
+        /* mem_size   = */ ggml_tensor_overhead() * (size_t)(2 * n_layer) + 1024,
         /* mem_buffer = */ nullptr,
         /* no_alloc   = */ true,
     };
@@ -1122,6 +1133,7 @@ void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
     }
 
     dflash_persist_inter_l.resize(n_layer, nullptr);
+    dflash_persist_conv_l.resize(n_layer, nullptr);
 
     // Determine the buffer type: use the device backend of the first recurrent layer's
     // SSM state tensor so the persist buffer lives on the same device.
@@ -1148,11 +1160,18 @@ void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
         if (!hparams.is_recurrent(il)) {
             continue; // full-attn layer — no persist buffer needed
         }
-        // Shape [S_v, S_v, H_v, n_tokens] F16 — matches ggml_gated_delta_net_tree_persist output
-        ggml_tensor * t = ggml_new_tensor_4d(dflash_persist_inter_ctx.get(),
+        // SSM persist: [S_v, S_v, H_v, n_tokens] F16 — matches gated_delta_net_tree_persist
+        ggml_tensor * ts = ggml_new_tensor_4d(dflash_persist_inter_ctx.get(),
                 GGML_TYPE_F16, head_v_dim, head_v_dim, num_v_heads, n_tokens);
-        ggml_format_name(t, "dflash_persist_il%d", il);
-        dflash_persist_inter_l[il] = t;
+        ggml_format_name(ts, "dflash_persist_il%d", il);
+        dflash_persist_inter_l[il] = ts;
+
+        // Conv persist: [K-1, conv_channels, n_tokens] F32 — matches the live
+        // r_l[il] layout (K-1 fastest, then conv_channels) per token.
+        ggml_tensor * tc = ggml_new_tensor_3d(dflash_persist_inter_ctx.get(),
+                GGML_TYPE_F32, d_conv - 1, conv_channels, n_tokens);
+        ggml_format_name(tc, "dflash_persist_conv_il%d", il);
+        dflash_persist_conv_l[il] = tc;
     }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(
@@ -1161,6 +1180,7 @@ void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
         LLAMA_LOG_ERROR("%s: failed to allocate persist buffers (n_tokens=%lld)\n",
                         __func__, (long long)n_tokens);
         dflash_persist_inter_l.assign(n_layer, nullptr);
+        dflash_persist_conv_l.assign(n_layer, nullptr);
         dflash_persist_inter_ctx.reset();
         return;
     }
@@ -2352,6 +2372,8 @@ llm_graph_params llama_context::graph_params(
         // Non-null only after ensure_dflash_persist_capacity() ran in decode().
         /*.dflash_persist_inter_l =*/ (!dflash_persist_inter_l.empty() && ubatch.parent_id != nullptr)
                                         ? &dflash_persist_inter_l : nullptr,
+        /*.dflash_persist_conv_l  =*/ (!dflash_persist_conv_l.empty()  && ubatch.parent_id != nullptr)
+                                        ? &dflash_persist_conv_l  : nullptr,
     };
 }
 
@@ -3640,6 +3662,39 @@ bool llama_context::dflash_rollback_ssm_to_dfs(llama_seq_id seq_id, int32_t acce
             ggml_backend_tensor_set(s_state, bounce_f32.data(), state_offset, state_row_bytes);
         } else {
             GGML_ABORT("dflash_rollback_ssm_to_dfs: unsupported s_state type");
+        }
+    }
+
+    // Phase 5 fix: also roll the conv state (r_l[il]) back to accepted_dfs_node.
+    // Without this, the conv window stays at the DFS-last node and pollutes the
+    // root forward of the next spec step.
+    if (!dflash_persist_conv_l.empty()) {
+        const int64_t n_embd_r = (int64_t)hparams.n_embd_r();
+        std::vector<float> bounce_conv((size_t)n_embd_r);
+        for (int il = 0; il < n_layer; ++il) {
+            if (!hparams.is_recurrent(il)) { continue; }
+            ggml_tensor * persist_conv = (il < (int32_t)dflash_persist_conv_l.size())
+                                         ? dflash_persist_conv_l[il] : nullptr;
+            ggml_tensor * r_state      = (il < (int32_t)mem_recr->r_l.size())
+                                         ? mem_recr->r_l[il] : nullptr;
+            if (!persist_conv || !r_state) { continue; }
+            if (accepted_dfs_node >= dflash_persist_max_n_tokens) { continue; }
+
+            GGML_ASSERT(persist_conv->type == GGML_TYPE_F32);
+            // persist_conv layout: [K-1, conv_channels, n_tokens] F32 contiguous;
+            // each token col is exactly n_embd_r elements (K-1 * conv_channels).
+            const size_t conv_col_bytes = (size_t)n_embd_r * sizeof(float);
+            const size_t conv_off_src   = (size_t)accepted_dfs_node * conv_col_bytes;
+            ggml_backend_tensor_get(persist_conv, bounce_conv.data(), conv_off_src, conv_col_bytes);
+
+            // Live r_state row layout: ggml_row_size(type, n_embd_r) per cell.
+            const size_t r_row_bytes  = ggml_row_size(r_state->type, n_embd_r);
+            const size_t r_off_dst    = (size_t)cell_id * r_row_bytes;
+            if (r_state->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(r_state, bounce_conv.data(), r_off_dst, r_row_bytes);
+            } else {
+                GGML_ABORT("dflash_rollback_ssm_to_dfs: unsupported r_state type");
+            }
         }
     }
 

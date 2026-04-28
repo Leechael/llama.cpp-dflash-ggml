@@ -375,12 +375,19 @@ private:
     ggml_backend_buffer_ptr     dflash_persist_inter_buf;  // backend buffer owning the data
     int64_t                     dflash_persist_max_n_tokens = 0; // current capacity
 
+    // dflash Phase 5 fix: per-token conv post-state persist buffer used by
+    // ggml_ssm_conv_tree_persist. One tensor per delta-net layer; shape
+    // [K_conv-1, conv_channels, n_tokens] F32. Read by dflash_rollback_ssm_to_dfs
+    // to roll the live conv state (r_l[il]) back to the accepted DFS node.
+    std::vector<ggml_tensor *>  dflash_persist_conv_l;     // [n_layer], nullptr for non-recurrent
+
     // Ensure the persist buffers can hold n_tokens columns; reallocates if needed.
     void ensure_dflash_persist_capacity(int64_t n_tokens);
 
-    // Returns the per-layer persist tensor for layer il, or nullptr if not a recurrent
-    // layer or the buffers have not yet been allocated (non-tree-mode decode).
+    // Returns the per-layer SSM/conv persist tensors for layer il, or nullptr if not
+    // a recurrent layer or the buffers have not yet been allocated.
     ggml_tensor * dflash_get_persist_inter(int32_t il) const;
+    ggml_tensor * dflash_get_persist_conv (int32_t il) const;
 
     // host-side mirror of t_hidden_capture, populated via ggml_backend_tensor_get_async
     // after each decode. get_hidden_capture_data() returns into this buffer so callers
