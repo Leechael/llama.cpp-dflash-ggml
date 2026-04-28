@@ -3158,7 +3158,33 @@ private:
 
                 // accepted: [root_echo, draft_accepted..., bonus]
                 // commit everything except the bonus token
-                const int n_committed = (int)accepted.size() - 1;
+                int n_committed = (int)accepted.size() - 1;
+
+                // DDTree driver picks tokens by argmax over target tree forward
+                // logits, bypassing the grammar sampler. When a jinja+tools
+                // grammar is active, an argmax-chosen token may not be in the
+                // grammar's allowed set, causing common_sampler_accept to throw
+                // ("Unexpected empty grammar stack"). Pre-check on a sampler
+                // clone and truncate at the first grammar-rejected token so the
+                // server doesn't crash. The slot will stop after emitting the
+                // grammar-valid prefix.
+                bool grammar_truncated = false;
+                if (slot.smpl) {
+                    auto * smpl_check = common_sampler_clone(slot.smpl.get());
+                    for (int ai = 0; ai < n_committed; ++ai) {
+                        try {
+                            common_sampler_accept(smpl_check, accepted[ai], true);
+                        } catch (const std::runtime_error & ex) {
+                            SLT_WRN(slot,
+                                "DDTree: grammar rejected token %d at index %d (%s); truncating accept\n",
+                                (int)accepted[ai], ai, ex.what());
+                            n_committed       = ai;
+                            grammar_truncated = true;
+                            break;
+                        }
+                    }
+                    common_sampler_free(smpl_check);
+                }
 
                 const int64_t t_current = ggml_time_us();
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
@@ -3188,6 +3214,18 @@ private:
                         slot_done = true;
                         break;
                     }
+                }
+
+                if (!slot_done && grammar_truncated) {
+                    // Stop the slot after the grammar-valid prefix; KV cache is
+                    // dirty for the rejected suffix but the slot will be released.
+                    slot.stop           = STOP_TYPE_LIMIT;
+                    slot.has_next_token = false;
+                    slot.print_timings();
+                    send_final_response(slot);
+                    metrics.on_prediction(slot);
+                    slot.release();
+                    slot_done = true;
                 }
 
                 if (!slot_done) {
