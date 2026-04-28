@@ -334,6 +334,7 @@ int main(int argc, char ** argv) {
     int32_t     n_gpu_layers  = 99;
     int32_t     n_ctx         = 4096;
     float       temp          = 0.0f;
+    std::string kv_type_str   = "f16"; // "f16" or "q8_0"
 
     llama_ddtree_params ddparams;  // defaults: budget=22, chain_seed=true
     // temp is set separately below after arg parsing
@@ -362,6 +363,8 @@ int main(int argc, char ** argv) {
             n_gpu_layers = std::atoi(argv[++i]);
         } else if (arg == "--n-ctx" && i + 1 < argc) {
             n_ctx = std::atoi(argv[++i]);
+        } else if (arg == "--kv-type" && i + 1 < argc) {
+            kv_type_str = argv[++i];
         } else if (arg == "-h" || arg == "--help") {
             usage(argv[0]);
             return 0;
@@ -426,14 +429,27 @@ int main(int argc, char ** argv) {
         const int32_t vocab_size = llama_vocab_n_tokens(vocab);
 
         // Context params shared by both target contexts (chain and spec runs).
+        const uint32_t n_batch = (uint32_t)std::min(n_ctx, 2048);
+        ggml_type kv_type = GGML_TYPE_F16;
+        if      (kv_type_str == "f16")  kv_type = GGML_TYPE_F16;
+        else if (kv_type_str == "q8_0") kv_type = GGML_TYPE_Q8_0;
+        else { fprintf(stderr, "unknown --kv-type: %s\n", kv_type_str.c_str()); return 1; }
         auto target_cparams    = llama_context_default_params();
         target_cparams.n_ctx   = (uint32_t)n_ctx;
-        target_cparams.n_batch = (uint32_t)n_ctx;
+        target_cparams.n_batch = n_batch;
+        target_cparams.type_k  = kv_type;
+        target_cparams.type_v  = kv_type;
 
-        // Draft context params.
+        // Draft context: dflash-draft doesn't keep a prompt KV cache; it consumes
+        // KV slots only for spec block decode (pos = committed_pos+i). A short
+        // ctx sized to prompt+gen+budget margin is sufficient and avoids the
+        // compute-buffer blow-up that target n_ctx would otherwise impose.
+        const uint32_t draft_n_ctx = (uint32_t)std::min(
+            (int32_t)4096,
+            std::max((int32_t)prompt.size() + gen + ddparams.budget + 64, (int32_t)1024));
         auto draft_cparams    = llama_context_default_params();
-        draft_cparams.n_ctx   = (uint32_t)n_ctx;
-        draft_cparams.n_batch = (uint32_t)n_ctx;
+        draft_cparams.n_ctx   = draft_n_ctx;
+        draft_cparams.n_batch = std::min(draft_n_ctx, (uint32_t)2048);
 
         // ---------------------------------------------------------------
         // Run 1: chain reference
