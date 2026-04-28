@@ -3146,12 +3146,19 @@ private:
                 // driver pick each chain step via the cloned sampler+grammar.
                 // The clone gets root_token accepted up front so the first
                 // sample at row 0 sees the grammar state "after root".
+                // LLAMA_DDTREE_NO_GRAMMAR_VERIFY=1 disables this and falls back
+                // to internal argmax (diagnostic; baseline for accept-rate
+                // comparison).
+                static const bool s_no_grammar_verify = []{
+                    const char * e = getenv("LLAMA_DDTREE_NO_GRAMMAR_VERIFY");
+                    return e && e[0] == '1';
+                }();
                 struct ddtree_verify_state {
                     common_sampler * smpl;
                     llama_context  * ctx;
                 };
                 ddtree_verify_state vstate{
-                    /*smpl=*/ slot.smpl ? common_sampler_clone(slot.smpl.get()) : nullptr,
+                    /*smpl=*/ (!s_no_grammar_verify && slot.smpl) ? common_sampler_clone(slot.smpl.get()) : nullptr,
                     /*ctx =*/ ctx,
                 };
                 if (vstate.smpl) {
