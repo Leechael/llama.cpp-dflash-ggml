@@ -7990,7 +7990,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             case LLM_ARCH_DFLASH_DRAFT:
                 {
                     // dflash-draft: 5-layer non-causal speculative decoder.
-                    // token_embd and lm_head are NOT loaded — they are shared from the target model at runtime.
+                    // token_embd is NOT loaded — token embeddings are looked up from the
+                    // target model at runtime via llama_model_token_embd_lookup.
+                    // lm_head (output.weight) is loaded from the GGUF: the convert script
+                    // (convert_dflash_to_gguf.py) copies it from the target model so the
+                    // draft can produce vocab-space logits without runtime tensor sharing.
                     // out_norm maps to model.output_norm; fc and hidden_norm are stored in dflash_fc / dflash_hidden_norm.
                     const int64_t n_draft_fc_in = (int64_t)5 * n_embd; // 5 * hidden = 25600 for 27B
 
@@ -7998,6 +8002,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     dflash_fc          = create_tensor(tn(LLM_TENSOR_DFLASH_FC,          "weight"), {n_draft_fc_in, n_embd}, 0);
                     dflash_hidden_norm = create_tensor(tn(LLM_TENSOR_DFLASH_HIDDEN_NORM, "weight"), {n_embd}, 0);
                     output_norm        = create_tensor(tn(LLM_TENSOR_DFLASH_OUT_NORM,    "weight"), {n_embd}, 0);
+                    output             = create_tensor(tn(LLM_TENSOR_OUTPUT,             "weight"), {n_embd, n_vocab}, 0);
 
                     for (int i = 0; i < n_layer; ++i) {
                         auto & layer = layers[i];
