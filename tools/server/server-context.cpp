@@ -3142,8 +3142,44 @@ private:
                     continue;
                 }
 
+                // Grammar-aware verify: clone the slot sampler and let the
+                // driver pick each chain step via the cloned sampler+grammar.
+                // The clone gets root_token accepted up front so the first
+                // sample at row 0 sees the grammar state "after root".
+                struct ddtree_verify_state {
+                    common_sampler * smpl;
+                    llama_context  * ctx;
+                };
+                ddtree_verify_state vstate{
+                    /*smpl=*/ slot.smpl ? common_sampler_clone(slot.smpl.get()) : nullptr,
+                    /*ctx =*/ ctx,
+                };
+                if (vstate.smpl) {
+                    common_sampler_accept(vstate.smpl, slot.ddtree_root_tok, true);
+                }
+                llama_speculative_tree_verify_cbs vcbs{};
+                vcbs.user_data  = &vstate;
+                vcbs.sample_cb  = [](void * ud, int32_t logits_row_idx) -> int32_t {
+                    auto * s = (ddtree_verify_state *)ud;
+                    if (!s->smpl) {
+                        return 0; // shouldn't happen; driver falls back if cb null
+                    }
+                    return (int32_t)common_sampler_sample(s->smpl, s->ctx, logits_row_idx, /*grammar_first=*/true);
+                };
+                vcbs.advance_cb = [](void * ud, llama_token tok) {
+                    auto * s = (ddtree_verify_state *)ud;
+                    if (s->smpl) {
+                        common_sampler_accept(s->smpl, tok, true);
+                    }
+                };
+
                 auto accepted = llama_speculative_tree_driver_step(
-                    slot.spec_driver, slot.ddtree_root_tok, slot.ddtree_committed_pos);
+                    slot.spec_driver, slot.ddtree_root_tok, slot.ddtree_committed_pos,
+                    vstate.smpl ? &vcbs : nullptr);
+
+                if (vstate.smpl) {
+                    common_sampler_free(vstate.smpl);
+                }
 
                 if (accepted.empty()) {
                     SLT_ERR(slot, "%s", "DDTree driver step returned empty result, treating as EOS\n");
@@ -3157,34 +3193,10 @@ private:
                 }
 
                 // accepted: [root_echo, draft_accepted..., bonus]
-                // commit everything except the bonus token
-                int n_committed = (int)accepted.size() - 1;
-
-                // DDTree driver picks tokens by argmax over target tree forward
-                // logits, bypassing the grammar sampler. When a jinja+tools
-                // grammar is active, an argmax-chosen token may not be in the
-                // grammar's allowed set, causing common_sampler_accept to throw
-                // ("Unexpected empty grammar stack"). Pre-check on a sampler
-                // clone and truncate at the first grammar-rejected token so the
-                // server doesn't crash. The slot will stop after emitting the
-                // grammar-valid prefix.
-                bool grammar_truncated = false;
-                if (slot.smpl) {
-                    auto * smpl_check = common_sampler_clone(slot.smpl.get());
-                    for (int ai = 0; ai < n_committed; ++ai) {
-                        try {
-                            common_sampler_accept(smpl_check, accepted[ai], true);
-                        } catch (const std::runtime_error & ex) {
-                            SLT_WRN(slot,
-                                "DDTree: grammar rejected token %d at index %d (%s); truncating accept\n",
-                                (int)accepted[ai], ai, ex.what());
-                            n_committed       = ai;
-                            grammar_truncated = true;
-                            break;
-                        }
-                    }
-                    common_sampler_free(smpl_check);
-                }
+                // commit everything except the bonus token. The driver used a
+                // grammar-aware verify (via vcbs above) so all accepted tokens
+                // are guaranteed to be in the sampler+grammar's allowed set.
+                const int n_committed = (int)accepted.size() - 1;
 
                 const int64_t t_current = ggml_time_us();
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
@@ -3214,18 +3226,6 @@ private:
                         slot_done = true;
                         break;
                     }
-                }
-
-                if (!slot_done && grammar_truncated) {
-                    // Stop the slot after the grammar-valid prefix; KV cache is
-                    // dirty for the rejected suffix but the slot will be released.
-                    slot.stop           = STOP_TYPE_LIMIT;
-                    slot.has_next_token = false;
-                    slot.print_timings();
-                    send_final_response(slot);
-                    metrics.on_prediction(slot);
-                    slot.release();
-                    slot_done = true;
                 }
 
                 if (!slot_done) {

@@ -46,11 +46,22 @@ void llama_speculative_tree_driver_free(llama_speculative_tree_driver * d);
 // The KV cache of target_ctx is compacted to hold only the accepted path after
 // each step.  The SSM/conv state is snapshot-before and restore-on-mismatch.
 //
+// Optional verify callbacks. If non-null, the driver picks the next token at
+// each verify-chain step via sample_cb instead of internal argmax. advance_cb
+// is invoked whenever the chain accepts a child, so callers can advance their
+// sampler/grammar state to mirror the chain.
+struct llama_speculative_tree_verify_cbs {
+    llama_speculative_pick_cb    sample_cb  = nullptr;
+    llama_speculative_advance_cb advance_cb = nullptr;
+    void *                       user_data  = nullptr;
+};
+
 // Returns an empty vector on internal failure.
 std::vector<llama_token> llama_speculative_tree_driver_step(
         llama_speculative_tree_driver * d,
         llama_token                     root_token,
-        llama_pos                       committed_pos);
+        llama_pos                       committed_pos,
+        const llama_speculative_tree_verify_cbs * verify_cbs = nullptr);
 
 // Ingest the most recent target_ctx capture as the initial ring contents.
 // Call this AFTER the chain-mode prompt prefill that primed target capture,

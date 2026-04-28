@@ -212,7 +212,8 @@ void llama_speculative_tree_driver_ingest_prompt_capture(
 std::vector<llama_token> llama_speculative_tree_driver_step(
         llama_speculative_tree_driver * d,
         llama_token                     root_token,
-        llama_pos                       committed_pos) {
+        llama_pos                       committed_pos,
+        const llama_speculative_tree_verify_cbs * verify_cbs) {
 
     const llama_model * target_model = llama_get_model(d->target_ctx);
     const int64_t n_embd     = d->n_embd;
@@ -359,25 +360,36 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
         }
     }
 
-    // ── Step 8: compute posterior and follow tree ─────────────────────────────
-    d->posterior.resize(N);
-    for (int i = 0; i < N; ++i) {
-        const float * row = llama_get_logits_ith(d->target_ctx, i);
-        if (!row) {
-            LOG_ERR("%s: target logits[%d] unavailable\n", __func__, i);
-            return {};
-        }
-        int32_t best = 0;
-        float best_val = row[0];
-        for (int64_t v = 1; v < n_vocab; ++v) {
-            if (row[v] > best_val) { best_val = row[v]; best = (int32_t)v; }
-        }
-        d->posterior[i] = best;
-    }
-
+    // ── Step 8: pick verify chain ─────────────────────────────────────────────
     std::vector<int32_t> accepted_dfs;
     llama_token next_token = LLAMA_TOKEN_NULL;
-    follow_verified_tree(tree, d->posterior.data(), accepted_dfs, next_token);
+    if (verify_cbs != nullptr && verify_cbs->sample_cb != nullptr) {
+        // Grammar-aware path: caller supplies a sampler/grammar via the
+        // sample_cb (no precomputed posterior). The chain only accepts tokens
+        // the caller's sampler+grammar would have produced.
+        follow_verified_tree_cb(tree,
+                                verify_cbs->sample_cb,
+                                verify_cbs->advance_cb,
+                                verify_cbs->user_data,
+                                accepted_dfs, next_token);
+    } else {
+        // Default: per-node argmax over target_ctx logits, then chain-walk.
+        d->posterior.resize(N);
+        for (int i = 0; i < N; ++i) {
+            const float * row = llama_get_logits_ith(d->target_ctx, i);
+            if (!row) {
+                LOG_ERR("%s: target logits[%d] unavailable\n", __func__, i);
+                return {};
+            }
+            int32_t best = 0;
+            float best_val = row[0];
+            for (int64_t v = 1; v < n_vocab; ++v) {
+                if (row[v] > best_val) { best_val = row[v]; best = (int32_t)v; }
+            }
+            d->posterior[i] = best;
+        }
+        follow_verified_tree(tree, d->posterior.data(), accepted_dfs, next_token);
+    }
 
     const int accept_depth = (int)accepted_dfs.size(); // includes root node (index 0)
     const int commit_n     = accept_depth; // root is always committed
