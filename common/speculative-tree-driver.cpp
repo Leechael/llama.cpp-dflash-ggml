@@ -30,7 +30,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
-#include <string>
 #include <vector>
 
 // Maximum target-context window that the draft attends over.
@@ -364,26 +363,6 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     // ── Step 8: pick verify chain ─────────────────────────────────────────────
     std::vector<int32_t> accepted_dfs;
     llama_token next_token = LLAMA_TOKEN_NULL;
-    {
-        // DIAGNOSTIC: log target argmax at root vs the root's child token ids
-        // so we can see whether dflash-draft proposals overlap with target.
-        const float * root_row = llama_get_logits_ith(d->target_ctx, 0);
-        if (root_row) {
-            int32_t target_root_argmax = 0;
-            float   tval = root_row[0];
-            for (int64_t v = 1; v < n_vocab; ++v) {
-                if (root_row[v] > tval) { tval = root_row[v]; target_root_argmax = (int32_t)v; }
-            }
-            std::string children_str;
-            for (int i = 1; i < N; ++i) {
-                if (tree.nodes[i].parent_idx == 0) {
-                    children_str += " " + std::to_string(tree.nodes[i].token_id);
-                }
-            }
-            LOG_INF("%s: DIAG target_argmax_root=%d  root_children=[%s]\n",
-                    __func__, (int)target_root_argmax, children_str.c_str());
-        }
-    }
     if (verify_cbs != nullptr && verify_cbs->sample_cb != nullptr) {
         // Grammar-aware path: caller supplies a sampler/grammar via the
         // sample_cb (no precomputed posterior). The chain only accepts tokens
