@@ -2390,6 +2390,17 @@ extern "C" {
             struct ggml_tensor  * c,
             struct ggml_tensor  * parent_ids);
 
+    // dflash extension: tree-mode ssm_conv that also writes each token's
+    // (K-1)-element post-state to persist_inter so the driver can roll the
+    // live conv state back to the accepted DFS node. persist_inter must be
+    // contiguous F32 with shape [K-1, d_inner, n_tokens, n_seqs] (K-1 fastest).
+    GGML_API struct ggml_tensor * ggml_ssm_conv_tree_persist(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * parent_ids,
+            struct ggml_tensor  * persist_inter);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

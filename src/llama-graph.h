@@ -631,6 +631,11 @@ struct llm_graph_params {
     // build_delta_net_tree() as the persist_inter argument.
     const std::vector<ggml_tensor *> * dflash_persist_inter_l = nullptr;
 
+    // dflash Phase 5: per-layer conv post-state persist buffers (paired with
+    // dflash_persist_inter_l). Read by ggml_ssm_conv_tree_persist; rolled back
+    // into r_l[il] after spec verify.
+    const std::vector<ggml_tensor *> * dflash_persist_conv_l  = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -695,7 +700,8 @@ struct llm_graph_params {
             loras          == other.loras          &&
             cross          == other.cross          &&
             capture_hidden == other.capture_hidden &&
-            (dflash_persist_inter_l != nullptr) == (other.dflash_persist_inter_l != nullptr);
+            (dflash_persist_inter_l != nullptr) == (other.dflash_persist_inter_l != nullptr) &&
+            (dflash_persist_conv_l  != nullptr) == (other.dflash_persist_conv_l  != nullptr);
     }
 };
 
@@ -834,6 +840,10 @@ struct llm_graph_context {
     // Non-owning pointer into llama_context::dflash_persist_inter_l (via graph_params).
     // Null when not in tree mode. Indexed by layer index il.
     const std::vector<ggml_tensor *> * dflash_persist_inter_l;
+
+    // dflash Phase 5: per-layer conv post-state persist buffer pointers
+    // (paired with dflash_persist_inter_l).
+    const std::vector<ggml_tensor *> * dflash_persist_conv_l;
 
     // dflash draft target_feat injection: propagated from llm_graph_params.
     // Non-owning; valid only for the dflash-draft graph builder.

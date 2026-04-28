@@ -337,10 +337,22 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    // use tree conv when parent_ids are set; identical output shape to ggml_ssm_conv
-    ggml_tensor * conv_output_proper = (parent_ids != nullptr)
-        ? ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, parent_ids)
-        : ggml_ssm_conv     (ctx0, conv_input, conv_kernel);
+    // use tree conv when parent_ids are set; identical output shape to ggml_ssm_conv.
+    // Phase 5 fix: when a per-layer conv-persist buffer is allocated, use the
+    // _persist variant so each token writes its post-state for SSM rollback.
+    ggml_tensor * conv_persist = nullptr;
+    if (parent_ids != nullptr && dflash_persist_conv_l != nullptr &&
+            il >= 0 && il < (int32_t)dflash_persist_conv_l->size()) {
+        conv_persist = (*dflash_persist_conv_l)[il];
+    }
+    ggml_tensor * conv_output_proper;
+    if (parent_ids != nullptr) {
+        conv_output_proper = (conv_persist != nullptr)
+            ? ggml_ssm_conv_tree_persist(ctx0, conv_input, conv_kernel, parent_ids, conv_persist)
+            : ggml_ssm_conv_tree        (ctx0, conv_input, conv_kernel, parent_ids);
+    } else {
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    }
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);

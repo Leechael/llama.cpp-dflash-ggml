@@ -1005,6 +1005,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     res              (params.res),
     capture_hidden   (params.capture_hidden),
     dflash_persist_inter_l(params.dflash_persist_inter_l),
+    dflash_persist_conv_l (params.dflash_persist_conv_l),
     pending_target_feat_raw_ptr      (params.pending_target_feat_raw_ptr),
     pending_target_feat_n_embd_fc_ptr(params.pending_target_feat_n_embd_fc_ptr),
     pending_target_feat_ctx_len_ptr  (params.pending_target_feat_ctx_len_ptr),

@@ -5514,6 +5514,34 @@ struct ggml_tensor * ggml_ssm_conv_tree(
     return result;
 }
 
+// dflash: tree-mode + external persistent conv post-state buffer. Same op as
+// ggml_ssm_conv_tree but the kernel ALSO writes each token's (K-1)-element
+// "post-state" (last K-1 cols of its parent-chain window) into persist_inter,
+// matching the [K-1, d_inner, n_tokens, n_seqs] layout used by the live conv
+// state in the recurrent memory.
+struct ggml_tensor * ggml_ssm_conv_tree_persist(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sx,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * persist_inter) {
+    struct ggml_tensor * result = ggml_ssm_conv_tree(ctx, sx, c, parent_ids);
+
+    GGML_ASSERT(persist_inter != NULL);
+    GGML_ASSERT(persist_inter->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(persist_inter));
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = sx->ne[0] - d_conv + 1;
+    const int64_t n_s     = sx->ne[2];
+    GGML_ASSERT(ggml_nelements(persist_inter) >= (d_conv - 1) * d_inner * n_t * n_s);
+
+    result->src[3] = persist_inter;
+
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
