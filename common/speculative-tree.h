@@ -59,6 +59,27 @@ void follow_verified_tree(
     std::vector<int32_t>      & accepted,
     llama_token               & next_token);
 
+// Variant of follow_verified_tree that pulls the picked token at each chain
+// step from caller-provided callbacks instead of a precomputed posterior[].
+// Lets callers (server) plug in grammar-aware sampling so the chain only
+// accepts tokens the sampler+grammar would have produced.
+//
+//   sample_cb (ud, logits_row_idx) -> picked token at this row (no state advance)
+//   advance_cb(ud, accepted_token)  -> caller must advance its sampler/grammar
+//
+// advance_cb is invoked every time the chain accepts a child (= the picked
+// token matched a child of `current`). It is NOT invoked for the bonus token.
+typedef int32_t (*llama_speculative_pick_cb)   (void * user_data, int32_t logits_row_idx);
+typedef void    (*llama_speculative_advance_cb)(void * user_data, llama_token accepted_token);
+
+void follow_verified_tree_cb(
+    const llama_ddtree           & tree,
+    llama_speculative_pick_cb      sample_cb,
+    llama_speculative_advance_cb   advance_cb,
+    void                         * user_data,
+    std::vector<int32_t>         & accepted,
+    llama_token                  & next_token);
+
 // Compute the [N, N] ancestor visibility mask from nodes[].parent_idx.
 // dst must point to an N*N uint8 buffer (caller-allocated).
 // Row i: dst[i*N + j] = 1 iff node j is an ancestor of i (inclusive).

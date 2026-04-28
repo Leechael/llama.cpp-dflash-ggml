@@ -164,6 +164,45 @@ void follow_verified_tree(
     next_token = (llama_token)posterior[current];
 }
 
+// follow_verified_tree_cb: same chain-walk semantics as follow_verified_tree
+// but the picked token at each step comes from sample_cb (caller-side
+// grammar/sampler), and chain advances notify the caller via advance_cb.
+void follow_verified_tree_cb(
+        const llama_ddtree           & tree,
+        llama_speculative_pick_cb      sample_cb,
+        llama_speculative_advance_cb   advance_cb,
+        void                         * user_data,
+        std::vector<int32_t>         & accepted,
+        llama_token                  & next_token) {
+    const int N = (int)tree.nodes.size();
+
+    // Build per-node child maps from parent_idx links.
+    std::vector<std::unordered_map<int32_t, int>> child_maps(N);
+    for (int i = 1; i < N; i++) {
+        const int p = tree.nodes[i].parent_idx;
+        child_maps[p][tree.nodes[i].token_id] = i;
+    }
+
+    accepted.clear();
+    accepted.reserve(N);
+    accepted.push_back(0);  // root is always accepted
+
+    int current = 0;
+    while (true) {
+        const int32_t picked = sample_cb(user_data, current);
+        const auto it = child_maps[current].find(picked);
+        if (it == child_maps[current].end()) {
+            next_token = (llama_token)picked;
+            break;
+        }
+        if (advance_cb != nullptr) {
+            advance_cb(user_data, (llama_token)tree.nodes[it->second].token_id);
+        }
+        current = it->second;
+        accepted.push_back(current);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // build_tree_visibility
 // ---------------------------------------------------------------------------
