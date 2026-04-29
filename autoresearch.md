@@ -46,11 +46,14 @@ Status from `DDTREE_STATUS_2026-04-29.md`:
 - Shared draft lm_head with target output weight: correct and frees about 1 GiB duplicate GPU allocation.
 - Full draft GPU offload (`-ngld6`) after avoiding unused persist allocation: correct and substantially faster draft compute.
 - Server prompt cache/checkpoint restored with DDTree rebuild window: repeated long prompts now reuse cache and rebuild only last target-feature window.
-- `LLAMA_DDTREE_TARGET_FEAT_CTX=1024`: kept; reduced pack/draft costs and improved repeated-request latency.
+- `LLAMA_DDTREE_TARGET_FEAT_CTX=1024`: kept previously; reduced pack/draft costs and improved repeated-request latency.
+- 2026-04-30 autoresearch found a stronger default: target feature window 128. On the 20,401-token rendered prompt, decode TPS improved from 6.42 to a best run of 9.11 tok/s. 64/96/192 were worse; 160 tied but did not beat 128. This is promising but still needs broader prompt validation.
 - Removing default batched tree verify from exact correctness path: kept; avoids diagnostic target-tree/snapshot overhead when exact chain validation is final authority.
 - Exact batched spine: discarded; snapshot/restore/replay cost made it slower.
 - Skipping logsumexp in top-k scores: discarded; top-k dominated by vocab scan/heap, not score normalization.
-- Fast rollback at 64k/full-draft: not viable on current 24GB GPU because persist allocation needs about 1.7 GiB extra VRAM.
+- Fast rollback at 64k/full-draft: not viable on current 24GB GPU because persist allocation needs about 1.7 GiB extra VRAM. Retested after 128-window and with tq3/less draft offload: full/`ngld4` still OOM; `ngld3` fits but is slower because draft compute jumps to ~294 ms.
+- Budget/K tuning: budget 14 lowered top-k cost but did not beat the best 128-window run; budget 8 was worse.
+- Small CPU optimizations discarded: fixed-array top-k and cached mask embedding did not improve primary TPS.
 
 ## Next Experiment Directions
 - Lower target 1-token exact decode cost without changing outputs.

@@ -8,8 +8,20 @@ DRAFT_MODEL=/home/leechael/workshop/lucebox-hub/dflash/models/draft/model.gguf
 PROMPT_TEXT=/tmp/real_rendered_prompt.txt
 GEN=${AUTORESEARCH_GEN:-32}
 CTX=${AUTORESEARCH_CTX:-65536}
+KV_TYPE=${AUTORESEARCH_KV_TYPE:-q4_0}
+DRAFT_GPU_LAYERS=${AUTORESEARCH_DRAFT_GPU_LAYERS:-6}
+N_BATCH=${AUTORESEARCH_N_BATCH:-512}
+N_UBATCH=${AUTORESEARCH_N_UBATCH:-512}
 BUDGET=${AUTORESEARCH_BUDGET:-22}
+PROFILE=${LLAMA_DDTREE_PROFILE:-1}
+BLOCK_SIZE=${LLAMA_DDTREE_BLOCK_SIZE:-}
 TARGET_FEAT_CTX=${LLAMA_DDTREE_TARGET_FEAT_CTX:-}
+FAST_BATCHED=${LLAMA_DDTREE_FAST_BATCHED:-}
+FAST_ROLLBACK=${LLAMA_DDTREE_FAST_ROLLBACK:-}
+SNAPSHOT_FALLBACK=${LLAMA_DDTREE_SNAPSHOT_FALLBACK:-}
+FORCE_CHAIN=${LLAMA_DDTREE_FORCE_CHAIN_KERNEL:-}
+SKIP_EXACT_SEQ_RM=${LLAMA_DDTREE_SKIP_EXACT_SEQ_RM:-}
+NO_FLASH_ARG=${AUTORESEARCH_NO_FLASH_ATTN:+--no-flash-attn}
 
 # Sync only source/control files needed for the benchmark. Avoid .git and build dirs.
 rsync -az --delete \
@@ -26,9 +38,14 @@ ssh "$REMOTE" "cd '$REMOTE_DIR' && cmake --build build-server -j 16 --target tes
 
 out_file=$(mktemp /tmp/autoresearch_ddtree.XXXXXX)
 ssh "$REMOTE" "cd '$REMOTE_DIR' && \
-  LLAMA_DDTREE_PROFILE=1 \
+  LLAMA_DDTREE_PROFILE='$PROFILE' \
+  LLAMA_DDTREE_BLOCK_SIZE='$BLOCK_SIZE' \
   LLAMA_DDTREE_TARGET_FEAT_CTX='$TARGET_FEAT_CTX' \
-  env -u LLAMA_DDTREE_FAST_BATCHED -u LLAMA_DDTREE_FAST_ROLLBACK -u LLAMA_DDTREE_SNAPSHOT_FALLBACK -u LLAMA_DDTREE_FORCE_CHAIN_KERNEL \
+  LLAMA_DDTREE_FAST_BATCHED='$FAST_BATCHED' \
+  LLAMA_DDTREE_FAST_ROLLBACK='$FAST_ROLLBACK' \
+  LLAMA_DDTREE_SNAPSHOT_FALLBACK='$SNAPSHOT_FALLBACK' \
+  LLAMA_DDTREE_FORCE_CHAIN_KERNEL='$FORCE_CHAIN' \
+  LLAMA_DDTREE_SKIP_EXACT_SEQ_RM='$SKIP_EXACT_SEQ_RM' \
   ./build-server/bin/test-speculative-tree-e2e \
     --target-model '$TARGET_MODEL' \
     --draft-model '$DRAFT_MODEL' \
@@ -40,11 +57,12 @@ ssh "$REMOTE" "cd '$REMOTE_DIR' && \
     --require-full-prompt-ingest \
     --temp 0 \
     --n-gpu-layers 65 \
-    --draft-gpu-layers 6 \
+    --draft-gpu-layers '$DRAFT_GPU_LAYERS' \
     --n-ctx '$CTX' \
-    --n-batch 512 \
-    --n-ubatch 512 \
-    --kv-type q4_0" >"$out_file" 2>&1 || {
+    --n-batch '$N_BATCH' \
+    --n-ubatch '$N_UBATCH' \
+    --kv-type '$KV_TYPE' \
+    $NO_FLASH_ARG" >"$out_file" 2>&1 || {
   tail -120 "$out_file"
   exit 1
 }

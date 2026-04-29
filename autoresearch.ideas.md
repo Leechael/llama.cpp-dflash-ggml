@@ -1,1 +1,3 @@
-- Revisit sizing the DFlash draft context from target feature window + block instead of fixed 2048/4096; one discarded run reduced target_feat set_inputs from ~4 ms to ~0.7 ms but did not improve decode TPS due draft compute noise.
+- Revisit sizing the DFlash draft context from target feature window + block instead of fixed 2048/4096; one discarded run reduced target_feat set_inputs from ~4 ms to ~0.7 ms but did not improve decode TPS, and it still did not fit fast-rollback persist.
+- Persist compression remains the route to fast rollback at 64k/full-draft: q4->tq3 KV, draft n_ctx reduction, and ngld4 did not free enough; ngld3 fit but was slower. Conv persist is still F32 and `ggml_ssm_conv_tree_persist` asserts F32, so F16 conv persist would need kernel + rollback support.
+- GPU-side draft logits top-k/argmax is likely the real top-k optimization; CPU heap/fixed-array tweaks and budget K=1 did not move primary TPS enough.
