@@ -66,7 +66,7 @@ spec_sec = last_float(r"spec timing:\s*([0-9.]+)\s*sec")
 gen_tokens = last_int(r"spec:\s*generated\s+(\d+)\s+tokens")
 # Committed can be > requested generation because one speculative step may validate beyond the requested output.
 steps = last_int(r"steps=(\d+)")
-committed = last_int(r"(?:^|\\s)committed=(\d+)")
+committed = last_int(r"(?:^|\s)committed=(\d+)")
 step_ms = last_float(r"spec timing avg:.*?step=([0-9.]+)")
 pack_ms = last_float(r"spec timing avg:.*?pack=([0-9.]+)")
 draft_ms = last_float(r"spec timing avg:.*?draft=([0-9.]+)")
