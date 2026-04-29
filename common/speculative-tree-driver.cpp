@@ -580,8 +580,16 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
                 d->top_token_ids[i] = best;
             }
         } else {
+            float proposal_temp = d->params.temp;
+            if (const char * e = std::getenv("LLAMA_DDTREE_PROPOSAL_TEMP")) {
+                char * end = nullptr;
+                const float v = std::strtof(e, &end);
+                if (end != e && v > 0.0f) {
+                    proposal_temp = v;
+                }
+            }
             extract_top_k_logprobs(draft_logits_row1, L, (int)n_vocab, K,
-                                   d->params.temp, d->top_log_probs.data(),
+                                   proposal_temp, d->top_log_probs.data(),
                                    d->top_token_ids.data());
         }
         if (std::getenv("LLAMA_DDTREE_DUMP_DRAFT_TOP") != nullptr && d->stats.n_steps == 0) {
