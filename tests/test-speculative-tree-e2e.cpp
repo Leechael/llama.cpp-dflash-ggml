@@ -280,10 +280,14 @@ static std::vector<llama_token> run_chain(
     out.reserve(gen);
 
     // Decode prompt; logits for last prompt token give the first generated token.
+    const auto prompt_t0 = std::chrono::steady_clock::now();
     std::vector<float> logits = decode_chain_prompt(ctx, prompt, vocab_size, prompt_chunk);
+    const auto prompt_t1 = std::chrono::steady_clock::now();
 
     llama_pos pos = (llama_pos)prompt.size();  // next decode position
 
+    double decode_ms = 0.0;
+    int32_t decode_steps = 0;
     for (int32_t i = 0; i < gen; ++i) {
         llama_token tok = argmax(logits.data(), vocab_size);
         out.push_back(tok);
@@ -291,12 +295,20 @@ static std::vector<llama_token> run_chain(
             LOG_INF("chain: EOS at step %d\n", i);
             break;
         }
+        const auto decode_t0 = std::chrono::steady_clock::now();
         logits = decode_single(ctx, tok, pos, vocab_size);
+        decode_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - decode_t0).count();
+        decode_steps++;
         pos++;
     }
 
     llama_free(ctx);
     LOG_INF("chain: generated %d tokens\n", (int)out.size());
+    LOG_INF("chain timing detail: prompt=%.2f ms decode_steps=%d decode_avg=%.2f ms decode_total=%.2f ms\n",
+            std::chrono::duration<double, std::milli>(prompt_t1 - prompt_t0).count(),
+            (int)decode_steps,
+            decode_steps > 0 ? decode_ms / (double)decode_steps : 0.0,
+            decode_ms);
     return out;
 }
 

@@ -26,6 +26,7 @@ TREE_ROWS=${LLAMA_DDTREE_TREE_ROWS:-}
 CHAIN_SEED=${LLAMA_DDTREE_CHAIN_SEED:-}
 CHAIN_DEPTH_CAP=${LLAMA_DDTREE_CHAIN_DEPTH_CAP:-}
 PROPOSAL_TEMP=${LLAMA_DDTREE_PROPOSAL_TEMP:-}
+TRACE=${LLAMA_DDTREE_TRACE:-}
 NO_FLASH_ARG=${AUTORESEARCH_NO_FLASH_ATTN:+--no-flash-attn}
 
 # Sync only source/control files needed for the benchmark. Avoid .git and build dirs.
@@ -56,6 +57,7 @@ ssh "$REMOTE" "cd '$REMOTE_DIR' && \
   LLAMA_DDTREE_CHAIN_SEED='$CHAIN_SEED' \
   LLAMA_DDTREE_CHAIN_DEPTH_CAP='$CHAIN_DEPTH_CAP' \
   LLAMA_DDTREE_PROPOSAL_TEMP='$PROPOSAL_TEMP' \
+  ${TRACE:+LLAMA_DDTREE_TRACE='$TRACE'} \
   ./build-server/bin/test-speculative-tree-e2e \
     --target-model '$TARGET_MODEL' \
     --draft-model '$DRAFT_MODEL' \
@@ -77,7 +79,7 @@ ssh "$REMOTE" "cd '$REMOTE_DIR' && \
   exit 1
 }
 
-cat "$out_file" | tail -120
+cat "$out_file" | tail -220
 
 python3 - "$out_file" <<'PY'
 import re, sys
