@@ -93,6 +93,21 @@ static bool ddtree_snapshot_fallback_enabled() {
     return e == nullptr || e[0] != '0';
 }
 
+static int64_t ddtree_target_feat_cap() {
+    const char * e = std::getenv("LLAMA_DDTREE_TARGET_FEAT_CTX");
+    if (!e || e[0] == '\0') {
+        return DRAFT_CTX_MAX;
+    }
+
+    char * end = nullptr;
+    const long v = std::strtol(e, &end, 10);
+    if (end == e || v <= 0) {
+        return DRAFT_CTX_MAX;
+    }
+
+    return std::min<int64_t>(DRAFT_CTX_MAX, std::max<int64_t>(1, (int64_t)v));
+}
+
 llama_speculative_tree_driver * llama_speculative_tree_driver_init(
         llama_context            * target_ctx,
         llama_context            * draft_ctx,
@@ -128,6 +143,7 @@ llama_speculative_tree_driver * llama_speculative_tree_driver_init(
     // Initialize cumulative target_feat ring buffer.
     d->target_feat_n_embd_fc   = 5 * d->n_embd;
     d->target_feat_n_committed = 0;
+    d->target_feat_cap         = ddtree_target_feat_cap();
     d->target_feat_ring.assign((size_t)d->target_feat_n_embd_fc * d->target_feat_cap, 0.0f);
 
     return d;
@@ -143,7 +159,7 @@ llama_speculative_tree_driver_stats llama_speculative_tree_driver_get_stats(
 }
 
 int32_t llama_speculative_tree_driver_context_window() {
-    return DRAFT_CTX_MAX;
+    return (int32_t)ddtree_target_feat_cap();
 }
 
 // Pack the hidden capture buffer into [5*n_embd, ctx_len] F32.
