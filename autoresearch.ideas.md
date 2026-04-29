@@ -1,0 +1,1 @@
+- Revisit sizing the DFlash draft context from target feature window + block instead of fixed 2048/4096; one discarded run reduced target_feat set_inputs from ~4 ms to ~0.7 ms but did not improve decode TPS due draft compute noise.

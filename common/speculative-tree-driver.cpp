@@ -29,9 +29,11 @@
 #include <cstring>
 #include <vector>
 
-// Maximum target-context window that the draft attends over.
-// Matches test_dflash.cpp:1086 DRAFT_CTX_MAX.
-static constexpr int DRAFT_CTX_MAX = 2048;
+// Maximum target-context window that the draft can attend over.
+// Matches test_dflash.cpp:1086 DRAFT_CTX_MAX. The server-port default is
+// smaller; raise it with LLAMA_DDTREE_TARGET_FEAT_CTX when needed.
+static constexpr int DRAFT_CTX_MAX     = 2048;
+static constexpr int DRAFT_CTX_DEFAULT = 128;
 
 // EOS token for Qwen3.5 family.
 static constexpr llama_token QWEN35_EOS = 248045;
@@ -66,7 +68,7 @@ struct llama_speculative_tree_driver {
     std::vector<float> target_feat_ring; // size = target_feat_n_embd_fc * target_feat_cap
     int64_t target_feat_n_committed = 0; // total committed positions appended to the ring, not capped
     int64_t target_feat_n_embd_fc   = 0; // = 5 * n_embd
-    int64_t target_feat_cap         = DRAFT_CTX_MAX; // max target feature context retained for draft
+    int64_t target_feat_cap         = DRAFT_CTX_DEFAULT; // target feature context retained for draft
 
     // Scratch buffers
     std::vector<float>   top_log_probs; // [block_size-1, K]
@@ -96,13 +98,13 @@ static bool ddtree_snapshot_fallback_enabled() {
 static int64_t ddtree_target_feat_cap() {
     const char * e = std::getenv("LLAMA_DDTREE_TARGET_FEAT_CTX");
     if (!e || e[0] == '\0') {
-        return DRAFT_CTX_MAX;
+        return DRAFT_CTX_DEFAULT;
     }
 
     char * end = nullptr;
     const long v = std::strtol(e, &end, 10);
     if (end == e || v <= 0) {
-        return DRAFT_CTX_MAX;
+        return DRAFT_CTX_DEFAULT;
     }
 
     return std::min<int64_t>(DRAFT_CTX_MAX, std::max<int64_t>(1, (int64_t)v));

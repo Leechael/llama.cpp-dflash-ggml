@@ -8,7 +8,8 @@ DRAFT_MODEL=/home/leechael/workshop/lucebox-hub/dflash/models/draft/model.gguf
 PROMPT_TEXT=/tmp/real_rendered_prompt.txt
 GEN=${AUTORESEARCH_GEN:-32}
 CTX=${AUTORESEARCH_CTX:-65536}
-TARGET_FEAT_CTX=${LLAMA_DDTREE_TARGET_FEAT_CTX:-1024}
+BUDGET=${AUTORESEARCH_BUDGET:-22}
+TARGET_FEAT_CTX=${LLAMA_DDTREE_TARGET_FEAT_CTX:-}
 
 # Sync only source/control files needed for the benchmark. Avoid .git and build dirs.
 rsync -az --delete \
@@ -35,7 +36,7 @@ ssh "$REMOTE" "cd '$REMOTE_DIR' && \
     --gen '$GEN' \
     --out-spec /tmp/autoresearch_spec.bin \
     --out-chain /tmp/autoresearch_chain.bin \
-    --ddtree-budget 22 \
+    --ddtree-budget '$BUDGET' \
     --require-full-prompt-ingest \
     --temp 0 \
     --n-gpu-layers 65 \
