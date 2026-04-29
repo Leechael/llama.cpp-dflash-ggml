@@ -364,7 +364,10 @@ static bool validate_tree_with_chain(llama_speculative_tree_driver * d,
         b.seq_id[0][0] = 0;
         b.logits[0]    = 1;
 
+        const auto t_decode0 = ddtree_clock::now();
         const int ret = llama_decode(d->target_ctx, b);
+        d->stats.t_exact_decode_ms += elapsed_ms(t_decode0);
+        d->stats.n_exact_validate_nodes++;
         llama_batch_free(b);
         if (ret != 0) {
             LOG_ERR("%s: chain validation llama_decode failed at depth %d: %d\n",
@@ -374,7 +377,9 @@ static bool validate_tree_with_chain(llama_speculative_tree_driver * d,
 
         driver_ingest_capture(d, nullptr, 1, ingest_source::replay);
 
+        const auto t_sample0 = ddtree_clock::now();
         const llama_token picked = pick_current_logits(d, verify_cbs);
+        d->stats.t_exact_sample_ms += elapsed_ms(t_sample0);
         if (picked == LLAMA_TOKEN_NULL) {
             LOG_ERR("%s: failed to pick from chain validation logits\n", __func__);
             return false;
@@ -387,14 +392,18 @@ static bool validate_tree_with_chain(llama_speculative_tree_driver * d,
         }
 
         if (verify_cbs != nullptr && verify_cbs->advance_cb != nullptr) {
+            const auto t_advance0 = ddtree_clock::now();
             verify_cbs->advance_cb(verify_cbs->user_data, picked);
+            d->stats.t_exact_advance_ms += elapsed_ms(t_advance0);
         }
 
         accepted_dfs.push_back(child);
         current = child;
     }
 
+    const auto t_sample0 = ddtree_clock::now();
     const llama_token picked = pick_current_logits(d, verify_cbs);
+    d->stats.t_exact_sample_ms += elapsed_ms(t_sample0);
     if (picked == LLAMA_TOKEN_NULL) {
         LOG_ERR("%s: failed to pick final chain validation token\n", __func__);
         return false;
