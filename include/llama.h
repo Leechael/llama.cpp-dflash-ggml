@@ -299,6 +299,9 @@ extern "C" {
         // NULL-terminated list of buffer types to use for tensors that match a pattern
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 
+        // optional target model for auxiliary models that share target tensors
+        const struct llama_model * target_model;
+
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 
@@ -1074,6 +1077,14 @@ extern "C" {
             struct llama_context * ctx,
             llama_seq_id           seq_id,
             int32_t                accepted_dfs_node);
+
+    // After persist-based rollback, adjust the recurrent cache bookkeeping so
+    // seq_pos_max() reflects the accepted chain position rather than the DFS
+    // tree position left by the tree-mode forward.
+    LLAMA_API bool llama_dflash_set_recurrent_tail_pos(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_pos              pos);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

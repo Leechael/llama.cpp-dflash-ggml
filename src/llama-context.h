@@ -373,7 +373,10 @@ private:
     std::vector<ggml_tensor *>  dflash_persist_inter_l;   // [n_layer], nullptr for non-recurrent
     ggml_context_ptr            dflash_persist_inter_ctx;  // ggml context owning the tensors
     ggml_backend_buffer_ptr     dflash_persist_inter_buf;  // backend buffer owning the data
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>>
+                                dflash_persist_ctxs_bufs; // per backend buffer type for mixed CPU/GPU offload
     int64_t                     dflash_persist_max_n_tokens = 0; // current capacity
+    int64_t                     dflash_persist_failed_n_tokens = 0; // suppress repeated OOM retries
 
     // dflash Phase 5 fix: per-token conv post-state persist buffer used by
     // ggml_ssm_conv_tree_persist. One tensor per delta-net layer; shape

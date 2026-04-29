@@ -67,13 +67,29 @@ struct chunked_scratch {
 };
 static chunked_scratch g_chunked_bufs[GGML_CUDA_MAX_DEVICES];
 
-static float * ensure_buf(float ** p, size_t * cur_bytes, size_t need_bytes) {
-    if (need_bytes <= *cur_bytes && *p != nullptr) return *p;
+static bool try_ensure_buf(float ** p, size_t * cur_bytes, size_t need_bytes) {
+    if (need_bytes <= *cur_bytes && *p != nullptr) return true;
     if (*p != nullptr) CUDA_CHECK(cudaFree(*p));
     *p = nullptr;
-    CUDA_CHECK(cudaMalloc(p, need_bytes));
+
+    const cudaError_t err = cudaMalloc(p, need_bytes);
+    if (err != cudaSuccess) {
+        // Clear the sticky CUDA error so the caller can retry with a smaller
+        // chunk instead of aborting the whole process.
+        (void) cudaGetLastError();
+        *p = nullptr;
+        *cur_bytes = 0;
+        return false;
+    }
+
     *cur_bytes = need_bytes;
-    return *p;
+    return true;
+}
+
+static void free_buf(float ** p, size_t * cur_bytes) {
+    if (*p != nullptr) CUDA_CHECK(cudaFree(*p));
+    *p = nullptr;
+    *cur_bytes = 0;
 }
 
 void ggml_cuda_flash_attn_ext_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -104,28 +120,66 @@ void ggml_cuda_flash_attn_ext_chunked(ggml_backend_cuda_context & ctx, ggml_tens
     size_t free_bytes = 0, total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
     const int vram_chunk = chunked_pf_compute_chunk_size(free_bytes, nh_q, nh_kv, q_batch_size, D);
-    const int tbq_chunk  = chunked_chunk_env(vram_chunk);
+    int tbq_chunk  = chunked_chunk_env(vram_chunk);
 
     const int device = ctx.device;
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
     chunked_scratch & sc = g_chunked_bufs[device];
 
-    const size_t O_bytes    = (size_t)nh_q * nq * D * sizeof(float);
-    const size_t l_bytes    = (size_t)nh_q * nq     * sizeof(float);
-    const size_t m_bytes    = (size_t)nh_q * nq     * sizeof(float);
-    const size_t S_bytes    = (size_t)nh_q * q_batch_size * tbq_chunk * sizeof(float);
-    // Per-chunk K/V dequant: [nh_kv, tbq_chunk, D] fp32. The final chunk may
-    // be shorter; we still size the buffer for the max and only write chunk_len.
-    const size_t kv_bytes   = (size_t)nh_kv * tbq_chunk * D * sizeof(float);
+    const size_t O_bytes     = (size_t)nh_q * nq * D * sizeof(float);
+    const size_t l_bytes     = (size_t)nh_q * nq     * sizeof(float);
+    const size_t m_bytes     = (size_t)nh_q * nq     * sizeof(float);
     const size_t Q_f32_bytes = (size_t)nh_q * nq * D * sizeof(float);
 
-    float * O_acc = ensure_buf(&sc.O_acc, &sc.O_bytes, O_bytes);
-    float * l_acc = ensure_buf(&sc.l_acc, &sc.l_bytes, l_bytes);
-    float * m_acc = ensure_buf(&sc.m_acc, &sc.m_bytes, m_bytes);
-    float * S     = ensure_buf(&sc.S,     &sc.S_bytes, S_bytes);
-    float * k_tmp = ensure_buf(&sc.k_tmp, &sc.k_bytes, kv_bytes);
-    float * v_tmp = ensure_buf(&sc.v_tmp, &sc.v_bytes, kv_bytes);
-    float * Q_f32 = ensure_buf(&sc.Q_f32, &sc.Q_bytes, Q_f32_bytes);
+    float * O_acc = nullptr;
+    float * l_acc = nullptr;
+    float * m_acc = nullptr;
+    float * S     = nullptr;
+    float * k_tmp = nullptr;
+    float * v_tmp = nullptr;
+    float * Q_f32 = nullptr;
+
+    const int requested_tbq_chunk = tbq_chunk;
+    for (;;) {
+        const size_t S_bytes  = (size_t)nh_q * q_batch_size * tbq_chunk * sizeof(float);
+        // Per-chunk K/V dequant: [nh_kv, tbq_chunk, D] fp32. The final chunk may
+        // be shorter; we still size the buffer for the max and only write chunk_len.
+        const size_t kv_bytes = (size_t)nh_kv * tbq_chunk * D * sizeof(float);
+
+        const bool ok =
+            try_ensure_buf(&sc.O_acc, &sc.O_bytes, O_bytes) &&
+            try_ensure_buf(&sc.l_acc, &sc.l_bytes, l_bytes) &&
+            try_ensure_buf(&sc.m_acc, &sc.m_bytes, m_bytes) &&
+            try_ensure_buf(&sc.S,     &sc.S_bytes, S_bytes) &&
+            try_ensure_buf(&sc.k_tmp, &sc.k_bytes, kv_bytes) &&
+            try_ensure_buf(&sc.v_tmp, &sc.v_bytes, kv_bytes) &&
+            try_ensure_buf(&sc.Q_f32, &sc.Q_bytes, Q_f32_bytes);
+
+        if (ok) {
+            O_acc = sc.O_acc;
+            l_acc = sc.l_acc;
+            m_acc = sc.m_acc;
+            S     = sc.S;
+            k_tmp = sc.k_tmp;
+            v_tmp = sc.v_tmp;
+            Q_f32 = sc.Q_f32;
+            break;
+        }
+
+        if (tbq_chunk <= CHUNKED_PF_MIN) {
+            GGML_ABORT("chunked prefill: failed to allocate scratch buffers");
+        }
+
+        tbq_chunk >>= 1;
+        // Release chunk-dependent scratch allocated for the failed, larger
+        // chunk. Otherwise retry can keep the old large buffers alive and fail
+        // again despite the smaller chunk size.
+        free_buf(&sc.S,     &sc.S_bytes);
+        free_buf(&sc.k_tmp, &sc.k_bytes);
+        free_buf(&sc.v_tmp, &sc.v_bytes);
+        GGML_LOG_WARN("chunked prefill: scratch allocation failed, retrying with chunk=%d (requested=%d)\n",
+                      tbq_chunk, requested_tbq_chunk);
+    }
 
     cublasHandle_t cublas_handle = ctx.cublas_handle();
     CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));

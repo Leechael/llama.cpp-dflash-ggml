@@ -918,7 +918,6 @@ void llm_graph_input_target_feat::set_input(const llama_ubatch * ubatch) {
     const float * data    = *host_data_ptr;
     const int64_t fc      = *n_embd_fc_ptr;
     const int64_t ctx_len = *ctx_len_ptr;
-    const int64_t cpos    = *committed_pos_ptr;
 
     // Sanity: if this graph input exists, the caller must have supplied data.
     GGML_ASSERT(data != nullptr &&
@@ -930,12 +929,14 @@ void llm_graph_input_target_feat::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(inp_target_feat_raw, data, 0, (size_t)fc * ctx_len * sizeof(float));
     }
 
-    // pos_q: [committed_pos .. committed_pos + block_size)
+    // pos_q is local to the draft attention window, not the target's global
+    // sequence position. The draft attends over target_feat[0..ctx_len) plus
+    // the block's noise tokens, matching standalone DFlash's draft_ctx+i.
     if (inp_pos_q) {
         const int64_t block_size = inp_pos_q->ne[0];
         std::vector<int32_t> pos_q(block_size);
         for (int64_t i = 0; i < block_size; ++i) {
-            pos_q[i] = (int32_t)(cpos + i);
+            pos_q[i] = (int32_t)(ctx_len + i);
         }
         ggml_backend_tensor_set(inp_pos_q, pos_q.data(), 0, block_size * sizeof(int32_t));
     }

@@ -33,11 +33,15 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     const float scale = 1.0f / sqrtf((float)n_embd_head);
 
     // ── Draft-specific inputs ─────────────────────────────────────────────────
-    // noise_embed: pre-computed embedding rows [n_embd, block_size] — host fills this.
-    // Shape uses n_tokens from ubatch (== block_size when calling the draft).
-    ggml_tensor * noise_embed = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-    ggml_set_name(noise_embed, "dflash_noise_embed");
-    ggml_set_input(noise_embed);
+    // noise_embed: pre-computed embedding rows [n_embd, block_size] — host fills this
+    // through ubatch.embd. It must be registered as a graph input; merely calling
+    // ggml_set_input() is not enough for llama_decode() to populate it.
+    auto inp_noise = std::make_unique<llm_graph_input_embd>(n_embd);
+    inp_noise->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_name(inp_noise->embd, "dflash_noise_embed");
+    ggml_set_input(inp_noise->embd);
+    ggml_tensor * noise_embed = inp_noise->embd;
+    res->add_input(std::move(inp_noise));
 
     // target_feat_raw / pos_q / pos_k: registered as graph inputs via build_inp_target_feat.
     // The host stashes data with llama_set_target_feat_raw() before llama_decode(); the
@@ -68,7 +72,8 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     cb(target_feat, "dflash_target_feat", -1);
 
     // ── Step 2: position tensors ──────────────────────────────────────────────
-    // Q positions: [committed_pos .. committed_pos + block_size)
+    // Q positions: [ctx_len .. ctx_len + block_size) in draft-window-local
+    // coordinates, matching standalone DFlash.
     // K positions: [0 .. ctx_len + block_size)
     // Both tensors were created and registered by build_inp_target_feat() above.
     // set_input() fills them from pending_draft_committed_pos before each decode.
