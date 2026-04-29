@@ -42,6 +42,7 @@ static void usage(const char * prog) {
         "  --out-summary PATH       (text summary; required)\n"
         "  --n-siblings N           (extra sibling nodes at depth 1; default 0)\n"
         "  --n-spec-steps N         (1 or 2; default 1; 2 chains step1 -> compact/rollback -> step2)\n"
+        "  --skip-rollback          (diagnostic: compact accepted root but do not rollback SSM)\n"
         "  --n-gpu-layers N         (default 99)\n"
         "  --n-ctx N                (default 4096)\n",
         prog);
@@ -133,7 +134,8 @@ static llama_batch build_tree_batch(const std::vector<int32_t> & tokens,
 static std::vector<float> run_chain_then_tree_two_step(llama_model * model,
                                                        const llama_context_params & cparams,
                                                        const std::vector<int32_t> & tokens,
-                                                       int n_siblings) {
+                                                       int n_siblings,
+                                                       bool skip_rollback) {
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
         throw std::runtime_error("failed to create two-step context");
@@ -173,7 +175,9 @@ static std::vector<float> run_chain_then_tree_two_step(llama_model * model,
     llama_kv_cache_seq_compact_tree(ctx, /*seq_id=*/0, accepted_dfs,
                                     /*n_accepted=*/1, /*commit_n=*/1,
                                     /*spine_start=*/n_prefix);
-    llama_dflash_rollback_ssm_to_dfs(ctx, /*seq_id=*/0, /*accepted_dfs_node=*/0);
+    if (!skip_rollback) {
+        llama_dflash_rollback_ssm_to_dfs(ctx, /*seq_id=*/0, /*accepted_dfs_node=*/0);
+    }
 
     // spec step 2: root @ pos n_prefix+1 (token = tokens[n_prefix+1])
     std::vector<float> out(vocab_sz);
@@ -340,6 +344,7 @@ int main(int argc, char ** argv) {
     int32_t n_ctx         = 4096;
     int32_t n_siblings    = 0;
     int32_t n_spec_steps  = 1;
+    bool skip_rollback    = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -350,6 +355,7 @@ int main(int argc, char ** argv) {
         else if (arg == "--out-summary"      && i + 1 < argc) out_summary        = argv[++i];
         else if (arg == "--n-siblings"       && i + 1 < argc) n_siblings         = std::atoi(argv[++i]);
         else if (arg == "--n-spec-steps"     && i + 1 < argc) n_spec_steps       = std::atoi(argv[++i]);
+        else if (arg == "--skip-rollback") skip_rollback = true;
         else if (arg == "--n-gpu-layers"     && i + 1 < argc) n_gpu_layers       = std::atoi(argv[++i]);
         else if (arg == "--n-ctx"            && i + 1 < argc) n_ctx              = std::atoi(argv[++i]);
         else if (arg == "-h" || arg == "--help") { usage(argv[0]); return 0; }
@@ -403,7 +409,7 @@ int main(int argc, char ** argv) {
         if (n_spec_steps == 1) {
             B = run_chain_then_tree_root(model, cparams, tokens, n_siblings);
         } else if (n_spec_steps == 2) {
-            B = run_chain_then_tree_two_step(model, cparams, tokens, n_siblings);
+            B = run_chain_then_tree_two_step(model, cparams, tokens, n_siblings, skip_rollback);
         } else {
             throw std::runtime_error("--n-spec-steps must be 1 or 2");
         }
@@ -414,6 +420,7 @@ int main(int argc, char ** argv) {
         f << "n_tokens=" << tokens.size() << "\n";
         f << "n_siblings=" << n_siblings << "\n";
         f << "n_spec_steps=" << n_spec_steps << "\n";
+        f << "skip_rollback=" << (skip_rollback ? 1 : 0) << "\n";
         f << "vocab_size=" << A.size() << "\n";
         f << "max_abs_diff=" << s.max_abs_diff << "\n";
         f << "mean_abs_diff=" << s.mean_abs_diff << "\n";

@@ -7992,9 +7992,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     // dflash-draft: 5-layer non-causal speculative decoder.
                     // token_embd is NOT loaded — token embeddings are looked up from the
                     // target model at runtime via llama_model_token_embd_lookup.
-                    // lm_head (output.weight) is loaded from the GGUF: the convert script
-                    // (convert_dflash_to_gguf.py) copies it from the target model so the
-                    // draft can produce vocab-space logits without runtime tensor sharing.
+                    // lm_head can be shared from the target model.  The draft GGUF may
+                    // still contain output.weight for standalone tests, but in server
+                    // mode loading another copy costs about 1 GiB on Qwen3.5-27B.
                     // out_norm maps to model.output_norm; fc and hidden_norm are stored in dflash_fc / dflash_hidden_norm.
                     const int64_t n_draft_fc_in = (int64_t)5 * n_embd; // 5 * hidden = 25600 for 27B
 
@@ -8002,7 +8002,17 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     dflash_fc          = create_tensor(tn(LLM_TENSOR_DFLASH_FC,          "weight"), {n_draft_fc_in, n_embd}, 0);
                     dflash_hidden_norm = create_tensor(tn(LLM_TENSOR_DFLASH_HIDDEN_NORM, "weight"), {n_embd}, 0);
                     output_norm        = create_tensor(tn(LLM_TENSOR_DFLASH_OUT_NORM,    "weight"), {n_embd}, 0);
-                    output             = create_tensor(tn(LLM_TENSOR_OUTPUT,             "weight"), {n_embd, n_vocab}, 0);
+
+                    const llama_model * target_model = params.target_model;
+                    if (target_model != nullptr && target_model->output != nullptr &&
+                            target_model->output->ne[0] == n_embd &&
+                            target_model->output->ne[1] == n_vocab) {
+                        (void) create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_SKIP);
+                        output = target_model->output;
+                        LLAMA_LOG_INFO("%s: dflash-draft: sharing target output.weight; skipped draft lm_head allocation\n", __func__);
+                    } else {
+                        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, 0);
+                    }
 
                     for (int i = 0; i < n_layer; ++i) {
                         auto & layer = layers[i];
@@ -9350,6 +9360,7 @@ llama_model_params llama_model_default_params() {
     llama_model_params result = {
         /*.devices                     =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
+        /*.target_model                =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,

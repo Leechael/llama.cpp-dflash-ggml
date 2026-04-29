@@ -1710,7 +1710,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1725,10 +1725,11 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     const int64_t n_tps = n_tokens/n_stream;
 
     // Tree-mode mask: each query node attends to all past (committed) KV cells
-    // unconditionally, plus its tree ancestors (cells whose pos matches an
-    // ancestor's pos in the current ubatch).
+    // unconditionally, plus its exact tree ancestors in the current ubatch.
+    // Do not match tree nodes by position: siblings share the same depth/pos.
     if (ubatch->parent_id != nullptr) {
         GGML_ASSERT(n_stream == 1 && "tree-mode requires n_stream == 1 in Phase 4");
+        GGML_ASSERT(sinfo.n_stream() == 1 && sinfo.size() == n_tokens);
 
         // Find the boundary between past KV and the current tree ubatch.
         llama_pos tree_min_pos = std::numeric_limits<llama_pos>::max();
@@ -1742,12 +1743,13 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         const auto &       cells   = v_cells.at(seq_to_stream[seq0]);
 
         for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
-            // Collect ancestor positions for query i (positions of self + all ancestors in the tree).
-            llama_pos ancestor_pos[64];
+            // Collect exact KV cell indices for query i's tree ancestors,
+            // including the node itself.
+            uint32_t ancestor_slot[64];
             int       n_anc = 0;
             int32_t   cur   = (int32_t) i;
             while (cur >= 0 && n_anc < 64) {
-                ancestor_pos[n_anc++] = ubatch->pos[cur];
+                ancestor_slot[n_anc++] = sinfo.idxs[0][cur];
                 const int32_t p = ubatch->parent_id[cur];
                 if (p < 0) break;
                 cur = p;
@@ -1763,9 +1765,9 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
                     // Past KV (prompt or earlier accepted tokens): always visible.
                     visible = true;
                 } else {
-                    // Tree region: visible only when p0 matches an ancestor's pos.
+                    // Tree region: visible only for the exact ancestor cells.
                     for (int k = 0; k < n_anc; ++k) {
-                        if (ancestor_pos[k] == p0) { visible = true; break; }
+                        if ((uint32_t) j == ancestor_slot[k]) { visible = true; break; }
                     }
                 }
                 if (visible) {
@@ -2645,7 +2647,7 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

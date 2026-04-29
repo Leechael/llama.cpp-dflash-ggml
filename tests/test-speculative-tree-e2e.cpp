@@ -59,11 +59,13 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -84,15 +86,26 @@ static void usage(const char * prog) {
         "Usage: %s\n"
         "  --target-model PATH     (Qwen3.5-27B GGUF; required)\n"
         "  --draft-model PATH      (dflash-draft GGUF; required)\n"
-        "  --prompt-tokens PATH    (binary int32 LE token IDs; required)\n"
+        "  --prompt-tokens PATH    (binary int32 LE token IDs; required unless --prompt-text)\n"
+        "  --prompt-text PATH      (raw rendered prompt text; tokenized with target vocab)\n"
+        "  --prompt-add-special    (with --prompt-text, request tokenizer special BOS/EOS insertion)\n"
+        "  --no-prompt-parse-special\n"
+        "                          (with --prompt-text, do not parse <|...|> as special tokens)\n"
         "  --gen N                 (tokens to generate; default 32)\n"
         "  --out-spec PATH         (spec-decode output tokens, int32 LE; required)\n"
         "  --out-chain PATH        (chain-decode reference tokens, int32 LE; required)\n"
         "  --ddtree-budget N       (DDTree node budget; default 22)\n"
         "  --ddtree-no-chain-seed  (disable chain-seed heuristic; default: on)\n"
+        "  --require-ddtree        (fail unless multi-node DDTree verify ran)\n"
+        "  --require-replay        (fail unless snapshot+replay fallback ran)\n"
+        "  --require-full-prompt-ingest\n"
+        "                          (fail unless DDTree ingested every prompt token capture)\n"
         "  --temp F                (sampling temperature; default 0.0 = greedy)\n"
         "  --n-gpu-layers N        (default 99)\n"
         "  --n-ctx N               (default 4096)\n"
+        "  --n-batch N             (logical prompt batch; default min(n_ctx, 2048))\n"
+        "  --n-ubatch N            (physical prompt batch; default 512)\n"
+        "  --no-flash-attn         (disable Flash Attention)\n"
         "\n"
         "Pass --temp 0 (greedy) to enable token-trajectory bit-equal assertion.\n",
         prog);
@@ -114,6 +127,33 @@ static std::vector<int32_t> read_int32_file(const std::string & path) {
     return buf;
 }
 
+static std::string read_text_file(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        throw std::runtime_error("cannot open file: " + path);
+    }
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+static std::vector<int32_t> tokenize_text(
+        const llama_vocab * vocab,
+        const std::string & text,
+        bool add_special,
+        bool parse_special) {
+    int32_t n = -llama_tokenize(vocab, text.data(), (int32_t)text.size(),
+                                nullptr, 0, add_special, parse_special);
+    if (n <= 0) {
+        throw std::runtime_error("llama_tokenize sizing failed");
+    }
+    std::vector<llama_token> tmp(n);
+    int32_t got = llama_tokenize(vocab, text.data(), (int32_t)text.size(),
+                                 tmp.data(), n, add_special, parse_special);
+    if (got != n) {
+        throw std::runtime_error("llama_tokenize result mismatch");
+    }
+    return std::vector<int32_t>(tmp.begin(), tmp.end());
+}
+
 static void write_token_file(const std::string & path,
                               const std::vector<llama_token> & tokens) {
     std::ofstream f(path, std::ios::binary);
@@ -126,30 +166,59 @@ static void write_token_file(const std::string & path,
             (std::streamsize)(tokens.size() * sizeof(llama_token)));
 }
 
-// Decode prompt as a plain chain batch, return last-token logits (copy).
+// Decode prompt as plain chain batches, return last-token logits (copy).
+// The optional per_chunk callback runs after every llama_decode() and is used
+// by the DDTree run to ingest exactly the hidden capture columns produced by
+// that physical prompt chunk.
 static std::vector<float> decode_chain_prompt(llama_context * ctx,
                                               const std::vector<int32_t> & prompt,
-                                              int32_t vocab_size) {
+                                              int32_t vocab_size,
+                                              int32_t prompt_chunk,
+                                              const std::function<void(int32_t)> & per_chunk = {}) {
     const int32_t n = (int32_t)prompt.size();
-    llama_batch batch = llama_batch_init(n, /*embd=*/0, /*n_seq_max=*/1);
-
-    for (int32_t i = 0; i < n; ++i) {
-        batch.token[i]     = (llama_token)prompt[i];
-        batch.pos[i]       = (llama_pos)i;
-        batch.n_seq_id[i]  = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i]    = (i == n - 1) ? 1 : 0;
+    if (prompt_chunk <= 0) {
+        throw std::runtime_error("prompt_chunk must be > 0");
     }
-    batch.n_tokens = n;
 
-    if (llama_decode(ctx, batch) != 0) {
+    std::vector<float> logits;
+    for (int32_t off = 0; off < n; off += prompt_chunk) {
+        const int32_t n_cur = std::min(prompt_chunk, n - off);
+        llama_batch batch = llama_batch_init(n_cur, /*embd=*/0, /*n_seq_max=*/1);
+
+        for (int32_t i = 0; i < n_cur; ++i) {
+            const int32_t pos = off + i;
+            batch.token[i]     = (llama_token)prompt[pos];
+            batch.pos[i]       = (llama_pos)pos;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]    = (pos == n - 1) ? 1 : 0;
+        }
+        batch.n_tokens = n_cur;
+
+        if (llama_decode(ctx, batch) != 0) {
+            llama_batch_free(batch);
+            throw std::runtime_error("llama_decode failed on prompt chunk");
+        }
+
+        if (per_chunk) {
+            per_chunk(n_cur);
+        }
+
+        if (off + n_cur == n) {
+            const float * row = llama_get_logits_ith(ctx, n_cur - 1);
+            if (!row) {
+                llama_batch_free(batch);
+                throw std::runtime_error("prompt final logits unavailable");
+            }
+            logits.assign(row, row + vocab_size);
+        }
+
         llama_batch_free(batch);
-        throw std::runtime_error("llama_decode failed on prompt");
     }
 
-    const float * row = llama_get_logits_ith(ctx, n - 1);
-    std::vector<float> logits(row, row + vocab_size);
-    llama_batch_free(batch);
+    if (logits.empty()) {
+        throw std::runtime_error("prompt decode produced no logits");
+    }
     return logits;
 }
 
@@ -199,7 +268,8 @@ static std::vector<llama_token> run_chain(
         const llama_context_params & cparams,
         const std::vector<int32_t> & prompt,
         int32_t gen,
-        int32_t vocab_size) {
+        int32_t vocab_size,
+        int32_t prompt_chunk) {
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
@@ -210,7 +280,7 @@ static std::vector<llama_token> run_chain(
     out.reserve(gen);
 
     // Decode prompt; logits for last prompt token give the first generated token.
-    std::vector<float> logits = decode_chain_prompt(ctx, prompt, vocab_size);
+    std::vector<float> logits = decode_chain_prompt(ctx, prompt, vocab_size, prompt_chunk);
 
     llama_pos pos = (llama_pos)prompt.size();  // next decode position
 
@@ -242,7 +312,9 @@ static std::vector<llama_token> run_spec(
         const std::vector<int32_t> & prompt,
         int32_t gen,
         int32_t vocab_size,
-        const llama_ddtree_params & ddparams) {
+        const llama_ddtree_params & ddparams,
+        int32_t prompt_chunk,
+        llama_speculative_tree_driver_stats * out_stats) {
 
     // Target context with hidden capture enabled (required by the driver).
     llama_context * target_ctx = llama_init_from_model(target_model, target_cparams);
@@ -257,14 +329,6 @@ static std::vector<llama_token> run_spec(
         throw std::runtime_error("spec: failed to create draft context");
     }
 
-    // Prime hidden capture: decode prompt as chain batch on target.
-    std::vector<float> prompt_logits =
-        decode_chain_prompt(target_ctx, prompt, vocab_size);
-
-    // Root token = argmax of last prompt position.
-    llama_token root_token = argmax(prompt_logits.data(), vocab_size);
-    llama_pos   committed_pos = (llama_pos)prompt.size();
-
     // Init spec driver.
     llama_speculative_tree_driver * driver =
         llama_speculative_tree_driver_init(target_ctx, draft_ctx, ddparams);
@@ -274,8 +338,18 @@ static std::vector<llama_token> run_spec(
         throw std::runtime_error("spec: llama_speculative_tree_driver_init returned NULL");
     }
 
-    // Ingest the prompt prefill capture into the driver's ring buffer.
-    llama_speculative_tree_driver_ingest_prompt_capture(driver, (int32_t)prompt.size());
+    // Prime hidden capture in physical prompt chunks and ingest each chunk
+    // immediately. A single logical 16k decode only leaves the last ubatch in
+    // the capture tensor, which is not a valid DDTree/DFlash prompt state.
+    std::vector<float> prompt_logits =
+        decode_chain_prompt(target_ctx, prompt, vocab_size, prompt_chunk,
+            [&](int32_t n_cur) {
+                llama_speculative_tree_driver_ingest_prompt_capture(driver, n_cur);
+            });
+
+    // Root token = argmax of last prompt position.
+    llama_token root_token = argmax(prompt_logits.data(), vocab_size);
+    llama_pos   committed_pos = (llama_pos)prompt.size();
 
     std::vector<llama_token> out;
     out.reserve(gen);
@@ -312,6 +386,10 @@ static std::vector<llama_token> run_spec(
         committed_pos += (llama_pos)n_committed;
     }
 
+    if (out_stats != nullptr) {
+        *out_stats = llama_speculative_tree_driver_get_stats(driver);
+    }
+
     llama_speculative_tree_driver_free(driver);
     llama_free(draft_ctx);
     llama_free(target_ctx);
@@ -328,13 +406,23 @@ int main(int argc, char ** argv) {
     std::string target_model_path;
     std::string draft_model_path;
     std::string prompt_tokens_path;
+    std::string prompt_text_path;
     std::string out_spec_path;
     std::string out_chain_path;
     int32_t     gen           = 32;
     int32_t     n_gpu_layers  = 99;
+    int32_t     n_gpu_layers_draft = -1;
     int32_t     n_ctx         = 4096;
+    int32_t     n_batch_arg   = 0;
+    int32_t     n_ubatch_arg  = 512;
     float       temp          = 0.0f;
-    std::string kv_type_str   = "f16"; // "f16" or "q8_0"
+    std::string kv_type_str   = "f16"; // "f16", "q8_0", or "q4_0"
+    bool        require_ddtree = false;
+    bool        require_replay = false;
+    bool        require_full_prompt_ingest = false;
+    bool        prompt_add_special   = false;
+    bool        prompt_parse_special = true;
+    bool        no_flash_attn        = false;
 
     llama_ddtree_params ddparams;  // defaults: budget=22, chain_seed=true
     // temp is set separately below after arg parsing
@@ -347,6 +435,12 @@ int main(int argc, char ** argv) {
             draft_model_path = argv[++i];
         } else if (arg == "--prompt-tokens" && i + 1 < argc) {
             prompt_tokens_path = argv[++i];
+        } else if (arg == "--prompt-text" && i + 1 < argc) {
+            prompt_text_path = argv[++i];
+        } else if (arg == "--prompt-add-special") {
+            prompt_add_special = true;
+        } else if (arg == "--no-prompt-parse-special") {
+            prompt_parse_special = false;
         } else if (arg == "--gen" && i + 1 < argc) {
             gen = std::atoi(argv[++i]);
         } else if (arg == "--out-spec" && i + 1 < argc) {
@@ -357,12 +451,26 @@ int main(int argc, char ** argv) {
             ddparams.budget = std::atoi(argv[++i]);
         } else if (arg == "--ddtree-no-chain-seed") {
             ddparams.chain_seed = false;
+        } else if (arg == "--require-ddtree") {
+            require_ddtree = true;
+        } else if (arg == "--require-replay") {
+            require_replay = true;
+        } else if (arg == "--require-full-prompt-ingest") {
+            require_full_prompt_ingest = true;
         } else if (arg == "--temp" && i + 1 < argc) {
             temp = std::stof(argv[++i]);
         } else if (arg == "--n-gpu-layers" && i + 1 < argc) {
             n_gpu_layers = std::atoi(argv[++i]);
+        } else if (arg == "--draft-gpu-layers" && i + 1 < argc) {
+            n_gpu_layers_draft = std::atoi(argv[++i]);
         } else if (arg == "--n-ctx" && i + 1 < argc) {
             n_ctx = std::atoi(argv[++i]);
+        } else if (arg == "--n-batch" && i + 1 < argc) {
+            n_batch_arg = std::atoi(argv[++i]);
+        } else if (arg == "--n-ubatch" && i + 1 < argc) {
+            n_ubatch_arg = std::atoi(argv[++i]);
+        } else if (arg == "--no-flash-attn") {
+            no_flash_attn = true;
         } else if (arg == "--kv-type" && i + 1 < argc) {
             kv_type_str = argv[++i];
         } else if (arg == "-h" || arg == "--help") {
@@ -377,7 +485,14 @@ int main(int argc, char ** argv) {
 
     if (target_model_path.empty()) { fprintf(stderr, "--target-model is required\n"); return 1; }
     if (draft_model_path.empty())  { fprintf(stderr, "--draft-model is required\n");  return 1; }
-    if (prompt_tokens_path.empty()){ fprintf(stderr, "--prompt-tokens is required\n");return 1; }
+    if (prompt_tokens_path.empty() && prompt_text_path.empty()) {
+        fprintf(stderr, "one of --prompt-tokens or --prompt-text is required\n");
+        return 1;
+    }
+    if (!prompt_tokens_path.empty() && !prompt_text_path.empty()) {
+        fprintf(stderr, "use only one of --prompt-tokens or --prompt-text\n");
+        return 1;
+    }
     if (out_spec_path.empty())     { fprintf(stderr, "--out-spec is required\n");      return 1; }
     if (out_chain_path.empty())    { fprintf(stderr, "--out-chain is required\n");     return 1; }
     if (gen <= 0)                  { fprintf(stderr, "--gen must be > 0\n");           return 1; }
@@ -400,11 +515,6 @@ int main(int argc, char ** argv) {
     llama_model * draft_model  = nullptr;
 
     try {
-        std::vector<int32_t> prompt = read_int32_file(prompt_tokens_path);
-        if (prompt.empty()) {
-            throw std::runtime_error("prompt-tokens file is empty");
-        }
-
         // Load target model.
         {
             auto mparams         = llama_model_default_params();
@@ -418,7 +528,8 @@ int main(int argc, char ** argv) {
         // Load draft model.
         {
             auto mparams         = llama_model_default_params();
-            mparams.n_gpu_layers = n_gpu_layers;
+            mparams.n_gpu_layers = n_gpu_layers_draft >= 0 ? n_gpu_layers_draft : n_gpu_layers;
+            mparams.target_model = target_model;
             draft_model          = llama_model_load_from_file(draft_model_path.c_str(), mparams);
             if (!draft_model) {
                 throw std::runtime_error("failed to load draft model: " + draft_model_path);
@@ -427,18 +538,36 @@ int main(int argc, char ** argv) {
 
         const auto * vocab   = llama_model_get_vocab(target_model);
         const int32_t vocab_size = llama_vocab_n_tokens(vocab);
+        std::vector<int32_t> prompt;
+        if (!prompt_tokens_path.empty()) {
+            prompt = read_int32_file(prompt_tokens_path);
+        } else {
+            const std::string prompt_text = read_text_file(prompt_text_path);
+            prompt = tokenize_text(vocab, prompt_text, prompt_add_special, prompt_parse_special);
+        }
+        if (prompt.empty()) {
+            throw std::runtime_error("prompt is empty after loading/tokenization");
+        }
+        LOG_INF("prompt: %d tokens\n", (int)prompt.size());
 
         // Context params shared by both target contexts (chain and spec runs).
-        const uint32_t n_batch = (uint32_t)std::min(n_ctx, 2048);
+        const uint32_t n_batch  = (uint32_t)(n_batch_arg > 0 ? n_batch_arg : std::min(n_ctx, 2048));
+        const uint32_t n_ubatch = (uint32_t)(n_ubatch_arg > 0 ? n_ubatch_arg : 512);
         ggml_type kv_type = GGML_TYPE_F16;
         if      (kv_type_str == "f16")  kv_type = GGML_TYPE_F16;
         else if (kv_type_str == "q8_0") kv_type = GGML_TYPE_Q8_0;
+        else if (kv_type_str == "q4_0") kv_type = GGML_TYPE_Q4_0;
         else { fprintf(stderr, "unknown --kv-type: %s\n", kv_type_str.c_str()); return 1; }
         auto target_cparams    = llama_context_default_params();
         target_cparams.n_ctx   = (uint32_t)n_ctx;
         target_cparams.n_batch = n_batch;
+        target_cparams.n_ubatch = std::min(n_batch, n_ubatch);
         target_cparams.type_k  = kv_type;
         target_cparams.type_v  = kv_type;
+        if (no_flash_attn) {
+            target_cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        }
+        const int32_t prompt_chunk = (int32_t)target_cparams.n_ubatch;
 
         // Draft context: dflash-draft doesn't keep a prompt KV cache; it consumes
         // KV slots only for spec block decode (pos = committed_pos+i). A short
@@ -450,26 +579,102 @@ int main(int argc, char ** argv) {
         auto draft_cparams    = llama_context_default_params();
         draft_cparams.n_ctx   = draft_n_ctx;
         draft_cparams.n_batch = std::min(draft_n_ctx, (uint32_t)2048);
+        draft_cparams.n_ubatch = std::min(draft_cparams.n_batch, n_ubatch);
+        if (no_flash_attn) {
+            draft_cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        }
 
         // ---------------------------------------------------------------
         // Run 1: chain reference
         // ---------------------------------------------------------------
         LOG_INF("=== Run 1: chain reference decode ===\n");
+        const auto chain_t0 = std::chrono::steady_clock::now();
         std::vector<llama_token> chain_tokens =
-            run_chain(target_model, target_cparams, prompt, gen, vocab_size);
+            run_chain(target_model, target_cparams, prompt, gen, vocab_size, prompt_chunk);
+        const auto chain_t1 = std::chrono::steady_clock::now();
 
         write_token_file(out_chain_path, chain_tokens);
         LOG_INF("chain: wrote %d tokens to %s\n",
                 (int)chain_tokens.size(), out_chain_path.c_str());
+        LOG_INF("chain timing: %.3f sec\n",
+                std::chrono::duration<double>(chain_t1 - chain_t0).count());
 
         // ---------------------------------------------------------------
         // Run 2: speculative decode
         // ---------------------------------------------------------------
         LOG_INF("=== Run 2: speculative decode ===\n");
+        const auto spec_t0 = std::chrono::steady_clock::now();
+        llama_speculative_tree_driver_stats spec_stats;
         std::vector<llama_token> spec_tokens =
             run_spec(target_model, draft_model,
                      target_cparams, draft_cparams,
-                     prompt, gen, vocab_size, ddparams);
+                     prompt, gen, vocab_size, ddparams, prompt_chunk, &spec_stats);
+        const auto spec_t1 = std::chrono::steady_clock::now();
+
+        LOG_INF("spec stats: steps=%lld tree_verifies=%lld tree_nodes_total=%lld max_tree_nodes=%d dfs_last=%lld snapshot_replays=%lld fast_batched_replays=%lld fast_batched_cb=%lld fast_rollback=%lld committed=%lld max_commit=%d batched_committed=%lld batched_max_commit=%d batched_exact_same=%lld batched_exact_diff=%lld batched_longer=%lld batched_shorter=%lld prompt_ingests=%lld prompt_tokens=%lld tree_tokens=%lld replay_tokens=%lld capture_clamps=%lld\n",
+                (long long)spec_stats.n_steps,
+                (long long)spec_stats.n_tree_verifies,
+                (long long)spec_stats.n_tree_nodes_total,
+                (int)spec_stats.max_tree_nodes,
+                (long long)spec_stats.n_dfs_last_commits,
+                (long long)spec_stats.n_snapshot_replays,
+                (long long)spec_stats.n_fast_batched_replays,
+                (long long)spec_stats.n_fast_batched_callback_steps,
+                (long long)spec_stats.n_fast_rollback_steps,
+                (long long)spec_stats.n_committed_tokens,
+                (int)spec_stats.max_committed_tokens_per_step,
+                (long long)spec_stats.n_batched_posterior_committed_tokens,
+                (int)spec_stats.max_batched_posterior_committed_tokens_per_step,
+                (long long)spec_stats.n_batched_exact_same,
+                (long long)spec_stats.n_batched_exact_diff,
+                (long long)spec_stats.n_batched_exact_longer,
+                (long long)spec_stats.n_batched_exact_shorter,
+                (long long)spec_stats.n_prompt_ingest_calls,
+                (long long)spec_stats.n_prompt_ingested_tokens,
+                (long long)spec_stats.n_tree_ingested_tokens,
+                (long long)spec_stats.n_replay_ingested_tokens,
+                (long long)spec_stats.n_capture_clamps);
+        if (spec_stats.n_steps > 0) {
+            LOG_INF("spec acceptance: exact_avg_commit_per_step=%.3f batched_avg_commit_per_step=%.3f\n",
+                    (double)spec_stats.n_committed_tokens / (double)spec_stats.n_steps,
+                    (double)spec_stats.n_batched_posterior_committed_tokens / (double)spec_stats.n_steps);
+            const double inv_steps = 1.0 / (double)spec_stats.n_steps;
+            LOG_INF("spec timing avg: step=%.2f ms pack=%.2f draft=%.2f topk=%.2f build=%.2f snap=%.2f target_tree=%.2f posterior=%.2f accept=%.2f compact=%.2f rollback=%.2f ingest=%.2f tree_ingest=%.2f replay_ingest=%.2f replay=%.2f exact=%.2f\n",
+                    spec_stats.t_step_ms * inv_steps,
+                    spec_stats.t_target_feat_pack_ms * inv_steps,
+                    spec_stats.t_draft_decode_ms * inv_steps,
+                    spec_stats.t_topk_ms * inv_steps,
+                    spec_stats.t_build_tree_ms * inv_steps,
+                    spec_stats.t_snapshot_ms * inv_steps,
+                    spec_stats.t_target_tree_decode_ms * inv_steps,
+                    spec_stats.t_posterior_scan_ms * inv_steps,
+                    spec_stats.t_accept_path_ms * inv_steps,
+                    spec_stats.t_kv_compact_ms * inv_steps,
+                    spec_stats.t_ssm_rollback_ms * inv_steps,
+                    spec_stats.t_ingest_capture_ms * inv_steps,
+                    spec_stats.t_tree_ingest_ms * inv_steps,
+                    spec_stats.t_replay_ingest_ms * inv_steps,
+                    spec_stats.t_replay_ms * inv_steps,
+                    spec_stats.t_exact_validate_ms * inv_steps);
+            LOG_INF("spec timing total: prompt_ingest=%.2f ms tree_ingest=%.2f ms replay_ingest=%.2f ms\n",
+                    spec_stats.t_prompt_ingest_ms,
+                    spec_stats.t_tree_ingest_ms,
+                    spec_stats.t_replay_ingest_ms);
+        }
+        LOG_INF("spec timing: %.3f sec\n",
+                std::chrono::duration<double>(spec_t1 - spec_t0).count());
+
+        if (require_ddtree && (spec_stats.n_tree_verifies <= 0 || spec_stats.max_tree_nodes <= 1)) {
+            throw std::runtime_error("--require-ddtree failed: no multi-node DDTree verify observed");
+        }
+        if (require_replay && spec_stats.n_snapshot_replays <= 0) {
+            throw std::runtime_error("--require-replay failed: snapshot+replay fallback was not exercised");
+        }
+        if (require_full_prompt_ingest &&
+                (spec_stats.n_capture_clamps != 0 ||
+                 spec_stats.n_prompt_ingested_tokens != (int64_t)prompt.size())) {
+            throw std::runtime_error("--require-full-prompt-ingest failed: prompt hidden capture was incomplete");
+        }
 
         // Truncate to gen if the driver produced more tokens than requested.
         if ((int32_t)spec_tokens.size() > gen) {
