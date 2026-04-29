@@ -44,6 +44,7 @@ struct llama_speculative_tree_driver_stats {
     int64_t n_tree_ingested_tokens        = 0;
     int64_t n_replay_ingested_tokens      = 0;
     int64_t n_capture_clamps              = 0;
+    int64_t n_exact_validate_nodes        = 0;
 
     double t_step_ms                 = 0.0;
     double t_target_feat_pack_ms     = 0.0;
@@ -62,6 +63,9 @@ struct llama_speculative_tree_driver_stats {
     double t_replay_ingest_ms        = 0.0;
     double t_replay_ms               = 0.0;
     double t_exact_validate_ms       = 0.0;
+    double t_exact_decode_ms         = 0.0;
+    double t_exact_sample_ms         = 0.0;
+    double t_exact_advance_ms        = 0.0;
 };
 
 // Allocate a driver.  target_ctx must have capture_hidden enabled before any

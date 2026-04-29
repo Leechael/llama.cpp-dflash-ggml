@@ -434,7 +434,7 @@ struct server_slot {
                         (long long)st.n_capture_clamps);
                 const double inv_steps = 1.0 / (double)st.n_steps;
                 SLT_CNT(*this,
-                        "ddtree timing avg: step=%0.2f ms pack=%0.2f draft=%0.2f topk=%0.2f build=%0.2f snap=%0.2f target_tree=%0.2f posterior=%0.2f accept=%0.2f compact=%0.2f rollback=%0.2f ingest=%0.2f tree_ingest=%0.2f replay_ingest=%0.2f replay=%0.2f exact=%0.2f\n",
+                        "ddtree timing avg: step=%0.2f ms pack=%0.2f draft=%0.2f topk=%0.2f build=%0.2f snap=%0.2f target_tree=%0.2f posterior=%0.2f accept=%0.2f compact=%0.2f rollback=%0.2f ingest=%0.2f tree_ingest=%0.2f replay_ingest=%0.2f replay=%0.2f exact=%0.2f exact_decode=%0.2f exact_sample=%0.2f exact_advance=%0.2f exact_nodes=%0.2f\n",
                         st.t_step_ms * inv_steps,
                         st.t_target_feat_pack_ms * inv_steps,
                         st.t_draft_decode_ms * inv_steps,
@@ -450,7 +450,11 @@ struct server_slot {
                         st.t_tree_ingest_ms * inv_steps,
                         st.t_replay_ingest_ms * inv_steps,
                         st.t_replay_ms * inv_steps,
-                        st.t_exact_validate_ms * inv_steps);
+                        st.t_exact_validate_ms * inv_steps,
+                        st.t_exact_decode_ms * inv_steps,
+                        st.t_exact_sample_ms * inv_steps,
+                        st.t_exact_advance_ms * inv_steps,
+                        (double)st.n_exact_validate_nodes * inv_steps);
                 SLT_CNT(*this,
                         "ddtree timing total: prompt_ingest=%0.2f ms tree_ingest=%0.2f ms replay_ingest=%0.2f ms\n",
                         st.t_prompt_ingest_ms,
