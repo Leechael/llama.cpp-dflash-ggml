@@ -6,7 +6,7 @@ REMOTE_DIR=/home/leechael/workshop/lucebox-hub/dflash/deps/llama.cpp
 TARGET_MODEL=/home/leechael/workshop/lucebox-hub/dflash/models/Qwen3.5-27B-Q4_K_M.gguf
 DRAFT_MODEL=/home/leechael/workshop/lucebox-hub/dflash/models/draft/model.gguf
 PROMPT_TEXT=/tmp/real_rendered_prompt.txt
-GEN=${AUTORESEARCH_GEN:-16}
+GEN=${AUTORESEARCH_GEN:-32}
 CTX=${AUTORESEARCH_CTX:-65536}
 TARGET_FEAT_CTX=${LLAMA_DDTREE_TARGET_FEAT_CTX:-1024}
 
@@ -66,7 +66,7 @@ spec_sec = last_float(r"spec timing:\s*([0-9.]+)\s*sec")
 gen_tokens = last_int(r"spec:\s*generated\s+(\d+)\s+tokens")
 # Committed can be > requested generation because one speculative step may validate beyond the requested output.
 steps = last_int(r"steps=(\d+)")
-committed = last_int(r"committed=(\d+)")
+committed = last_int(r"(?:^|\\s)committed=(\d+)")
 step_ms = last_float(r"spec timing avg:.*?step=([0-9.]+)")
 pack_ms = last_float(r"spec timing avg:.*?pack=([0-9.]+)")
 draft_ms = last_float(r"spec timing avg:.*?draft=([0-9.]+)")
@@ -74,11 +74,13 @@ topk_ms = last_float(r"spec timing avg:.*?topk=([0-9.]+)")
 exact_ms = last_float(r"spec timing avg:.*?exact=([0-9.]+)")
 exact_decode_ms = last_float(r"spec timing avg:.*?exact_decode=([0-9.]+)")
 acceptance = last_float(r"exact_avg_commit_per_step=([0-9.]+)")
-if not spec_sec or not gen_tokens:
-    print("Failed to parse spec timing/generated tokens", file=sys.stderr)
+if not spec_sec or not gen_tokens or not step_ms or not steps:
+    print("Failed to parse spec timing/generated tokens/decode step timing", file=sys.stderr)
     sys.exit(2)
-tps = gen_tokens / spec_sec
-print(f"METRIC tps={tps:.6f}")
+e2e_tps = gen_tokens / spec_sec
+decode_tps = gen_tokens / (steps * step_ms / 1000.0)
+print(f"METRIC tps={decode_tps:.6f}")
+print(f"METRIC e2e_tps={e2e_tps:.6f}")
 print(f"METRIC spec_sec={spec_sec:.6f}")
 print(f"METRIC gen_tokens={gen_tokens}")
 print(f"METRIC steps={steps}")

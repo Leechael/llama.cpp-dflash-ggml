@@ -4,8 +4,8 @@
 Improve DFlash + DDTree decode throughput for the Qwen3.5-27B llama.cpp server port on Castle without sacrificing greedy bit-equal correctness in the e2e harness. The current user-visible TPS is far below the standalone DFlash baseline and below the target-only llama.cpp server reference.
 
 ## Metrics
-- **Primary**: `tps` (tok/s, higher is better) — e2e speculative decode throughput, computed as `spec_generated / spec_timing_sec`.
-- **Secondary**: `step_ms`, `draft_ms`, `exact_decode_ms`, `pack_ms`, `topk_ms`, `acceptance`, `gen_tokens`, `spec_sec`.
+- **Primary**: `tps` (tok/s, higher is better) — decode-only speculative throughput, computed as `generated_tokens / (steps * step_ms)` from the harness timing breakdown.
+- **Secondary**: `e2e_tps`, `step_ms`, `draft_ms`, `exact_decode_ms`, `pack_ms`, `topk_ms`, `acceptance`, `gen_tokens`, `spec_sec`.
 
 ## How to Run
 `./autoresearch.sh`
