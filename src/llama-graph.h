@@ -541,6 +541,7 @@ public:
     virtual ~llm_graph_input_target_feat() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 
     // [5*n_embd, ctx_len] F32 — stacked hidden captures from target layers
     ggml_tensor * inp_target_feat_raw = nullptr;
