@@ -5,7 +5,7 @@ REMOTE=castle.local
 REMOTE_DIR=/home/leechael/workshop/lucebox-hub/dflash/deps/llama.cpp
 TARGET_MODEL=/home/leechael/workshop/lucebox-hub/dflash/models/Qwen3.5-27B-Q4_K_M.gguf
 DRAFT_MODEL=/home/leechael/workshop/lucebox-hub/dflash/models/draft/model.gguf
-PROMPT_TEXT=/tmp/real_rendered_prompt.txt
+PROMPT_TEXT=${AUTORESEARCH_PROMPT:-/tmp/real_rendered_prompt.txt}
 GEN=${AUTORESEARCH_GEN:-32}
 CTX=${AUTORESEARCH_CTX:-65536}
 KV_TYPE=${AUTORESEARCH_KV_TYPE:-q4_0}
@@ -27,6 +27,8 @@ CHAIN_SEED=${LLAMA_DDTREE_CHAIN_SEED:-}
 CHAIN_DEPTH_CAP=${LLAMA_DDTREE_CHAIN_DEPTH_CAP:-}
 PROPOSAL_TEMP=${LLAMA_DDTREE_PROPOSAL_TEMP:-}
 TRACE=${LLAMA_DDTREE_TRACE:-}
+CHAIN_CAPTURE=${LLAMA_DDTREE_CHAIN_CAPTURE:-}
+CHAIN_SEQ_RM=${LLAMA_DDTREE_CHAIN_SEQ_RM:-}
 NO_FLASH_ARG=${AUTORESEARCH_NO_FLASH_ATTN:+--no-flash-attn}
 
 # Sync only source/control files needed for the benchmark. Avoid .git and build dirs.
@@ -58,6 +60,8 @@ ssh "$REMOTE" "cd '$REMOTE_DIR' && \
   LLAMA_DDTREE_CHAIN_DEPTH_CAP='$CHAIN_DEPTH_CAP' \
   LLAMA_DDTREE_PROPOSAL_TEMP='$PROPOSAL_TEMP' \
   ${TRACE:+LLAMA_DDTREE_TRACE='$TRACE'} \
+  ${CHAIN_CAPTURE:+LLAMA_DDTREE_CHAIN_CAPTURE='$CHAIN_CAPTURE'} \
+  ${CHAIN_SEQ_RM:+LLAMA_DDTREE_CHAIN_SEQ_RM='$CHAIN_SEQ_RM'} \
   ./build-server/bin/test-speculative-tree-e2e \
     --target-model '$TARGET_MODEL' \
     --draft-model '$DRAFT_MODEL' \
@@ -80,6 +84,7 @@ ssh "$REMOTE" "cd '$REMOTE_DIR' && \
 }
 
 cat "$out_file" | tail -220
+grep -E 'chain timing detail|chain timing:' "$out_file" || true
 
 python3 - "$out_file" <<'PY'
 import re, sys
