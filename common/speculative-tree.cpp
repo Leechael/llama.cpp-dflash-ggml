@@ -257,23 +257,10 @@ void extract_top_k_logprobs(
         std::vector<Entry> heap;
         heap.reserve(K + 1);
 
-        // Single pass: online logsumexp + top-K min-heap.
-        float running_max     = -INFINITY;
-        float running_sum_exp = 0.0f;
-
+        // Single pass: top-K min-heap.  Approximate row normalization from
+        // the retained top-K only to avoid a full-vocab exp/logsumexp pass.
         for (int j = 0; j < V; j++) {
             const float l = row[j] * inv_t;
-
-            // Update running logsumexp.
-            if (l > running_max) {
-                if (running_max > -INFINITY) {
-                    running_sum_exp *= std::exp(running_max - l);
-                }
-                running_sum_exp += 1.0f;
-                running_max = l;
-            } else {
-                running_sum_exp += std::exp(l - running_max);
-            }
 
             // Maintain top-K min-heap.
             if ((int)heap.size() < K) {
@@ -286,14 +273,18 @@ void extract_top_k_logprobs(
             }
         }
 
-        const float log_z = running_max + std::log(running_sum_exp);
-
         // sort_heap with a greater-than comparator (cmp_min) produces descending
         // order — same as std::sort with std::greater — so no reversal needed.
         std::sort_heap(heap.begin(), heap.end(), cmp_min);
 
+        const float row_best = heap.empty() ? 0.0f : heap[0].logit;
+        float sum_exp_top = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            sum_exp_top += std::exp(heap[k].logit - row_best);
+        }
+        const float log_z_approx = row_best + std::log(sum_exp_top);
         for (int k = 0; k < K; k++) {
-            out_log_probs[(size_t)i * K + k] = heap[k].logit - log_z;
+            out_log_probs[(size_t)i * K + k] = heap[k].logit - log_z_approx;
             out_token_ids[(size_t)i * K + k] = heap[k].id;
         }
     }
