@@ -70,6 +70,7 @@ ssh "$REMOTE" "cd '$REMOTE_DIR' && \
     --out-spec /tmp/autoresearch_spec.bin \
     --out-chain /tmp/autoresearch_chain.bin \
     --ddtree-budget '$BUDGET' \
+    ${TOP_K:+--ddtree-top-k '$TOP_K'} \
     --require-full-prompt-ingest \
     --temp 0 \
     --n-gpu-layers ${AUTORESEARCH_N_GPU_LAYERS:-65} \
