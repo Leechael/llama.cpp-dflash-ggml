@@ -461,6 +461,8 @@ int main(int argc, char ** argv) {
             out_chain_path = argv[++i];
         } else if (arg == "--ddtree-budget" && i + 1 < argc) {
             ddparams.budget = std::atoi(argv[++i]);
+        } else if (arg == "--ddtree-top-k" && i + 1 < argc) {
+            ddparams.top_k = std::atoi(argv[++i]);
         } else if (arg == "--ddtree-no-chain-seed") {
             ddparams.chain_seed = false;
         } else if (arg == "--require-ddtree") {

@@ -552,7 +552,7 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     // Read draft logits: [block_size, n_vocab].
     // Skip position 0 (root slot fixed to root_token) and use positions 1..block_size-1.
     const int L = (int)block_size - 1; // draft positions with meaningful predictions
-    const int K = (d->params.budget > L) ? 8 : 1;
+    const int K = (d->params.top_k > 0) ? d->params.top_k : ((d->params.budget > L) ? 8 : 1);
 
     d->top_log_probs.resize((size_t)L * K);
     d->top_token_ids.resize((size_t)L * K);
