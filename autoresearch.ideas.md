@@ -1,3 +1,9 @@
 - Revisit sizing the DFlash draft context from target feature window + block instead of fixed 2048/4096; one discarded run reduced target_feat set_inputs from ~4 ms to ~0.7 ms but did not improve decode TPS, and it still did not fit fast-rollback persist.
 - Persist compression remains the route to fast rollback at 64k/full-draft: q4->tq3 KV, draft n_ctx reduction, and ngld4 did not free enough; ngld3 fit but was slower. Conv persist is still F32 and `ggml_ssm_conv_tree_persist` asserts F32, so F16 conv persist would need kernel + rollback support.
 - GPU-side draft logits top-k/argmax is likely the real top-k optimization; CPU heap/fixed-array tweaks and budget K=1 did not move primary TPS enough.
+- 2026-04-30 autoresearch Phase 2 findings:
+  - Multi-prompt batched/exact validation: 7/8 prompts perfect match; 56k prompt had 1 diff at min_margin=0.0045 (step 2). A margin threshold >=0.01 might be safe for exact-skip on tested prompts, but broader validation needed.
+  - Draft compute buffer reduction (capping draft n_batch to 64) saves ~1.1 GiB GPU memory and is now committed. Does not affect exact-path TPS but enables smaller-n_batch fast-rollback fits.
+  - Fast-batched + fast-rollback path consistently slower than exact-validation for budgets 8-16 (7.3-7.8 TPS vs ~10 TPS exact). Target_tree decode dominates cost (~70-120ms depending on budget).
+  - GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 allows budget 22 persist to allocate (cudaMallocManaged), but target_tree decode slows to ~1344ms/step due to page-fault thrashing — unusable.
+  - To make high-budget fast rollback viable without performance collapse, need either: (a) persist representation smaller than F16 (custom 8-bit kernel support), (b) extract accepted-node state from tree-kernel result tensor instead of separate persist buffer, or (c) free ~500MB-1GB additional contiguous GPU memory.
