@@ -590,7 +590,7 @@ int main(int argc, char ** argv) {
             std::max((int32_t)prompt.size() + gen + ddparams.budget + 64, (int32_t)1024));
         auto draft_cparams    = llama_context_default_params();
         draft_cparams.n_ctx   = draft_n_ctx;
-        draft_cparams.n_batch = std::min(draft_n_ctx, (uint32_t)2048);
+        draft_cparams.n_batch = std::min(draft_n_ctx, (uint32_t)64);
         draft_cparams.n_ubatch = std::min(draft_cparams.n_batch, n_ubatch);
         if (no_flash_attn) {
             draft_cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
