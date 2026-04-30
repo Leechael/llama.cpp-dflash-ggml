@@ -1149,26 +1149,11 @@ void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
         }
     };
 
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
-
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
-        if (it == ctx_map.end()) {
-            struct ggml_init_params init_params = {
-                /* mem_size   = */ ggml_tensor_overhead() * (size_t)(2 * n_layer) + 1024,
-                /* mem_buffer = */ nullptr,
-                /* no_alloc   = */ true,
-            };
-            ggml_context * ctx = ggml_init(init_params);
-            if (!ctx) {
-                return nullptr;
-            }
-            ctx_map.emplace(buft, ctx);
-            return ctx;
-        }
-        return it->second.get();
-    };
-
+    // dflash Phase 2.4 fix: allocate each layer's persist tensors in a separate
+    // context so they get separate backend buffers. This lets small (~26 MiB)
+    // per-layer allocations fit into fragmented GPU memory where one large
+    // (~1.7 GiB) contiguous block would fail.
+    size_t total_bytes = 0;
     for (int il = 0; il < n_layer; ++il) {
         if (!hparams.is_recurrent(il)) {
             continue; // full-attn layer — no persist buffer needed
@@ -1179,7 +1164,13 @@ void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
                 mem_recr->s_l[il] != nullptr && mem_recr->s_l[il]->buffer != nullptr) {
             buft = ggml_backend_buffer_get_type(mem_recr->s_l[il]->buffer);
         }
-        ggml_context * ctx = ctx_for_buft(buft);
+
+        struct ggml_init_params init_params = {
+            /* mem_size   = */ ggml_tensor_overhead() * 2 + 1024,
+            /* mem_buffer = */ nullptr,
+            /* no_alloc   = */ true,
+        };
+        ggml_context * ctx = ggml_init(init_params);
         if (!ctx) {
             LLAMA_LOG_ERROR("%s: failed to create ggml context for persist buffers\n", __func__);
             dflash_persist_inter_l.clear();
@@ -1205,24 +1196,20 @@ void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
                 GGML_TYPE_F32, d_conv - 1, conv_channels, n_tokens);
         ggml_format_name(tc, "dflash_persist_conv_il%d", il);
         dflash_persist_conv_l[il] = tc;
-    }
 
-    size_t total_bytes = 0;
-    for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
         if (!buf) {
-            LLAMA_LOG_ERROR("%s: failed to allocate persist buffers (n_tokens=%lld)\n",
-                            __func__, (long long)n_tokens);
+            LLAMA_LOG_ERROR("%s: failed to allocate persist buffer for layer %d (n_tokens=%lld)\n",
+                            __func__, il, (long long)n_tokens);
             dflash_persist_inter_l.clear();
             dflash_persist_conv_l.clear();
             dflash_persist_ctxs_bufs.clear();
-            ctx_map.clear();
             dflash_persist_failed_n_tokens = std::max(dflash_persist_failed_n_tokens, n_tokens);
             return;
         }
         ggml_backend_buffer_clear(buf, 0);
         total_bytes += ggml_backend_buffer_get_size(buf);
-        dflash_persist_ctxs_bufs.emplace_back(std::move(ctx), buf);
+        dflash_persist_ctxs_bufs.emplace_back(ggml_context_ptr(ctx), buf);
     }
     dflash_persist_max_n_tokens = n_tokens;
     dflash_persist_failed_n_tokens = 0;
