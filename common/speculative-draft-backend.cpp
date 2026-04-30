@@ -130,9 +130,9 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
             draft_batch.logits    = logits.data();
             draft_batch.parent_id = nullptr;
 
-            const int ret = llama_decode(draft_ctx, draft_batch);
+            const int ret = llama_encode(draft_ctx, draft_batch);
             if (ret != 0) {
-                LOG_ERR("%s: draft llama_decode failed: %d\n", __func__, ret);
+                LOG_ERR("%s: draft llama_encode failed: %d\n", __func__, ret);
                 info.t_draft_decode_ms += draft_elapsed_ms(t0);
                 return false;
             }
