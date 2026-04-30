@@ -952,6 +952,44 @@ void llm_graph_input_target_feat::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_graph_input_target_feat::can_reuse(const llm_graph_params & params) {
+    if (params.pending_target_feat_raw_ptr == nullptr ||
+            params.pending_target_feat_n_embd_fc_ptr == nullptr ||
+            params.pending_target_feat_ctx_len_ptr == nullptr) {
+        return false;
+    }
+
+    const int64_t fc       = *params.pending_target_feat_n_embd_fc_ptr;
+    const int64_t ctx_len  = *params.pending_target_feat_ctx_len_ptr;
+    const int64_t n_tokens = params.ubatch.n_tokens;
+
+    if (fc <= 0 || ctx_len <= 0 || n_tokens <= 0) {
+        return false;
+    }
+
+    bool res = true;
+    res &= inp_target_feat_raw != nullptr;
+    res &= inp_pos_q           != nullptr;
+    res &= inp_pos_k           != nullptr;
+
+    if (inp_target_feat_raw) {
+        res &= inp_target_feat_raw->ne[0] == fc;
+        res &= inp_target_feat_raw->ne[1] == ctx_len;
+    }
+    if (inp_pos_q) {
+        res &= inp_pos_q->ne[0] == n_tokens;
+    }
+    if (inp_pos_k) {
+        res &= inp_pos_k->ne[0] == ctx_len + n_tokens;
+    }
+
+    if (debug > 1) {
+        LLAMA_LOG_DEBUG("%s: can reuse dflash target_feat graph input = %d\n", __func__, res);
+    }
+
+    return res;
+}
+
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
     inputs.emplace_back(std::move(input));
     return inputs.back().get();
