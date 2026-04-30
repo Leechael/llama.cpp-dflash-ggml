@@ -72,7 +72,7 @@ ssh "$REMOTE" "cd '$REMOTE_DIR' && \
     --ddtree-budget '$BUDGET' \
     --require-full-prompt-ingest \
     --temp 0 \
-    --n-gpu-layers 65 \
+    --n-gpu-layers ${AUTORESEARCH_N_GPU_LAYERS:-65} \
     --draft-gpu-layers '$DRAFT_GPU_LAYERS' \
     --n-ctx '$CTX' \
     --n-batch '$N_BATCH' \
