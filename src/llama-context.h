@@ -132,12 +132,26 @@ struct llama_context {
     // committed_pos is the number of tokens committed in the target context so far.
     void set_target_feat_raw(const float * data, int64_t n_embd_fc, int64_t ctx_len,
                              int64_t committed_pos);
+    void set_target_feat_fused(const float * data, int64_t n_embd, int64_t ctx_len,
+                               int64_t committed_pos);
+    int dflash_draft_fuse_target_feat(const float * target_feat_raw,
+                                      int64_t       n_embd_fc,
+                                      int64_t       ctx_len,
+                                      float *       target_feat_fused);
     int dflash_draft_encode_top_k(const llama_batch & batch_inp,
                                   const float *       target_feat_raw,
                                   int64_t             n_embd_fc,
                                   int64_t             ctx_len,
                                   int64_t             committed_pos,
                                   int32_t             top_k);
+    int dflash_draft_encode_top_k_fused(const llama_batch & batch_inp,
+                                        const float *       target_feat_fused,
+                                        int64_t             n_embd,
+                                        int64_t             ctx_len,
+                                        int64_t             committed_pos,
+                                        int32_t             top_k);
+    int dflash_draft_encode_top_k_pending(const llama_batch & batch_inp,
+                                          int32_t             top_k);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -427,6 +441,8 @@ private:
     mutable int64_t       pending_target_feat_n_embd_fc = 0;
     mutable int64_t       pending_target_feat_ctx_len   = 0;
     mutable int64_t       pending_draft_committed_pos   = 0;
+    mutable bool          pending_target_feat_fused     = false;
+    mutable bool          pending_dflash_fuse_only      = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

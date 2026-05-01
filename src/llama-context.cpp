@@ -1257,6 +1257,18 @@ void llama_context::set_target_feat_raw(const float * data, int64_t n_embd_fc, i
     pending_target_feat_n_embd_fc = n_embd_fc;
     pending_target_feat_ctx_len   = ctx_len;
     pending_draft_committed_pos   = committed_pos;
+    pending_target_feat_fused     = false;
+    pending_dflash_fuse_only      = false;
+}
+
+void llama_context::set_target_feat_fused(const float * data, int64_t n_embd, int64_t ctx_len,
+                                          int64_t committed_pos) {
+    pending_target_feat_raw       = data;
+    pending_target_feat_n_embd_fc = n_embd;
+    pending_target_feat_ctx_len   = ctx_len;
+    pending_draft_committed_pos   = committed_pos;
+    pending_target_feat_fused     = true;
+    pending_dflash_fuse_only      = false;
 }
 
 void llama_context::set_warmup(bool value) {
@@ -1737,6 +1749,87 @@ int llama_context::encode(const llama_batch & batch_inp) {
     return 0;
 }
 
+int llama_context::dflash_draft_fuse_target_feat(
+        const float * target_feat_raw,
+        int64_t       n_embd_fc,
+        int64_t       ctx_len,
+        float *       target_feat_fused) {
+    if (model.arch != LLM_ARCH_DFLASH_DRAFT || target_feat_raw == nullptr || target_feat_fused == nullptr ||
+        n_embd_fc <= 0 || ctx_len <= 0) {
+        return -1;
+    }
+
+    set_target_feat_raw(target_feat_raw, n_embd_fc, ctx_len, 0);
+    pending_dflash_fuse_only = true;
+    set_dflash_draft_top_k(0);
+
+    const auto & hparams = model.hparams;
+    const int64_t n_embd = hparams.n_embd_inp();
+    std::vector<float> dummy_embd((size_t) n_embd, 0.0f);
+    llama_pos pos = 0;
+    int32_t n_seq_id = 1;
+    llama_seq_id seq_id_value = 0;
+    llama_seq_id * seq_id = &seq_id_value;
+    int8_t output = 1;
+
+    llama_batch batch{};
+    batch.n_tokens = 1;
+    batch.token    = nullptr;
+    batch.embd     = dummy_embd.data();
+    batch.pos      = &pos;
+    batch.n_seq_id = &n_seq_id;
+    batch.seq_id   = &seq_id;
+    batch.logits   = &output;
+
+    if (!balloc->init(batch, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        pending_dflash_fuse_only = false;
+        return -1;
+    }
+
+    const uint32_t n_tokens = balloc->get_n_tokens();
+    const llama_ubatch ubatch = balloc->split_simple(n_tokens);
+
+    if (t_compute_start_us == 0) {
+        t_compute_start_us = ggml_time_us();
+    }
+
+    embd_seq.clear();
+    sched_reserve();
+    n_queued_tokens += n_tokens;
+    n_outputs = n_tokens;
+
+    const bool causal_attn_org = cparams.causal_attn;
+    cparams.causal_attn = false;
+
+    ggml_status status;
+    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+
+    cparams.causal_attn = causal_attn_org;
+    pending_dflash_fuse_only = false;
+
+    if (!res) {
+        switch (status) {
+            case GGML_STATUS_ABORTED:      return  2;
+            case GGML_STATUS_ALLOC_FAILED: return -2;
+            case GGML_STATUS_FAILED:       return -3;
+            case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+        }
+    }
+
+    ggml_tensor * t_fused = res->get_embd();
+    if (t_fused == nullptr || t_fused->ne[0] != n_embd || t_fused->ne[1] != ctx_len) {
+        return -3;
+    }
+
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t_fused);
+    GGML_ASSERT(backend != nullptr);
+    ggml_backend_tensor_get_async(backend, t_fused, target_feat_fused, 0, ggml_nbytes(t_fused));
+    synchronize();
+
+    return 0;
+}
+
 int llama_context::dflash_draft_encode_top_k(
         const llama_batch & batch_inp,
         const float *       target_feat_raw,
@@ -1749,12 +1842,43 @@ int llama_context::dflash_draft_encode_top_k(
     }
 
     set_target_feat_raw(target_feat_raw, n_embd_fc, ctx_len, committed_pos);
+    return dflash_draft_encode_top_k_pending(batch_inp, top_k);
+}
+
+int llama_context::dflash_draft_encode_top_k_fused(
+        const llama_batch & batch_inp,
+        const float *       target_feat_fused,
+        int64_t             n_embd,
+        int64_t             ctx_len,
+        int64_t             committed_pos,
+        int32_t             top_k) {
+    if (model.arch != LLM_ARCH_DFLASH_DRAFT || target_feat_fused == nullptr || top_k <= 0) {
+        return -1;
+    }
+
+    set_target_feat_fused(target_feat_fused, n_embd, ctx_len, committed_pos);
+    return dflash_draft_encode_top_k_pending(batch_inp, top_k);
+}
+
+int llama_context::dflash_draft_encode_top_k_pending(
+        const llama_batch & batch_inp,
+        int32_t             top_k) {
+    if (model.arch != LLM_ARCH_DFLASH_DRAFT || pending_target_feat_raw == nullptr || top_k <= 0) {
+        return -1;
+    }
+
     set_dflash_draft_top_k(top_k);
 
     const auto & hparams = model.hparams;
-    const int64_t n_embd = hparams.n_embd_inp();
+    const int64_t n_embd_model = hparams.n_embd_inp();
 
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+    if (pending_target_feat_fused && pending_target_feat_n_embd_fc != n_embd_model) {
+        LLAMA_LOG_ERROR("%s: fused target_feat width mismatch: got %lld expected %lld\n",
+                        __func__, (long long)pending_target_feat_n_embd_fc, (long long)n_embd_model);
+        return -1;
+    }
+
+    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd_model, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -2619,6 +2743,8 @@ llm_graph_params llama_context::graph_params(
         /*.pending_target_feat_n_embd_fc_ptr =*/ &pending_target_feat_n_embd_fc,
         /*.pending_target_feat_ctx_len_ptr   =*/ &pending_target_feat_ctx_len,
         /*.pending_draft_committed_pos_ptr   =*/ &pending_draft_committed_pos,
+        /*.dflash_target_feat_fused          =*/ pending_target_feat_fused,
+        /*.dflash_fuse_only                  =*/ pending_dflash_fuse_only,
         /*.dflash_draft_top_k                =*/ dflash_draft_top_k_req,
         // Phase 2.4: pass persist buffer vector when in tree mode (parent_id is set).
         // Non-null only after ensure_dflash_persist_capacity() ran in decode().
@@ -3569,6 +3695,14 @@ void llama_set_target_feat_raw(llama_context * ctx,
     ctx->set_target_feat_raw(data, n_embd_fc, ctx_len, committed_pos);
 }
 
+int llama_dflash_draft_fuse_target_feat(llama_context * ctx,
+                                        const float   * target_feat_raw,
+                                        int64_t         n_embd_fc,
+                                        int64_t         ctx_len,
+                                        float         * target_feat_fused) {
+    return ctx->dflash_draft_fuse_target_feat(target_feat_raw, n_embd_fc, ctx_len, target_feat_fused);
+}
+
 int llama_dflash_draft_encode_top_k(llama_context * ctx,
                                     llama_batch     batch,
                                     const float   * target_feat_raw,
@@ -3577,6 +3711,16 @@ int llama_dflash_draft_encode_top_k(llama_context * ctx,
                                     int64_t         committed_pos,
                                     int32_t         top_k) {
     return ctx->dflash_draft_encode_top_k(batch, target_feat_raw, n_embd_fc, ctx_len, committed_pos, top_k);
+}
+
+int llama_dflash_draft_encode_top_k_fused(llama_context * ctx,
+                                          llama_batch     batch,
+                                          const float   * target_feat_fused,
+                                          int64_t         n_embd,
+                                          int64_t         ctx_len,
+                                          int64_t         committed_pos,
+                                          int32_t         top_k) {
+    return ctx->dflash_draft_encode_top_k_fused(batch, target_feat_fused, n_embd, ctx_len, committed_pos, top_k);
 }
 
 bool llama_dflash_rollback_ssm_to_dfs(

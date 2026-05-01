@@ -625,6 +625,8 @@ struct llm_graph_params {
     const int64_t * pending_target_feat_ctx_len_ptr   = nullptr;
     const int64_t * pending_draft_committed_pos_ptr   = nullptr;
 
+    bool dflash_target_feat_fused = false;
+    bool dflash_fuse_only         = false;
     int32_t dflash_draft_top_k = 0;
 
     // dflash Phase 2.4: per-layer SSM intermediate-state persist buffers.
@@ -703,6 +705,8 @@ struct llm_graph_params {
             loras          == other.loras          &&
             cross          == other.cross          &&
             capture_hidden == other.capture_hidden &&
+            dflash_target_feat_fused == other.dflash_target_feat_fused &&
+            dflash_fuse_only == other.dflash_fuse_only &&
             dflash_draft_top_k == other.dflash_draft_top_k &&
             (dflash_persist_inter_l != nullptr) == (other.dflash_persist_inter_l != nullptr) &&
             (dflash_persist_conv_l  != nullptr) == (other.dflash_persist_conv_l  != nullptr);
@@ -851,6 +855,8 @@ struct llm_graph_context {
     // Null when not in tree mode. Indexed by layer index il.
     const std::vector<ggml_tensor *> * dflash_persist_inter_l;
 
+    bool dflash_target_feat_fused;
+    bool dflash_fuse_only;
     int32_t dflash_draft_top_k;
 
     // dflash Phase 5: per-layer conv post-state persist buffer pointers

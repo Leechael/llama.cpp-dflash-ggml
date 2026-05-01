@@ -1066,6 +1066,12 @@ extern "C" {
                                              int64_t                 ctx_len,
                                              int64_t                 committed_pos);
 
+    LLAMA_API int llama_dflash_draft_fuse_target_feat(struct llama_context * ctx,
+                                                      const float          * target_feat_raw,
+                                                      int64_t                n_embd_fc,
+                                                      int64_t                ctx_len,
+                                                      float                * target_feat_fused);
+
     LLAMA_API int llama_dflash_draft_encode_top_k(struct llama_context * ctx,
                                                   struct llama_batch     batch,
                                                   const float          * target_feat_raw,
@@ -1073,6 +1079,14 @@ extern "C" {
                                                   int64_t                ctx_len,
                                                   int64_t                committed_pos,
                                                   int32_t                top_k);
+
+    LLAMA_API int llama_dflash_draft_encode_top_k_fused(struct llama_context * ctx,
+                                                        struct llama_batch     batch,
+                                                        const float          * target_feat_fused,
+                                                        int64_t                n_embd,
+                                                        int64_t                ctx_len,
+                                                        int64_t                committed_pos,
+                                                        int32_t                top_k);
 
     // dflash Phase 2.4: persist-based SSM rollback after tree verify.
     // After llama_kv_cache_seq_compact_tree(), call this to copy the SSM state
