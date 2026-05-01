@@ -1116,12 +1116,16 @@ const float * llama_context::get_hidden_capture_data(int64_t * out_ne0, int64_t 
     }
 
     const size_t cap_n = ggml_nelements(t_cap);
-    if (hidden_capture_host.size() < cap_n) {
-        hidden_capture_host.resize(cap_n);
+    if (!hidden_capture_host_valid || hidden_capture_host.size() < cap_n ||
+            hidden_capture_ne0 != t_cap->ne[0] || hidden_capture_ne1 != t_cap->ne[1]) {
+        if (hidden_capture_host.size() < cap_n) {
+            hidden_capture_host.resize(cap_n);
+        }
+        hidden_capture_ne0 = t_cap->ne[0];
+        hidden_capture_ne1 = t_cap->ne[1];
+        ggml_backend_tensor_get(t_cap, hidden_capture_host.data(), 0, cap_n * sizeof(float));
+        hidden_capture_host_valid = true;
     }
-    hidden_capture_ne0 = t_cap->ne[0];
-    hidden_capture_ne1 = t_cap->ne[1];
-    ggml_backend_tensor_get(t_cap, hidden_capture_host.data(), 0, cap_n * sizeof(float));
 
     if (out_ne0) *out_ne0 = hidden_capture_ne0;
     if (out_ne1) *out_ne1 = hidden_capture_ne1;
@@ -1692,11 +1696,23 @@ int llama_context::encode(const llama_batch & batch_inp) {
         dflash_draft_top_token_ids.clear();
     }
 
-    // dflash hidden capture stays device-side. get_hidden_capture_data() performs
-    // a lazy host sync only for fallback/debug callers.
     if (capture_hidden && res->t_hidden_capture != nullptr) {
-        hidden_capture_ne0 = res->t_hidden_capture->ne[0];
-        hidden_capture_ne1 = res->t_hidden_capture->ne[1];
+        ggml_tensor * t_cap = res->t_hidden_capture;
+        hidden_capture_ne0 = t_cap->ne[0];
+        hidden_capture_ne1 = t_cap->ne[1];
+        const char * direct = std::getenv("LLAMA_DDTREE_CAPTURE_DIRECT");
+        if (direct != nullptr && direct[0] == '1') {
+            hidden_capture_host_valid = false;
+        } else {
+            ggml_backend_t backend_cap = ggml_backend_sched_get_tensor_backend(sched.get(), t_cap);
+            GGML_ASSERT(backend_cap != nullptr);
+            const size_t cap_n = ggml_nelements(t_cap);
+            if (hidden_capture_host.size() < cap_n) {
+                hidden_capture_host.resize(cap_n);
+            }
+            ggml_backend_tensor_get_async(backend_cap, t_cap, hidden_capture_host.data(), 0, cap_n * sizeof(float));
+            hidden_capture_host_valid = true;
+        }
     }
 
     // extract embeddings
@@ -3179,11 +3195,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        // dflash hidden capture stays device-side. get_hidden_capture_data() performs
-        // a lazy host sync only for fallback/debug callers.
         if (capture_hidden && res->t_hidden_capture != nullptr) {
-            hidden_capture_ne0 = res->t_hidden_capture->ne[0];
-            hidden_capture_ne1 = res->t_hidden_capture->ne[1];
+            ggml_tensor * t_cap = res->t_hidden_capture;
+            hidden_capture_ne0 = t_cap->ne[0];
+            hidden_capture_ne1 = t_cap->ne[1];
+            const char * direct = std::getenv("LLAMA_DDTREE_CAPTURE_DIRECT");
+            if (direct != nullptr && direct[0] == '1') {
+                hidden_capture_host_valid = false;
+            } else {
+                ggml_backend_t backend_cap = ggml_backend_sched_get_tensor_backend(sched.get(), t_cap);
+                GGML_ASSERT(backend_cap != nullptr);
+                const size_t cap_n = ggml_nelements(t_cap);
+                if (hidden_capture_host.size() < cap_n) {
+                    hidden_capture_host.resize(cap_n);
+                }
+                ggml_backend_tensor_get_async(backend_cap, t_cap, hidden_capture_host.data(), 0, cap_n * sizeof(float));
+                hidden_capture_host_valid = true;
+            }
         }
 
         // extract embeddings
