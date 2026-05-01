@@ -857,6 +857,12 @@ void llm_graph_result::set_outputs() {
     if (t_hidden_capture != nullptr) {
         ggml_set_output(t_hidden_capture);
     }
+    if (t_dflash_top_logits != nullptr) {
+        ggml_set_output(t_dflash_top_logits);
+    }
+    if (t_dflash_top_ids != nullptr) {
+        ggml_set_output(t_dflash_top_ids);
+    }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
             ggml_set_output(t);
@@ -1044,6 +1050,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     res              (params.res),
     capture_hidden   (params.capture_hidden),
     dflash_persist_inter_l(params.dflash_persist_inter_l),
+    dflash_draft_top_k(params.dflash_draft_top_k),
     dflash_persist_conv_l (params.dflash_persist_conv_l),
     pending_target_feat_raw_ptr      (params.pending_target_feat_raw_ptr),
     pending_target_feat_n_embd_fc_ptr(params.pending_target_feat_n_embd_fc_ptr),

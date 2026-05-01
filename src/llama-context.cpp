@@ -999,6 +999,27 @@ size_t llama_context::get_sampled_probs_count(int32_t idx) {
     }
 }
 
+bool llama_context::get_dflash_draft_top_k(
+        const float **       top_logits,
+        const llama_token ** top_token_ids,
+        int32_t *            n_rows,
+        int32_t *            k) {
+    if (top_logits) {
+        *top_logits = dflash_draft_top_logits.empty() ? nullptr : dflash_draft_top_logits.data();
+    }
+    if (top_token_ids) {
+        *top_token_ids = dflash_draft_top_token_ids.empty() ? nullptr : dflash_draft_top_token_ids.data();
+    }
+    if (n_rows) {
+        *n_rows = dflash_draft_top_rows;
+    }
+    if (k) {
+        *k = dflash_draft_top_k;
+    }
+    return dflash_draft_top_rows > 0 && dflash_draft_top_k > 0 &&
+           !dflash_draft_top_logits.empty() && !dflash_draft_top_token_ids.empty();
+}
+
 
 void llama_context::attach_threadpool(
            ggml_threadpool_t threadpool,
@@ -1075,6 +1096,15 @@ ggml_tensor * llama_context::get_hidden_capture() const {
         return gf_res_prev->t_hidden_capture;
     }
     return nullptr;
+}
+
+void llama_context::set_dflash_draft_top_k(int32_t k) {
+    k = std::max(0, k);
+    if (dflash_draft_top_k_req == k) {
+        return;
+    }
+    dflash_draft_top_k_req = k;
+    sched_need_reserve = true;
 }
 
 const float * llama_context::get_hidden_capture_data(int64_t * out_ne0, int64_t * out_ne1) const {
@@ -1345,6 +1375,28 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(const llama_ubatch & ubatch, uint32_t row_offset);
+static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers);
+static void copy_tensor_async_ints(
+    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const buffer_view<llama_token> & sampled,
+    const std::map<llama_seq_id, uint32_t> & seq_to_row,
+    ggml_backend_sched_t sched);
+static void copy_tensor_async_floats(
+    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const buffer_view<float> & dst,
+    size_t stride,
+    std::vector<uint32_t> & counts,
+    const std::map<llama_seq_id, uint32_t> & seq_to_row,
+    ggml_backend_sched_t sched);
+static void copy_tensor_async_candidates(
+    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const buffer_view<llama_token> & dst,
+    size_t stride,
+    std::vector<uint32_t> & counts,
+    const std::map<llama_seq_id, uint32_t> & seq_to_row,
+    ggml_backend_sched_t sched);
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     const bool profile_dflash =
         model.arch == LLM_ARCH_DFLASH_DRAFT &&
@@ -1532,12 +1584,57 @@ int llama_context::encode(const llama_batch & batch_inp) {
     auto * t_embd = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
 
     // extract logits
-    if (logits.data && t_logits) {
+    if (logits.data && t_logits && dflash_draft_top_k_req <= 0 && needs_raw_logits(ubatch, sampling.samplers)) {
         ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+    }
+
+    // Copy backend sampling output if this ubatch produced any sampling tensors.
+    if (!sampling.samplers.empty() && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() ||
+                                      !res->t_sampled_logits.empty() || !res->t_candidates.empty())) {
+        const auto seq_to_output_row = build_seq_to_output_row(ubatch, 0);
+        const auto stride = n_vocab;
+
+        copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());
+        copy_tensor_async_floats(res->t_sampled_logits, sampling.logits, stride, sampling.logits_count,
+                                 seq_to_output_row, sched.get());
+        copy_tensor_async_floats(res->t_sampled_probs, sampling.probs, stride, sampling.probs_count,
+                                 seq_to_output_row, sched.get());
+        copy_tensor_async_candidates(res->t_candidates, sampling.candidates, stride, sampling.candidates_count,
+                                     seq_to_output_row, sched.get());
+    }
+
+    // dflash-draft top-K output: pull compact [K, n_tokens] tensors into host memory.
+    if (model.arch == LLM_ARCH_DFLASH_DRAFT && res->get_dflash_top_logits() != nullptr &&
+        res->get_dflash_top_ids() != nullptr) {
+        ggml_tensor * t_top_logits = res->get_dflash_top_logits();
+        ggml_tensor * t_top_ids    = res->get_dflash_top_ids();
+        ggml_backend_t backend_logits = ggml_backend_sched_get_tensor_backend(sched.get(), t_top_logits);
+        ggml_backend_t backend_ids    = ggml_backend_sched_get_tensor_backend(sched.get(), t_top_ids);
+        GGML_ASSERT(backend_logits != nullptr);
+        GGML_ASSERT(backend_ids != nullptr);
+
+        const int64_t top_k = t_top_logits->ne[0];
+        const int64_t rows  = t_top_logits->ne[1];
+        GGML_ASSERT(t_top_ids->ne[0] == top_k && t_top_ids->ne[1] == rows);
+
+        dflash_draft_top_k    = (int32_t) top_k;
+        dflash_draft_top_rows = (int32_t) rows;
+        dflash_draft_top_logits.resize((size_t) top_k * rows);
+        dflash_draft_top_token_ids.resize((size_t) top_k * rows);
+
+        ggml_backend_tensor_get_async(backend_logits, t_top_logits, dflash_draft_top_logits.data(), 0,
+                                      ggml_nbytes(t_top_logits));
+        ggml_backend_tensor_get_async(backend_ids, t_top_ids, dflash_draft_top_token_ids.data(), 0,
+                                      ggml_nbytes(t_top_ids));
+    } else {
+        dflash_draft_top_k = 0;
+        dflash_draft_top_rows = 0;
+        dflash_draft_top_logits.clear();
+        dflash_draft_top_token_ids.clear();
     }
 
     // dflash hidden capture: pull the device tensor into host_capture_host so
@@ -1636,6 +1733,94 @@ int llama_context::encode(const llama_batch & batch_inp) {
             }
         }
     }
+
+    return 0;
+}
+
+int llama_context::dflash_draft_encode_top_k(
+        const llama_batch & batch_inp,
+        const float *       target_feat_raw,
+        int64_t             n_embd_fc,
+        int64_t             ctx_len,
+        int64_t             committed_pos,
+        int32_t             top_k) {
+    if (model.arch != LLM_ARCH_DFLASH_DRAFT || target_feat_raw == nullptr || top_k <= 0) {
+        return -1;
+    }
+
+    set_target_feat_raw(target_feat_raw, n_embd_fc, ctx_len, committed_pos);
+    set_dflash_draft_top_k(top_k);
+
+    const auto & hparams = model.hparams;
+    const int64_t n_embd = hparams.n_embd_inp();
+
+    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        return -1;
+    }
+
+    const uint32_t n_tokens = balloc->get_n_tokens();
+    const llama_ubatch ubatch = balloc->split_simple(n_tokens);
+
+    if (cparams.n_ubatch < n_tokens) {
+        LLAMA_LOG_ERROR("%s: encoder requires n_ubatch >= n_tokens\n", __func__);
+        return -1;
+    }
+
+    if (t_compute_start_us == 0) {
+        t_compute_start_us = ggml_time_us();
+    }
+
+    embd_seq.clear();
+    sched_reserve();
+    n_queued_tokens += n_tokens;
+    n_outputs = n_tokens;
+
+    const bool causal_attn_org = cparams.causal_attn;
+    cparams.causal_attn = false;
+
+    ggml_status status;
+    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+
+    cparams.causal_attn = causal_attn_org;
+
+    if (!res) {
+        switch (status) {
+            case GGML_STATUS_ABORTED:      return  2;
+            case GGML_STATUS_ALLOC_FAILED: return -2;
+            case GGML_STATUS_FAILED:       return -3;
+            case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+        }
+    }
+
+    if (res->get_dflash_top_logits() == nullptr || res->get_dflash_top_ids() == nullptr) {
+        dflash_draft_top_k = 0;
+        dflash_draft_top_rows = 0;
+        dflash_draft_top_logits.clear();
+        dflash_draft_top_token_ids.clear();
+        return -3;
+    }
+
+    ggml_tensor * t_top_logits = res->get_dflash_top_logits();
+    ggml_tensor * t_top_ids    = res->get_dflash_top_ids();
+    ggml_backend_t backend_logits = ggml_backend_sched_get_tensor_backend(sched.get(), t_top_logits);
+    ggml_backend_t backend_ids    = ggml_backend_sched_get_tensor_backend(sched.get(), t_top_ids);
+    GGML_ASSERT(backend_logits != nullptr);
+    GGML_ASSERT(backend_ids != nullptr);
+
+    const int64_t graph_top_k = t_top_logits->ne[0];
+    const int64_t rows        = t_top_logits->ne[1];
+    GGML_ASSERT(t_top_ids->ne[0] == graph_top_k && t_top_ids->ne[1] == rows);
+
+    dflash_draft_top_k    = (int32_t) graph_top_k;
+    dflash_draft_top_rows = (int32_t) rows;
+    dflash_draft_top_logits.resize((size_t) graph_top_k * rows);
+    dflash_draft_top_token_ids.resize((size_t) graph_top_k * rows);
+
+    ggml_backend_tensor_get_async(backend_logits, t_top_logits, dflash_draft_top_logits.data(), 0,
+                                  ggml_nbytes(t_top_logits));
+    ggml_backend_tensor_get_async(backend_ids, t_top_ids, dflash_draft_top_token_ids.data(), 0,
+                                  ggml_nbytes(t_top_ids));
 
     return 0;
 }
@@ -2434,6 +2619,7 @@ llm_graph_params llama_context::graph_params(
         /*.pending_target_feat_n_embd_fc_ptr =*/ &pending_target_feat_n_embd_fc,
         /*.pending_target_feat_ctx_len_ptr   =*/ &pending_target_feat_ctx_len,
         /*.pending_draft_committed_pos_ptr   =*/ &pending_draft_committed_pos,
+        /*.dflash_draft_top_k                =*/ dflash_draft_top_k_req,
         // Phase 2.4: pass persist buffer vector when in tree mode (parent_id is set).
         // Non-null only after ensure_dflash_persist_capacity() ran in decode().
         /*.dflash_persist_inter_l =*/ (!dflash_persist_inter_l.empty() && ubatch.parent_id != nullptr)
@@ -3361,6 +3547,10 @@ void llama_set_capture_hidden(llama_context * ctx, bool enable) {
     ctx->set_capture_hidden(enable);
 }
 
+void llama_set_dflash_draft_top_k(llama_context * ctx, int32_t k) {
+    ctx->set_dflash_draft_top_k(k);
+}
+
 ggml_tensor * llama_get_hidden_capture(llama_context * ctx) {
     ctx->synchronize();
     return ctx->get_hidden_capture();
@@ -3377,6 +3567,16 @@ void llama_set_target_feat_raw(llama_context * ctx,
                                int64_t         ctx_len,
                                int64_t         committed_pos) {
     ctx->set_target_feat_raw(data, n_embd_fc, ctx_len, committed_pos);
+}
+
+int llama_dflash_draft_encode_top_k(llama_context * ctx,
+                                    llama_batch     batch,
+                                    const float   * target_feat_raw,
+                                    int64_t         n_embd_fc,
+                                    int64_t         ctx_len,
+                                    int64_t         committed_pos,
+                                    int32_t         top_k) {
+    return ctx->dflash_draft_encode_top_k(batch, target_feat_raw, n_embd_fc, ctx_len, committed_pos, top_k);
 }
 
 bool llama_dflash_rollback_ssm_to_dfs(
@@ -3504,6 +3704,16 @@ uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
+}
+
+bool llama_get_dflash_draft_top_k(
+        llama_context *      ctx,
+        const float **       logits,
+        const llama_token ** token_ids,
+        int32_t *            n_rows,
+        int32_t *            k) {
+    ctx->synchronize();
+    return ctx->get_dflash_draft_top_k(logits, token_ids, n_rows, k);
 }
 
 struct ggml_cgraph * llama_graph_reserve(

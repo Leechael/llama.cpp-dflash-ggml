@@ -1052,6 +1052,8 @@ extern "C" {
                                                           int64_t * out_ne1);
 
     // dflash draft target_feat injection (Task 1 Phase 4 gap fix).
+    LLAMA_API void llama_set_dflash_draft_top_k(struct llama_context * ctx, int32_t k);
+
     // Must be called on the draft context before llama_decode() when running a
     // dflash-draft (LLM_ARCH_DFLASH_DRAFT) model. The driver supplies a packed
     // [5*n_embd, ctx_len] F32 host buffer with per-layer hidden captures from the
@@ -1063,6 +1065,14 @@ extern "C" {
                                              int64_t                 n_embd_fc,
                                              int64_t                 ctx_len,
                                              int64_t                 committed_pos);
+
+    LLAMA_API int llama_dflash_draft_encode_top_k(struct llama_context * ctx,
+                                                  struct llama_batch     batch,
+                                                  const float          * target_feat_raw,
+                                                  int64_t                n_embd_fc,
+                                                  int64_t                ctx_len,
+                                                  int64_t                committed_pos,
+                                                  int32_t                top_k);
 
     // dflash Phase 2.4: persist-based SSM rollback after tree verify.
     // After llama_kv_cache_seq_compact_tree(), call this to copy the SSM state
@@ -1155,6 +1165,15 @@ extern "C" {
     // Returns NULL if no candidates were sampled.
     LLAMA_API llama_token * llama_get_sampled_candidates_ith      (struct llama_context * ctx, int32_t i);
     LLAMA_API uint32_t      llama_get_sampled_candidates_count_ith(struct llama_context * ctx, int32_t i);
+
+    // DFlash draft graph top-K tensors. Returns false when the last eval was not a
+    // dflash-draft graph with top-K output. Layout is row-major [n_rows, k].
+    LLAMA_API bool llama_get_dflash_draft_top_k(
+            struct llama_context * ctx,
+            const float **         logits,
+            const llama_token **   token_ids,
+            int32_t *              n_rows,
+            int32_t *              k);
 
     //
     // Vocab

@@ -91,6 +91,12 @@ struct llama_context {
     const llama_token * get_sampled_candidates_ith(int32_t idx);
     size_t get_sampled_candidates_count(int32_t idx);
 
+    bool get_dflash_draft_top_k(
+            const float **       top_logits,
+            const llama_token ** top_token_ids,
+            int32_t *            n_rows,
+            int32_t *            k);
+
     void attach_threadpool(
             ggml_threadpool_t threadpool,
             ggml_threadpool_t threadpool_batch);
@@ -108,6 +114,7 @@ struct llama_context {
     // dflash hidden capture API
     void          set_capture_hidden(bool enable);
     ggml_tensor * get_hidden_capture() const;
+    void          set_dflash_draft_top_k(int32_t k);
 
     // dflash Phase 2.4: persist-based SSM rollback.
     // Copies the SSM state stored in dflash_persist_inter_l[il] at DFS column
@@ -125,6 +132,12 @@ struct llama_context {
     // committed_pos is the number of tokens committed in the target context so far.
     void set_target_feat_raw(const float * data, int64_t n_embd_fc, int64_t ctx_len,
                              int64_t committed_pos);
+    int dflash_draft_encode_top_k(const llama_batch & batch_inp,
+                                  const float *       target_feat_raw,
+                                  int64_t             n_embd_fc,
+                                  int64_t             ctx_len,
+                                  int64_t             committed_pos,
+                                  int32_t             top_k);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -311,6 +324,12 @@ private:
     };
 
     sampling_info sampling;
+
+    int32_t                  dflash_draft_top_k_req = 0;
+    std::vector<float>       dflash_draft_top_logits;
+    std::vector<llama_token> dflash_draft_top_token_ids;
+    int32_t                  dflash_draft_top_rows = 0;
+    int32_t                  dflash_draft_top_k    = 0;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

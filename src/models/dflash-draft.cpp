@@ -17,6 +17,8 @@
 #include "llama-impl.h"   // LLAMA_TENSOR_NAME_FATTN
 #include "llama-graph.h"  // llm_graph_input_target_feat, build_inp_target_feat
 
+#include <algorithm>
+
 llm_build_dflash_draft::llm_build_dflash_draft(
         const llama_model  & model,
         const llm_graph_params & params) : llm_graph_context(params) {
@@ -25,8 +27,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_v());
 
     // draft constants derived from hparams
-    const int64_t block_size = (int64_t)hparams.dflash_block_size;  // 16 noise tokens
-    const int64_t n_embd_fc  = (int64_t)5 * n_embd;                 // 5*hidden for fc input
+    const int64_t n_embd_fc = (int64_t)5 * n_embd; // 5*hidden for fc input
 
     // rope_theta = 10M for draft (matches DFLASH27B_ROPE_THETA)
     const float draft_rope_theta = 10000000.0f;
@@ -196,8 +197,26 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     if (model.output != nullptr) {
         ggml_tensor * logits = ggml_mul_mat(ctx0, model.output, out);
         cb(logits, "result_output", -1);
-        res->t_logits = logits;
-        ggml_build_forward_expand(gf, logits);
+
+        if (dflash_draft_top_k > 0) {
+            const int top_k = dflash_draft_top_k;
+
+            ggml_tensor * top_ids = ggml_top_k(ctx0, logits, top_k);
+            cb(top_ids, "dflash_top_ids", -1);
+
+            ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], n_tokens);
+            ggml_tensor * top_logits  = ggml_get_rows(ctx0, logits_rows, top_ids);
+            top_logits = ggml_reshape_2d(ctx0, top_logits, top_k, n_tokens);
+            cb(top_logits, "dflash_top_logits", -1);
+
+            res->t_dflash_top_ids    = top_ids;
+            res->t_dflash_top_logits = top_logits;
+            ggml_build_forward_expand(gf, top_ids);
+            ggml_build_forward_expand(gf, top_logits);
+        } else {
+            res->t_logits = logits;
+            ggml_build_forward_expand(gf, logits);
+        }
     } else {
         ggml_build_forward_expand(gf, out);
     }
