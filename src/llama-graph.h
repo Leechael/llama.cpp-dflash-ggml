@@ -625,6 +625,8 @@ struct llm_graph_params {
     const int64_t * pending_target_feat_ctx_len_ptr   = nullptr;
     const int64_t * pending_draft_committed_pos_ptr   = nullptr;
 
+    int32_t dflash_draft_top_k = 0;
+
     // dflash Phase 2.4: per-layer SSM intermediate-state persist buffers.
     // Non-owning pointer into llama_context::dflash_persist_inter_l. Null when not in
     // tree mode or when the buffers have not yet been allocated. Graph builder reads
@@ -701,6 +703,7 @@ struct llm_graph_params {
             loras          == other.loras          &&
             cross          == other.cross          &&
             capture_hidden == other.capture_hidden &&
+            dflash_draft_top_k == other.dflash_draft_top_k &&
             (dflash_persist_inter_l != nullptr) == (other.dflash_persist_inter_l != nullptr) &&
             (dflash_persist_conv_l  != nullptr) == (other.dflash_persist_conv_l  != nullptr);
     }
@@ -717,6 +720,8 @@ public:
     ggml_tensor * get_embd()           const { return t_embd; }
     ggml_tensor * get_embd_pooled()    const { return t_embd_pooled; }
     ggml_tensor * get_hidden_capture() const { return t_hidden_capture; }
+    ggml_tensor * get_dflash_top_logits() const { return t_dflash_top_logits; }
+    ggml_tensor * get_dflash_top_ids()    const { return t_dflash_top_ids; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -747,6 +752,10 @@ public:
     ggml_tensor * t_embd_pooled   = nullptr;
     // dflash hidden capture: [5*n_embd, n_tokens] F32, populated when capture_hidden=true in graph_params
     ggml_tensor * t_hidden_capture = nullptr;
+
+    // dflash-draft top-K graph outputs: [K, n_tokens]
+    ggml_tensor * t_dflash_top_logits = nullptr;
+    ggml_tensor * t_dflash_top_ids    = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -841,6 +850,8 @@ struct llm_graph_context {
     // Non-owning pointer into llama_context::dflash_persist_inter_l (via graph_params).
     // Null when not in tree mode. Indexed by layer index il.
     const std::vector<ggml_tensor *> * dflash_persist_inter_l;
+
+    int32_t dflash_draft_top_k;
 
     // dflash Phase 5: per-layer conv post-state persist buffer pointers
     // (paired with dflash_persist_inter_l).

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -79,10 +80,11 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
         for (int64_t i = 1; i < block_size; ++i) {
             memcpy(noise_embd.data() + i * n_embd, mask_embd.data(), (size_t) n_embd * sizeof(float));
         }
+        llama_set_dflash_draft_top_k(draft_ctx, llama_speculative_draft_top_k_width((int) block_size, params));
         return true;
     }
 
-    const char * name() const override { return "llama"; }
+    const char * name() const override { return "dflash-topk"; }
 
     bool decode_topk(llama_token                                      root_token,
                      llama_pos                                        committed_pos,
@@ -103,8 +105,6 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
                 info.t_target_feat_pack_ms += draft_elapsed_ms(t0);
                 return false;
             }
-            llama_set_target_feat_raw(draft_ctx, target_feat_buf.data(), target_feat.n_embd_fc, info.ctx_len,
-                                      committed_pos);
             info.t_target_feat_pack_ms += draft_elapsed_ms(t0);
         }
 
@@ -130,9 +130,11 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
             draft_batch.logits    = logits.data();
             draft_batch.parent_id = nullptr;
 
-            const int ret = llama_encode(draft_ctx, draft_batch);
+            const int ret = llama_dflash_draft_encode_top_k(draft_ctx, draft_batch,
+                                                            target_feat_buf.data(), target_feat.n_embd_fc,
+                                                            info.ctx_len, committed_pos, info.K);
             if (ret != 0) {
-                LOG_ERR("%s: draft llama_encode failed: %d\n", __func__, ret);
+                LOG_ERR("%s: dflash draft encode-topK failed: %d\n", __func__, ret);
                 info.t_draft_decode_ms += draft_elapsed_ms(t0);
                 return false;
             }
@@ -143,38 +145,64 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
         top_token_ids.resize((size_t) info.L * info.K);
 
         {
-            const auto    t0                = ddtree_draft_clock::now();
-            const float * draft_logits_row1 = llama_get_logits_ith(draft_ctx, 1);
-            if (!draft_logits_row1) {
-                LOG_ERR("%s: draft logits unavailable\n", __func__);
+            const auto t0 = ddtree_draft_clock::now();
+
+            float proposal_temp = params.temp;
+            if (const char * e = std::getenv("LLAMA_DDTREE_PROPOSAL_TEMP")) {
+                char *      end = nullptr;
+                const float v   = std::strtof(e, &end);
+                if (end != e && v > 0.0f) {
+                    proposal_temp = v;
+                }
+            }
+            const float inv_t = 1.0f / std::max(1e-6f, proposal_temp);
+
+            const float *     draft_top_logits = nullptr;
+            const llama_token * draft_top_tokens = nullptr;
+            int32_t           top_rows         = 0;
+            int32_t           top_k            = 0;
+            if (!llama_get_dflash_draft_top_k(draft_ctx, &draft_top_logits, &draft_top_tokens, &top_rows, &top_k) ||
+                draft_top_logits == nullptr || draft_top_tokens == nullptr || top_rows < (int32_t) block_size ||
+                top_k < info.K) {
+                LOG_ERR("%s: dflash draft top-K unavailable\n", __func__);
                 info.t_topk_ms += draft_elapsed_ms(t0);
                 return false;
             }
-            if (info.K == 1) {
-                for (int i = 0; i < info.L; ++i) {
-                    const float * row      = draft_logits_row1 + (size_t) i * n_vocab;
-                    int32_t       best     = 0;
-                    float         best_val = row[0];
-                    for (int64_t v = 1; v < n_vocab; ++v) {
-                        if (row[v] > best_val) {
-                            best_val = row[v];
-                            best     = (int32_t) v;
-                        }
-                    }
+
+            struct Entry {
+                float       logit;
+                llama_token token;
+            };
+            std::vector<Entry> row_top((size_t) info.K);
+
+            for (int i = 0; i < info.L; ++i) {
+                const int row_idx = i + 1;
+                for (int k = 0; k < info.K; ++k) {
+                    row_top[(size_t) k] = {
+                        draft_top_logits[(size_t) row_idx * top_k + k],
+                        draft_top_tokens[(size_t) row_idx * top_k + k],
+                    };
+                }
+                std::sort(row_top.begin(), row_top.end(), [](const Entry & a, const Entry & b) {
+                    return a.logit > b.logit;
+                });
+
+                if (info.K == 1) {
                     top_log_probs[(size_t) i] = 0.0f;
-                    top_token_ids[(size_t) i] = best;
+                    top_token_ids[(size_t) i] = row_top[0].token;
+                    continue;
                 }
-            } else {
-                float proposal_temp = params.temp;
-                if (const char * e = std::getenv("LLAMA_DDTREE_PROPOSAL_TEMP")) {
-                    char *      end = nullptr;
-                    const float v   = std::strtof(e, &end);
-                    if (end != e && v > 0.0f) {
-                        proposal_temp = v;
-                    }
+
+                const float row_best = row_top[0].logit * inv_t;
+                float sum_exp_top = 0.0f;
+                for (int k = 0; k < info.K; ++k) {
+                    sum_exp_top += std::exp(row_top[(size_t) k].logit * inv_t - row_best);
                 }
-                extract_top_k_logprobs(draft_logits_row1, info.L, (int) n_vocab, info.K, proposal_temp,
-                                       top_log_probs.data(), top_token_ids.data());
+                const float log_z_approx = row_best + std::log(sum_exp_top);
+                for (int k = 0; k < info.K; ++k) {
+                    top_log_probs[(size_t) i * info.K + k] = row_top[(size_t) k].logit * inv_t - log_z_approx;
+                    top_token_ids[(size_t) i * info.K + k] = row_top[(size_t) k].token;
+                }
             }
             info.t_topk_ms += draft_elapsed_ms(t0);
         }
