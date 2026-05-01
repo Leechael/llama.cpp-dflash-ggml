@@ -22,8 +22,19 @@
 #include <stdexcept>
 
 static bool llama_dflash_fast_rollback_enabled() {
+    const char * verifier = std::getenv("LLAMA_DDTREE_VERIFIER");
+    if (verifier != nullptr && (std::strcmp(verifier, "paper") == 0 || std::strcmp(verifier, "tree") == 0)) {
+        return true;
+    }
+    const char * exact = std::getenv("LLAMA_DDTREE_EXACT_VALIDATION");
+    if (exact != nullptr && exact[0] == '1') {
+        return false;
+    }
     const char * e = std::getenv("LLAMA_DDTREE_FAST_ROLLBACK");
-    return e != nullptr && e[0] == '1';
+    if (e != nullptr) {
+        return e[0] == '1';
+    }
+    return true;
 }
 
 //
