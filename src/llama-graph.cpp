@@ -929,7 +929,7 @@ void llm_graph_input_target_feat::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(data != nullptr &&
                 "dflash-draft: llama_set_target_feat_raw() must be called before llama_decode()");
 
-    if (inp_target_feat_raw) {
+    if (inp_target_feat_raw && inp_target_feat_raw->buffer != nullptr) {
         GGML_ASSERT(inp_target_feat_raw->ne[0] == fc);
         GGML_ASSERT(inp_target_feat_raw->ne[1] == ctx_len);
         ggml_backend_tensor_set(inp_target_feat_raw, data, 0, (size_t)fc * ctx_len * sizeof(float));
@@ -938,7 +938,7 @@ void llm_graph_input_target_feat::set_input(const llama_ubatch * ubatch) {
     // pos_q is local to the draft attention window, not the target's global
     // sequence position. The draft attends over target_feat[0..ctx_len) plus
     // the block's noise tokens, matching standalone DFlash's draft_ctx+i.
-    if (inp_pos_q) {
+    if (inp_pos_q && inp_pos_q->buffer != nullptr) {
         const int64_t block_size = inp_pos_q->ne[0];
         std::vector<int32_t> pos_q(block_size);
         for (int64_t i = 0; i < block_size; ++i) {
@@ -948,7 +948,7 @@ void llm_graph_input_target_feat::set_input(const llama_ubatch * ubatch) {
     }
 
     // pos_k: [0 .. ctx_len + block_size)
-    if (inp_pos_k) {
+    if (inp_pos_k && inp_pos_k->buffer != nullptr) {
         const int64_t total_k = inp_pos_k->ne[0];
         std::vector<int32_t> pos_k(total_k);
         for (int64_t i = 0; i < total_k; ++i) {
@@ -1050,6 +1050,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     res              (params.res),
     capture_hidden   (params.capture_hidden),
     dflash_persist_inter_l(params.dflash_persist_inter_l),
+    dflash_target_feat_fused(params.dflash_target_feat_fused),
+    dflash_fuse_only(params.dflash_fuse_only),
     dflash_draft_top_k(params.dflash_draft_top_k),
     dflash_persist_conv_l (params.dflash_persist_conv_l),
     pending_target_feat_raw_ptr      (params.pending_target_feat_raw_ptr),

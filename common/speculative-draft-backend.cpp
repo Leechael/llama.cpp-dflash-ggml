@@ -96,12 +96,34 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
         info.L = (int) block_size - 1;
         info.K = llama_speculative_draft_top_k_width((int) block_size, params);
 
+        if (target_feat.ring == nullptr || target_feat.n_committed <= 0 || target_feat.cap <= 0 ||
+            target_feat.n_embd_fc <= 0 || target_feat.n_embd_fc % 5 != 0) {
+            LOG_ERR(
+                "%s: target_feat ring is empty; call llama_speculative_tree_driver_ingest_prompt_capture first\n",
+                __func__);
+            return false;
+        }
+
+        const int64_t fused_n_embd = target_feat.n_embd_fc / 5;
         {
             const auto t0 = ddtree_draft_clock::now();
-            if (!llama_speculative_draft_pack_target_feat(target_feat, target_feat_buf, info.ctx_len)) {
-                LOG_ERR(
-                    "%s: target_feat ring is empty; call llama_speculative_tree_driver_ingest_prompt_capture first\n",
-                    __func__);
+            if (!ensure_fused_target_feat(target_feat, fused_n_embd)) {
+                info.t_draft_decode_ms += draft_elapsed_ms(t0);
+                return false;
+            }
+            info.t_draft_decode_ms += draft_elapsed_ms(t0);
+        }
+
+        {
+            const auto t0 = ddtree_draft_clock::now();
+            llama_speculative_draft_target_feat_view fused_view {
+                fused_target_feat_ring.data(),
+                target_feat.n_committed,
+                target_feat.cap,
+                fused_n_embd,
+            };
+            if (!llama_speculative_draft_pack_target_feat(fused_view, target_feat_buf, info.ctx_len)) {
+                LOG_ERR("%s: fused target_feat ring is empty\n", __func__);
                 info.t_target_feat_pack_ms += draft_elapsed_ms(t0);
                 return false;
             }
@@ -130,9 +152,9 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
             draft_batch.logits    = logits.data();
             draft_batch.parent_id = nullptr;
 
-            const int ret = llama_dflash_draft_encode_top_k(draft_ctx, draft_batch,
-                                                            target_feat_buf.data(), target_feat.n_embd_fc,
-                                                            info.ctx_len, committed_pos, info.K);
+            const int ret = llama_dflash_draft_encode_top_k_fused(draft_ctx, draft_batch,
+                                                                  target_feat_buf.data(), fused_n_embd,
+                                                                  info.ctx_len, committed_pos, info.K);
             if (ret != 0) {
                 LOG_ERR("%s: dflash draft encode-topK failed: %d\n", __func__, ret);
                 info.t_draft_decode_ms += draft_elapsed_ms(t0);
@@ -211,6 +233,56 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
     }
 
   private:
+    bool ensure_fused_target_feat(const llama_speculative_draft_target_feat_view & target_feat,
+                                  int64_t fused_n_embd) {
+        const int64_t ctx_len = std::min(target_feat.n_committed, target_feat.cap);
+        const int64_t ring_start = target_feat.n_committed - ctx_len;
+
+        if (fused_target_feat_cap != target_feat.cap || fused_target_feat_n_embd != fused_n_embd ||
+            fused_target_feat_ring.size() != (size_t) target_feat.cap * fused_n_embd) {
+            fused_target_feat_cap = target_feat.cap;
+            fused_target_feat_n_embd = fused_n_embd;
+            fused_target_feat_n_committed = ring_start;
+            fused_target_feat_ring.assign((size_t) target_feat.cap * fused_n_embd, 0.0f);
+        }
+
+        if (fused_target_feat_n_committed < ring_start || fused_target_feat_n_committed > target_feat.n_committed) {
+            fused_target_feat_n_committed = ring_start;
+        }
+
+        const int64_t missing = target_feat.n_committed - fused_target_feat_n_committed;
+        if (missing <= 0) {
+            return true;
+        }
+
+        raw_fuse_buf.resize((size_t) target_feat.n_embd_fc * missing);
+        for (int64_t t = 0; t < missing; ++t) {
+            const int64_t logical_col = fused_target_feat_n_committed + t;
+            const int64_t ring_col = logical_col % target_feat.cap;
+            const float * src = target_feat.ring + ring_col * target_feat.n_embd_fc;
+            float * dst = raw_fuse_buf.data() + t * target_feat.n_embd_fc;
+            memcpy(dst, src, (size_t) target_feat.n_embd_fc * sizeof(float));
+        }
+
+        fused_fuse_buf.resize((size_t) fused_n_embd * missing);
+        const int ret = llama_dflash_draft_fuse_target_feat(draft_ctx, raw_fuse_buf.data(), target_feat.n_embd_fc,
+                                                            missing, fused_fuse_buf.data());
+        if (ret != 0) {
+            LOG_ERR("%s: dflash target_feat fuse failed: %d\n", __func__, ret);
+            return false;
+        }
+
+        for (int64_t t = 0; t < missing; ++t) {
+            const int64_t logical_col = fused_target_feat_n_committed + t;
+            const int64_t ring_col = logical_col % fused_target_feat_cap;
+            const float * src = fused_fuse_buf.data() + t * fused_n_embd;
+            float * dst = fused_target_feat_ring.data() + ring_col * fused_n_embd;
+            memcpy(dst, src, (size_t) fused_n_embd * sizeof(float));
+        }
+        fused_target_feat_n_committed = target_feat.n_committed;
+        return true;
+    }
+
     llama_context *     draft_ctx     = nullptr;
     const llama_model * target_model  = nullptr;
     int64_t             n_embd        = 0;
@@ -220,6 +292,12 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
     llama_ddtree_params params;
 
     std::vector<float>          target_feat_buf;
+    std::vector<float>          raw_fuse_buf;
+    std::vector<float>          fused_fuse_buf;
+    std::vector<float>          fused_target_feat_ring;
+    int64_t                     fused_target_feat_n_committed = 0;
+    int64_t                     fused_target_feat_n_embd = 0;
+    int64_t                     fused_target_feat_cap = 0;
     std::vector<float>          mask_embd;
     std::vector<float>          noise_embd;
     std::vector<llama_pos>      pos;

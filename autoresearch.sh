@@ -30,6 +30,10 @@ TRACE=${LLAMA_DDTREE_TRACE:-}
 CHAIN_CAPTURE=${LLAMA_DDTREE_CHAIN_CAPTURE:-}
 CHAIN_SEQ_RM=${LLAMA_DDTREE_CHAIN_SEQ_RM:-}
 NO_FLASH_ARG=${AUTORESEARCH_NO_FLASH_ATTN:+--no-flash-attn}
+AGENT_TPS_GATE=${AUTORESEARCH_AGENT_TPS_GATE:-required}
+AGENT_TPS_LOG=${AUTORESEARCH_AGENT_TPS_LOG:-}
+AGENT_TPS_MIN_API=${AUTORESEARCH_AGENT_TPS_MIN_API:-}
+AGENT_TPS_MIN_WALL=${AUTORESEARCH_AGENT_TPS_MIN_WALL:-}
 
 # Sync only source/control files needed for the benchmark. Avoid .git and build dirs.
 rsync -az --delete \
@@ -130,5 +134,68 @@ print(f"METRIC exact_ms={exact_ms:.6f}")
 print(f"METRIC exact_decode_ms={exact_decode_ms:.6f}")
 print(f"METRIC acceptance={acceptance:.6f}")
 PY
+
+if [[ "$AGENT_TPS_GATE" != "off" ]]; then
+  if [[ -z "$AGENT_TPS_LOG" || ! -f "$AGENT_TPS_LOG" ]]; then
+    echo "agent TPS gate failed: set AUTORESEARCH_AGENT_TPS_LOG=/path/to/agent-run.log, or AUTORESEARCH_AGENT_TPS_GATE=off for compile-only runs" >&2
+    rm -f "$out_file"
+    exit 3
+  fi
+  python3 - "$AGENT_TPS_LOG" "$AGENT_TPS_MIN_API" "$AGENT_TPS_MIN_WALL" <<'PY'
+import re, sys
+path, min_api_s, min_wall_s = sys.argv[1:4]
+text = open(path, 'r', errors='replace').read()
+
+def f(pattern, required=True, default=0.0):
+    vals = re.findall(pattern, text, re.I | re.S)
+    if vals:
+        v = vals[-1]
+        if isinstance(v, tuple):
+            v = v[0]
+        return float(str(v).replace(',', ''))
+    if required:
+        print(f"agent TPS gate failed: missing pattern {pattern!r}", file=sys.stderr)
+        sys.exit(4)
+    return default
+
+def i(pattern, required=False, default=0):
+    vals = re.findall(pattern, text, re.I | re.S)
+    if vals:
+        v = vals[-1]
+        if isinstance(v, tuple):
+            v = v[0]
+        return int(str(v).replace(',', ''))
+    if required:
+        print(f"agent TPS gate failed: missing pattern {pattern!r}", file=sys.stderr)
+        sys.exit(4)
+    return default
+
+m = re.findall(r"(?:TASK\s+)?TPS\s+([0-9.]+)\s*tok/s\s*API,\s*([0-9.]+)\s*tok/s\s*wall", text, re.I)
+if not m:
+    m = re.findall(r"agent[_ ]TPS:\s*([0-9.]+)\s*tok/s\s*API,\s*([0-9.]+)\s*tok/s\s*wall", text, re.I)
+if not m:
+    print("agent TPS gate failed: missing 'TPS <api> tok/s API, <wall> tok/s wall'", file=sys.stderr)
+    sys.exit(4)
+api_tps, wall_tps = map(float, m[-1])
+requests = i(r"(?:req|requests)\s*[:=]?\s*([0-9,]+)")
+output_tokens = i(r"(?:out|output(?:_tokens)?)\s*[:=]?\s*([0-9,]+)")
+input_tokens = i(r"(?:in|input(?:_tokens)?)\s*[:=]?\s*([0-9,]+)")
+api_sec = f(r"api\s*[:=]?\s*([0-9.]+)s", required=False)
+wall_sec = f(r"wall\s*[:=]?\s*([0-9.]+)s", required=False)
+if min_api_s and api_tps < float(min_api_s):
+    print(f"agent TPS gate failed: api_tps {api_tps:.6f} < {float(min_api_s):.6f}", file=sys.stderr)
+    sys.exit(5)
+if min_wall_s and wall_tps < float(min_wall_s):
+    print(f"agent TPS gate failed: wall_tps {wall_tps:.6f} < {float(min_wall_s):.6f}", file=sys.stderr)
+    sys.exit(5)
+print(f"METRIC agent_tps_api={api_tps:.6f}")
+print(f"METRIC agent_tps_wall={wall_tps:.6f}")
+print(f"METRIC agent_requests={requests}")
+print(f"METRIC agent_output_tokens={output_tokens}")
+print(f"METRIC agent_input_tokens={input_tokens}")
+print(f"METRIC agent_api_sec={api_sec:.6f}")
+print(f"METRIC agent_wall_sec={wall_sec:.6f}")
+PY
+fi
 
 rm -f "$out_file"

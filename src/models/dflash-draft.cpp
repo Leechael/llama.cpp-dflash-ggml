@@ -33,17 +33,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     const float draft_rope_theta = 10000000.0f;
     const float scale = 1.0f / sqrtf((float)n_embd_head);
 
-    // ── Draft-specific inputs ─────────────────────────────────────────────────
-    // noise_embed: pre-computed embedding rows [n_embd, block_size] — host fills this
-    // through ubatch.embd. It must be registered as a graph input; merely calling
-    // ggml_set_input() is not enough for llama_decode() to populate it.
-    auto inp_noise = std::make_unique<llm_graph_input_embd>(n_embd);
-    inp_noise->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-    ggml_set_name(inp_noise->embd, "dflash_noise_embed");
-    ggml_set_input(inp_noise->embd);
-    ggml_tensor * noise_embed = inp_noise->embd;
-    res->add_input(std::move(inp_noise));
-
+    // ── Draft-specific target-feature input ───────────────────────────────────
     // target_feat_raw / pos_q / pos_k: registered as graph inputs via build_inp_target_feat.
     // The host stashes data with llama_set_target_feat_raw() before llama_decode(); the
     // graph input class copies it into these GGML tensors at set_input() time.
@@ -54,23 +44,44 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     const int64_t ctx_len = (pending_target_feat_ctx_len_ptr && *pending_target_feat_ctx_len_ptr > 0)
                             ? *pending_target_feat_ctx_len_ptr
                             : n_ctx;
-    llm_graph_input_target_feat * inp_tf = build_inp_target_feat(n_embd_fc, ctx_len);
+    const int64_t target_feat_width = dflash_target_feat_fused ? n_embd : n_embd_fc;
+    llm_graph_input_target_feat * inp_tf = build_inp_target_feat(target_feat_width, ctx_len);
 
-    ggml_tensor * target_feat_raw = inp_tf->inp_target_feat_raw;
-    ggml_tensor * pos_q           = inp_tf->inp_pos_q;
-    ggml_tensor * pos_k           = inp_tf->inp_pos_k;
+    ggml_tensor * target_feat_in = inp_tf->inp_target_feat_raw;
+    ggml_tensor * pos_q          = inp_tf->inp_pos_q;
+    ggml_tensor * pos_k          = inp_tf->inp_pos_k;
 
     // ── Step 1: feature fusion ────────────────────────────────────────────────
     // target_feat = rms_norm(fc @ target_feat_raw, hidden_norm)
-    // fc:              [n_embd_fc, n_embd]   (ggml: ne[0]=n_embd_fc, ne[1]=n_embd)
-    // target_feat_raw: [n_embd_fc, ctx_len]
-    // Result:          [n_embd, ctx_len]
-    ggml_tensor * target_feat = ggml_mul_mat(ctx0, model.dflash_fc, target_feat_raw);
-    cb(target_feat, "dflash_fc_out", -1);
+    // The dedicated draft runtime can pass a cached fused target_feat directly.
+    ggml_tensor * target_feat = target_feat_in;
+    if (!dflash_target_feat_fused) {
+        // fc:              [n_embd_fc, n_embd]   (ggml: ne[0]=n_embd_fc, ne[1]=n_embd)
+        // target_feat_raw: [n_embd_fc, ctx_len]
+        // Result:          [n_embd, ctx_len]
+        target_feat = ggml_mul_mat(ctx0, model.dflash_fc, target_feat_in);
+        cb(target_feat, "dflash_fc_out", -1);
 
-    target_feat = ggml_rms_norm(ctx0, target_feat, hparams.f_norm_rms_eps);
-    target_feat = ggml_mul(ctx0, target_feat, model.dflash_hidden_norm);
+        target_feat = ggml_rms_norm(ctx0, target_feat, hparams.f_norm_rms_eps);
+        target_feat = ggml_mul(ctx0, target_feat, model.dflash_hidden_norm);
+    }
     cb(target_feat, "dflash_target_feat", -1);
+
+    if (dflash_fuse_only) {
+        res->t_embd = target_feat;
+        ggml_build_forward_expand(gf, target_feat);
+        return;
+    }
+
+    // noise_embed: pre-computed embedding rows [n_embd, block_size] — host fills this
+    // through ubatch.embd. It must be registered as a graph input; merely calling
+    // ggml_set_input() is not enough for llama_decode() to populate it.
+    auto inp_noise = std::make_unique<llm_graph_input_embd>(n_embd);
+    inp_noise->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_name(inp_noise->embd, "dflash_noise_embed");
+    ggml_set_input(inp_noise->embd);
+    ggml_tensor * noise_embed = inp_noise->embd;
+    res->add_input(std::move(inp_noise));
 
     // ── Step 2: position tensors ──────────────────────────────────────────────
     // Q positions: [ctx_len .. ctx_len + block_size) in draft-window-local
