@@ -83,6 +83,34 @@ struct llama_speculative_tree_driver {
     bool fast_rollback_unavailable = false;
 };
 
+enum class ddtree_verifier_mode {
+    exact,
+    paper,
+};
+
+static ddtree_verifier_mode ddtree_get_verifier_mode() {
+    const char * e = std::getenv("LLAMA_DDTREE_VERIFIER");
+    if (e != nullptr) {
+        if (std::strcmp(e, "exact") == 0 || std::strcmp(e, "chain") == 0) {
+            return ddtree_verifier_mode::exact;
+        }
+        if (std::strcmp(e, "paper") == 0 || std::strcmp(e, "tree") == 0) {
+            return ddtree_verifier_mode::paper;
+        }
+    }
+
+    const char * exact = std::getenv("LLAMA_DDTREE_EXACT_VALIDATION");
+    if (exact != nullptr && exact[0] == '1') {
+        return ddtree_verifier_mode::exact;
+    }
+
+    return ddtree_verifier_mode::paper;
+}
+
+static bool ddtree_paper_verifier_enabled() {
+    return ddtree_get_verifier_mode() == ddtree_verifier_mode::paper;
+}
+
 static bool ddtree_fast_batched_enabled() {
     const char * e = std::getenv("LLAMA_DDTREE_FAST_BATCHED");
     return e != nullptr && e[0] == '1';
@@ -581,9 +609,10 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     d->stats.n_tree_nodes_total += N;
     d->stats.max_tree_nodes = std::max(d->stats.max_tree_nodes, N);
 
-    const bool fast_batched  = ddtree_fast_batched_enabled();
-    const bool trace_batched = std::getenv("LLAMA_DDTREE_TRACE") != nullptr ||
-                               std::getenv("LLAMA_DDTREE_TRACE_CHAIN_ROOT") != nullptr;
+    const bool paper_verifier = ddtree_paper_verifier_enabled();
+    const bool fast_batched   = paper_verifier || ddtree_fast_batched_enabled();
+    const bool trace_batched  = std::getenv("LLAMA_DDTREE_TRACE") != nullptr ||
+                                std::getenv("LLAMA_DDTREE_TRACE_CHAIN_ROOT") != nullptr;
     const bool need_batched_tree = fast_batched || trace_batched;
 
     if (!need_batched_tree) {
@@ -613,8 +642,10 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
         return result;
     }
 
-    const bool fast_rollback = fast_batched && ddtree_fast_rollback_enabled() && !d->fast_rollback_unavailable;
-    const bool keep_snapshot = !fast_batched || !fast_rollback || ddtree_snapshot_fallback_enabled();
+    const bool fast_rollback = fast_batched && (paper_verifier || ddtree_fast_rollback_enabled()) &&
+                               !d->fast_rollback_unavailable;
+    const bool keep_snapshot = !paper_verifier &&
+                               (!fast_batched || !fast_rollback || ddtree_snapshot_fallback_enabled());
 
     // ── Step 6: snapshot before target verify ────────────────────────────────
     // By default fast-rollback mode still keeps a snapshot as a safety net.
@@ -803,6 +834,12 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
         }
 
         if (N > 1 && !did_commit_state) {
+            if (paper_verifier) {
+                LOG_ERR("%s: paper verifier requires tree-state rollback; no snapshot/replay fallback is allowed\n",
+                        __func__);
+                release_snap();
+                return {};
+            }
             if (snap == LLAMA_MEM_SNAPSHOT_INVALID || !llama_seq_restore(d->target_ctx, snap)) {
                 LOG_ERR("%s: fast rollback failed and snapshot fallback is unavailable\n", __func__);
                 release_snap();
