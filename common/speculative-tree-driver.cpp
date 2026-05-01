@@ -17,6 +17,7 @@
 //   snapshot+restore+chain-replay for that case.
 
 #include "speculative-tree-driver.h"
+#include "speculative-draft-backend.h"
 #include "speculative-tree.h"
 #include "log.h"
 
@@ -27,6 +28,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 // Maximum target-context window that the draft can attend over.
@@ -48,6 +50,7 @@ struct llama_speculative_tree_driver {
     llama_context * target_ctx = nullptr;
     llama_context * draft_ctx  = nullptr;
     llama_ddtree_params params;
+    std::unique_ptr<llama_speculative_draft_backend> draft_backend;
 
     // n_embd from the target model (for hidden capture slicing).
     int64_t n_embd = 0;
@@ -93,6 +96,11 @@ static bool ddtree_fast_rollback_enabled() {
 static bool ddtree_snapshot_fallback_enabled() {
     const char * e = std::getenv("LLAMA_DDTREE_SNAPSHOT_FALLBACK");
     return e == nullptr || e[0] != '0';
+}
+
+static bool ddtree_capture_direct_enabled() {
+    const char * e = std::getenv("LLAMA_DDTREE_CAPTURE_DIRECT");
+    return e != nullptr && e[0] == '1';
 }
 
 static int64_t ddtree_target_feat_cap() {
@@ -148,6 +156,14 @@ llama_speculative_tree_driver * llama_speculative_tree_driver_init(
     d->target_feat_cap         = ddtree_target_feat_cap();
     d->target_feat_ring.assign((size_t)d->target_feat_n_embd_fc * d->target_feat_cap, 0.0f);
 
+    d->draft_backend = llama_speculative_draft_backend_init_llama(
+            draft_ctx, target_model, d->n_embd, d->n_vocab, d->block_size, d->mask_token_id, d->params);
+    if (!d->draft_backend) {
+        LOG_ERR("%s: failed to initialize draft backend\n", __func__);
+        delete d;
+        return nullptr;
+    }
+
     return d;
 }
 
@@ -200,9 +216,10 @@ static int32_t driver_ingest_capture(llama_speculative_tree_driver * d,
                                      int32_t         n_dfs,
                                      ingest_source   source) {
     const auto t0 = ddtree_clock::now();
-    int64_t ne0 = 0, ne1 = 0;
-    const float * capture = llama_get_hidden_capture_data(d->target_ctx, &ne0, &ne1);
-    if (!capture || ne0 == 0 || ne1 == 0) {
+    ggml_tensor * t_capture = llama_get_hidden_capture(d->target_ctx);
+    int64_t ne0 = t_capture != nullptr ? t_capture->ne[0] : 0;
+    int64_t ne1 = t_capture != nullptr ? t_capture->ne[1] : 0;
+    if (t_capture == nullptr || ne0 == 0 || ne1 == 0) {
         LOG_ERR("%s: no hidden capture data available\n", __func__);
         d->stats.t_ingest_capture_ms += elapsed_ms(t0);
         return 0;
@@ -228,6 +245,39 @@ static int32_t driver_ingest_capture(llama_speculative_tree_driver * d,
         LOG_WRN("%s: requested n_dfs=%d but capture only has n_tokens=%lld; clamping (ring will be incomplete)\n",
                 __func__, n_dfs, (long long)n_tokens);
         n_to_ingest = (int32_t)n_tokens;
+    }
+
+    if (ddtree_capture_direct_enabled() && d->draft_backend) {
+        double direct_ms = 0.0;
+        if (d->draft_backend->ingest_target_capture(d->target_ctx, dfs_indices, n_to_ingest,
+                                                    d->target_feat_n_committed, d->target_feat_cap,
+                                                    direct_ms)) {
+            d->target_feat_n_committed += (int64_t)n_to_ingest;
+            switch (source) {
+                case ingest_source::prompt:
+                    d->stats.n_prompt_ingest_calls++;
+                    d->stats.n_prompt_ingested_tokens += n_to_ingest;
+                    d->stats.t_prompt_ingest_ms += direct_ms;
+                    break;
+                case ingest_source::tree:
+                    d->stats.n_tree_ingested_tokens += n_to_ingest;
+                    d->stats.t_tree_ingest_ms += direct_ms;
+                    break;
+                case ingest_source::replay:
+                    d->stats.n_replay_ingested_tokens += n_to_ingest;
+                    d->stats.t_replay_ingest_ms += direct_ms;
+                    break;
+            }
+            d->stats.t_ingest_capture_ms += direct_ms;
+            return n_to_ingest;
+        }
+    }
+
+    const float * capture = llama_get_hidden_capture_data(d->target_ctx, &ne0, &ne1);
+    if (!capture || ne0 == 0 || ne1 == 0) {
+        LOG_ERR("%s: no hidden capture data available after direct-ingest fallback\n", __func__);
+        d->stats.t_ingest_capture_ms += elapsed_ms(t0);
+        return 0;
     }
 
     for (int32_t i = 0; i < n_to_ingest; ++i) {
@@ -468,154 +518,51 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     }
     const auto t_step0 = ddtree_clock::now();
 
-    const llama_model * target_model = llama_get_model(d->target_ctx);
-    const int64_t n_embd     = d->n_embd;
-    const int64_t n_vocab    = d->n_vocab;
-    const int64_t block_size = d->block_size;
+    const int64_t n_vocab = d->n_vocab;
 
-    // ── Step 1: build noise embeddings ────────────────────────────────────────
-    // [root_token, mask_token * (block_size-1)] → embed rows → [block_size * n_embd]
-    d->noise_embd_buf.resize((size_t)block_size * n_embd);
-    {
-        // Embed root token at position 0.
-        if (llama_model_token_embd_lookup(target_model, root_token,
-                                          d->noise_embd_buf.data(), n_embd) != 0) {
-            LOG_ERR("%s: token_embd_lookup failed for root_token=%d\n",
-                            __func__, (int)root_token);
-            return {};
-        }
-        // Embed mask token for positions 1..block_size-1.
-        std::vector<float> mask_embd(n_embd);
-        if (llama_model_token_embd_lookup(target_model, d->mask_token_id,
-                                          mask_embd.data(), n_embd) != 0) {
-            LOG_ERR("%s: token_embd_lookup failed for mask_token=%d\n",
-                            __func__, (int)d->mask_token_id);
-            return {};
-        }
-        for (int64_t i = 1; i < block_size; ++i) {
-            memcpy(d->noise_embd_buf.data() + i * n_embd, mask_embd.data(),
-                   (size_t)n_embd * sizeof(float));
-        }
-    }
-
-    // ── Step 2: slice and pack target_feat from the cumulative ring buffer ────
-    // The ring holds columns 0..target_feat_n_committed-1 in order.
-    // We use the most recent ctx_len columns.
-    const int64_t n_committed = d->target_feat_n_committed;
-    if (n_committed == 0) {
-        LOG_ERR("%s: target_feat ring is empty; call llama_speculative_tree_driver_ingest_prompt_capture first\n",
-                        __func__);
+    llama_speculative_draft_decode_info draft_info;
+    llama_speculative_draft_target_feat_view target_feat_view {
+        d->target_feat_ring.data(),
+        d->target_feat_n_committed,
+        d->target_feat_cap,
+        d->target_feat_n_embd_fc,
+    };
+    if (!d->draft_backend->decode_topk(
+            root_token, committed_pos, target_feat_view,
+            d->top_log_probs, d->top_token_ids, draft_info)) {
         return {};
     }
-    const int64_t ctx_len = std::min(n_committed, d->target_feat_cap);
-    const int64_t ring_start = n_committed - ctx_len; // first ring column to include
+    d->stats.t_target_feat_pack_ms += draft_info.t_target_feat_pack_ms;
+    d->stats.t_draft_decode_ms     += draft_info.t_draft_decode_ms;
+    d->stats.t_topk_ms             += draft_info.t_topk_ms;
 
-    // Copy the selected columns from the ring into a contiguous [5*n_embd, ctx_len] buffer
-    // where the output is column-major: out[t * 5*n_embd + l*n_embd .. +n_embd] = layer l at pos t.
-    {
-        const auto t0 = ddtree_clock::now();
-        d->target_feat_buf.resize((size_t)5 * n_embd * ctx_len);
-        for (int64_t t = 0; t < ctx_len; ++t) {
-            const int64_t ring_col = (ring_start + t) % d->target_feat_cap;
-            const float * ring_src = d->target_feat_ring.data() + ring_col * d->target_feat_n_embd_fc;
-            float * dst = d->target_feat_buf.data() + t * 5 * n_embd;
-            memcpy(dst, ring_src, (size_t)5 * n_embd * sizeof(float));
+    const int L = draft_info.L;
+    const int K = draft_info.K;
+    const int64_t ctx_len = draft_info.ctx_len;
+
+    if (std::getenv("LLAMA_DDTREE_DUMP_DRAFT_TOP") != nullptr && d->stats.n_steps == 0) {
+        LOG_INF("draft_top port: step=%lld committed=%d ctx_len=%lld root=%d K=%d backend=%s\n",
+                (long long)d->stats.n_steps,
+                (int)committed_pos,
+                (long long)ctx_len,
+                (int)root_token,
+                K,
+                d->draft_backend->name());
+        LOG_INF("draft_top port: top1:");
+        for (int i = 0; i < L; ++i) {
+            LOG_INF(" %d", (int)d->top_token_ids[(size_t)i * K]);
         }
-        llama_set_target_feat_raw(d->draft_ctx, d->target_feat_buf.data(),
-                                  5 * n_embd, ctx_len, committed_pos);
-        d->stats.t_target_feat_pack_ms += elapsed_ms(t0);
-    }
-
-    // ── Step 3: draft forward ─────────────────────────────────────────────────
-    // Inject target_feat into draft context and run llama_decode with noise embeddings.
-    {
-        const auto t0 = ddtree_clock::now();
-        llama_batch draft_batch = llama_batch_init((int32_t)block_size, (int32_t)n_embd, 1);
-        draft_batch.n_tokens = (int32_t)block_size;
-        memcpy(draft_batch.embd, d->noise_embd_buf.data(),
-               (size_t)block_size * n_embd * sizeof(float));
-        for (int32_t i = 0; i < (int32_t)block_size; ++i) {
-            draft_batch.pos[i]      = (llama_pos)(committed_pos + i);
-            draft_batch.n_seq_id[i] = 1;
-            draft_batch.seq_id[i][0] = 0;
-            draft_batch.logits[i]   = 1; // output logits for all positions
-        }
-        int ret = llama_decode(d->draft_ctx, draft_batch);
-        llama_batch_free(draft_batch);
-        if (ret != 0) {
-            LOG_ERR("%s: draft llama_decode failed: %d\n", __func__, ret);
-            return {};
-        }
-        d->stats.t_draft_decode_ms += elapsed_ms(t0);
-    }
-
-    // Read draft logits: [block_size, n_vocab].
-    // Skip position 0 (root slot fixed to root_token) and use positions 1..block_size-1.
-    const int L = (int)block_size - 1; // draft positions with meaningful predictions
-    const int K = (d->params.top_k > 0) ? d->params.top_k : ((d->params.budget > L) ? 8 : 1);
-
-    d->top_log_probs.resize((size_t)L * K);
-    d->top_token_ids.resize((size_t)L * K);
-
-    // ── Step 4: extract top-K log-probs ───────────────────────────────────────
-    // Draft logits pointer: llama_get_logits_ith(0) is row 0, etc.
-    // We skip row 0 (root slot) and use rows 1..L.
-    {
-        const auto t0 = ddtree_clock::now();
-        const float * draft_logits_row1 = llama_get_logits_ith(d->draft_ctx, 1);
-        if (!draft_logits_row1) {
-            LOG_ERR("%s: draft logits unavailable\n", __func__);
-            return {};
-        }
-        if (K == 1) {
-            // Fast path: argmax per position.
-            for (int i = 0; i < L; ++i) {
-                const float * row = draft_logits_row1 + (size_t)i * n_vocab;
-                int32_t best = 0;
-                float best_val = row[0];
-                for (int64_t v = 1; v < n_vocab; ++v) {
-                    if (row[v] > best_val) { best_val = row[v]; best = (int32_t)v; }
+        LOG_INF("\n");
+        if (K > 1) {
+            const int rows = std::min(4, L);
+            for (int r = 0; r < rows; ++r) {
+                LOG_INF("draft_top port: row%d:", r + 1);
+                for (int k = 0; k < K; ++k) {
+                    LOG_INF(" %d", (int)d->top_token_ids[(size_t)r * K + k]);
                 }
-                d->top_log_probs[i] = 0.0f; // log-prob irrelevant for pure-chain budget
-                d->top_token_ids[i] = best;
-            }
-        } else {
-            float proposal_temp = d->params.temp;
-            if (const char * e = std::getenv("LLAMA_DDTREE_PROPOSAL_TEMP")) {
-                char * end = nullptr;
-                const float v = std::strtof(e, &end);
-                if (end != e && v > 0.0f) {
-                    proposal_temp = v;
-                }
-            }
-            extract_top_k_logprobs(draft_logits_row1, L, (int)n_vocab, K,
-                                   proposal_temp, d->top_log_probs.data(),
-                                   d->top_token_ids.data());
-        }
-        if (std::getenv("LLAMA_DDTREE_DUMP_DRAFT_TOP") != nullptr && d->stats.n_steps == 0) {
-            LOG_INF("draft_top port: step=%lld committed=%d ctx_len=%lld root=%d K=%d\n",
-                    (long long)d->stats.n_steps,
-                    (int)committed_pos,
-                    (long long)ctx_len,
-                    (int)root_token,
-                    K);
-            LOG_INF("draft_top port: top1:");
-            for (int i = 0; i < L; ++i) {
-                LOG_INF(" %d", (int)d->top_token_ids[(size_t)i * K]);
-            }
-            LOG_INF("\n");
-            if (K > 1) {
-                const int rows = std::min(4, L);
-                for (int r = 0; r < rows; ++r) {
-                    LOG_INF("draft_top port: row%d:", r + 1);
-                    for (int k = 0; k < K; ++k) {
-                        LOG_INF(" %d", (int)d->top_token_ids[(size_t)r * K + k]);
-                    }
-                    LOG_INF("\n");
-                }
+                LOG_INF("\n");
             }
         }
-        d->stats.t_topk_ms += elapsed_ms(t0);
     }
 
     // ── Step 5: build DDTree ──────────────────────────────────────────────────

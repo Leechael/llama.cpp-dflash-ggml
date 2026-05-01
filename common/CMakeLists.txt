@@ -90,6 +90,8 @@ add_library(${TARGET} STATIC
     sampling.h
     speculative.cpp
     speculative.h
+    speculative-draft-backend.cpp
+    speculative-draft-backend.h
     speculative-tree.cpp
     speculative-tree.h
     speculative-tree-driver.cpp

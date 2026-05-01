@@ -17,6 +17,8 @@
 #include "llama-impl.h"   // LLAMA_TENSOR_NAME_FATTN
 #include "llama-graph.h"  // llm_graph_input_target_feat, build_inp_target_feat
 
+#include <algorithm>
+
 llm_build_dflash_draft::llm_build_dflash_draft(
         const llama_model  & model,
         const llm_graph_params & params) : llm_graph_context(params) {
@@ -25,24 +27,13 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_v());
 
     // draft constants derived from hparams
-    const int64_t block_size = (int64_t)hparams.dflash_block_size;  // 16 noise tokens
-    const int64_t n_embd_fc  = (int64_t)5 * n_embd;                 // 5*hidden for fc input
+    const int64_t n_embd_fc = (int64_t)5 * n_embd; // 5*hidden for fc input
 
     // rope_theta = 10M for draft (matches DFLASH27B_ROPE_THETA)
     const float draft_rope_theta = 10000000.0f;
     const float scale = 1.0f / sqrtf((float)n_embd_head);
 
-    // ── Draft-specific inputs ─────────────────────────────────────────────────
-    // noise_embed: pre-computed embedding rows [n_embd, block_size] — host fills this
-    // through ubatch.embd. It must be registered as a graph input; merely calling
-    // ggml_set_input() is not enough for llama_decode() to populate it.
-    auto inp_noise = std::make_unique<llm_graph_input_embd>(n_embd);
-    inp_noise->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-    ggml_set_name(inp_noise->embd, "dflash_noise_embed");
-    ggml_set_input(inp_noise->embd);
-    ggml_tensor * noise_embed = inp_noise->embd;
-    res->add_input(std::move(inp_noise));
-
+    // ── Draft-specific target-feature input ───────────────────────────────────
     // target_feat_raw / pos_q / pos_k: registered as graph inputs via build_inp_target_feat.
     // The host stashes data with llama_set_target_feat_raw() before llama_decode(); the
     // graph input class copies it into these GGML tensors at set_input() time.
@@ -53,23 +44,93 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     const int64_t ctx_len = (pending_target_feat_ctx_len_ptr && *pending_target_feat_ctx_len_ptr > 0)
                             ? *pending_target_feat_ctx_len_ptr
                             : n_ctx;
-    llm_graph_input_target_feat * inp_tf = build_inp_target_feat(n_embd_fc, ctx_len);
+    ggml_tensor * cached_target_feat = (pending_target_feat_tensor_ptr != nullptr)
+                                      ? *pending_target_feat_tensor_ptr
+                                      : nullptr;
+    const bool use_cached_target_feat = cached_target_feat != nullptr;
+    const int64_t target_feat_width = dflash_target_feat_fused ? n_embd : n_embd_fc;
+    llm_graph_input_target_feat * inp_tf = build_inp_target_feat(target_feat_width, ctx_len);
 
-    ggml_tensor * target_feat_raw = inp_tf->inp_target_feat_raw;
-    ggml_tensor * pos_q           = inp_tf->inp_pos_q;
-    ggml_tensor * pos_k           = inp_tf->inp_pos_k;
+    ggml_tensor * target_feat_in = use_cached_target_feat ? cached_target_feat : inp_tf->inp_target_feat_raw;
+    ggml_tensor * pos_q          = inp_tf->inp_pos_q;
+    ggml_tensor * pos_k          = inp_tf->inp_pos_k;
 
     // ── Step 1: feature fusion ────────────────────────────────────────────────
     // target_feat = rms_norm(fc @ target_feat_raw, hidden_norm)
-    // fc:              [n_embd_fc, n_embd]   (ggml: ne[0]=n_embd_fc, ne[1]=n_embd)
-    // target_feat_raw: [n_embd_fc, ctx_len]
-    // Result:          [n_embd, ctx_len]
-    ggml_tensor * target_feat = ggml_mul_mat(ctx0, model.dflash_fc, target_feat_raw);
-    cb(target_feat, "dflash_fc_out", -1);
+    // The dedicated draft runtime can pass a cached fused target_feat directly.
+    ggml_tensor * target_feat = target_feat_in;
+    if (!dflash_target_feat_fused) {
+        if (use_cached_target_feat && target_feat_in->ne[0] == n_embd && target_feat_in->ne[1] == 5*ctx_len) {
+            ggml_tensor * packed = nullptr;
+            for (int l = 0; l < 5; ++l) {
+                ggml_tensor * layer = ggml_view_2d(ctx0, target_feat_in, n_embd, ctx_len,
+                                                   (size_t)n_embd * ggml_element_size(target_feat_in),
+                                                   (size_t)l * ctx_len * n_embd * ggml_element_size(target_feat_in));
+                packed = packed == nullptr ? layer : ggml_concat(ctx0, packed, layer, 0);
+            }
+            target_feat_in = packed;
+        }
+        // fc:              [n_embd_fc, n_embd]   (ggml: ne[0]=n_embd_fc, ne[1]=n_embd)
+        // target_feat_raw: [n_embd_fc, ctx_len]
+        // Result:          [n_embd, ctx_len]
+        target_feat = ggml_mul_mat(ctx0, model.dflash_fc, target_feat_in);
+        cb(target_feat, "dflash_fc_out", -1);
 
-    target_feat = ggml_rms_norm(ctx0, target_feat, hparams.f_norm_rms_eps);
-    target_feat = ggml_mul(ctx0, target_feat, model.dflash_hidden_norm);
+        target_feat = ggml_rms_norm(ctx0, target_feat, hparams.f_norm_rms_eps);
+        target_feat = ggml_mul(ctx0, target_feat, model.dflash_hidden_norm);
+    }
+    GGML_ASSERT(target_feat->ne[0] == n_embd);
+    GGML_ASSERT(target_feat->ne[1] == ctx_len);
     cb(target_feat, "dflash_target_feat", -1);
+
+    if (dflash_fuse_only && !dflash_kv_update_only) {
+        res->t_embd = target_feat;
+        ggml_build_forward_expand(gf, target_feat);
+        return;
+    }
+
+    if (dflash_kv_update_only) {
+        GGML_ASSERT(dflash_kv_cache_k_l != nullptr);
+        GGML_ASSERT(dflash_kv_cache_v_l != nullptr);
+        GGML_ASSERT((int64_t) dflash_kv_cache_k_l->size() >= n_layer);
+        GGML_ASSERT((int64_t) dflash_kv_cache_v_l->size() >= n_layer);
+
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & layer = model.layers[il];
+
+            ggml_tensor * K = ggml_mul_mat(ctx0, layer.wk, target_feat);
+            K = ggml_reshape_3d(ctx0, K, n_embd_head, n_head_kv, ctx_len);
+            K = ggml_rms_norm(ctx0, K, hparams.f_norm_rms_eps);
+            K = ggml_mul(ctx0, K, layer.attn_k_norm);
+            cb(K, "dflash_k_cache_update", il);
+
+            ggml_tensor * V = ggml_mul_mat(ctx0, layer.wv, target_feat);
+            V = ggml_reshape_3d(ctx0, V, n_embd_head, n_head_kv, ctx_len);
+            cb(V, "dflash_v_cache_update", il);
+
+            ggml_tensor * Kdst = (*dflash_kv_cache_k_l)[il];
+            ggml_tensor * Vdst = (*dflash_kv_cache_v_l)[il];
+            GGML_ASSERT(Kdst != nullptr && Vdst != nullptr);
+            const int64_t n_el = n_embd_head * n_head_kv * ctx_len;
+            const size_t dst_off = (size_t) dflash_kv_cache_dst_pos * n_embd_head * n_head_kv * sizeof(float);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_view_1d(ctx0, K, n_el, 0),
+                                                    ggml_view_1d(ctx0, Kdst, n_el, dst_off)));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_view_1d(ctx0, V, n_el, 0),
+                                                    ggml_view_1d(ctx0, Vdst, n_el, dst_off)));
+        }
+        res->t_embd = target_feat;
+        return;
+    }
+
+    // noise_embed: pre-computed embedding rows [n_embd, block_size] — host fills this
+    // through ubatch.embd. It must be registered as a graph input; merely calling
+    // ggml_set_input() is not enough for llama_decode() to populate it.
+    auto inp_noise = std::make_unique<llm_graph_input_embd>(n_embd);
+    inp_noise->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_name(inp_noise->embd, "dflash_noise_embed");
+    ggml_set_input(inp_noise->embd);
+    ggml_tensor * noise_embed = inp_noise->embd;
+    res->add_input(std::move(inp_noise));
 
     // ── Step 2: position tensors ──────────────────────────────────────────────
     // Q positions: [ctx_len .. ctx_len + block_size) in draft-window-local
@@ -111,25 +172,51 @@ llm_build_dflash_draft::llm_build_dflash_draft(
         cb(Q, "Q_rope", il);
 
         // -- K and V from concat(target_feat, noise)
-        // First compute K/V from target_feat (ctx_len tokens)
-        ggml_tensor * Kctx = ggml_mul_mat(ctx0, layer.wk, target_feat); // [n_head_kv*n_embd_head, ctx_len]
-        ggml_tensor * Vctx = ggml_mul_mat(ctx0, layer.wv, target_feat);
+        ggml_tensor * K = nullptr;
+        ggml_tensor * V = nullptr;
+        const bool use_cached_kv = dflash_kv_cache_k_l != nullptr && dflash_kv_cache_v_l != nullptr &&
+                                   (int64_t) dflash_kv_cache_k_l->size() > il &&
+                                   (int64_t) dflash_kv_cache_v_l->size() > il &&
+                                   (*dflash_kv_cache_k_l)[il] != nullptr &&
+                                   (*dflash_kv_cache_v_l)[il] != nullptr;
+        if (use_cached_kv) {
+            ggml_tensor * Kctx = (*dflash_kv_cache_k_l)[il];
+            ggml_tensor * Vctx = (*dflash_kv_cache_v_l)[il];
+            GGML_ASSERT(Kctx->ne[0] == n_embd_head && Kctx->ne[1] == n_head_kv && Kctx->ne[2] == ctx_len);
+            GGML_ASSERT(Vctx->ne[0] == n_embd_head && Vctx->ne[1] == n_head_kv && Vctx->ne[2] == ctx_len);
 
-        // Then from noise (block_size tokens)
-        ggml_tensor * Kn = ggml_mul_mat(ctx0, layer.wk, hn);            // [n_head_kv*n_embd_head, block_size]
-        ggml_tensor * Vn = ggml_mul_mat(ctx0, layer.wv, hn);
+            ggml_tensor * Kn = ggml_mul_mat(ctx0, layer.wk, hn);
+            Kn = ggml_reshape_3d(ctx0, Kn, n_embd_head, n_head_kv, n_tokens);
+            Kn = ggml_rms_norm(ctx0, Kn, hparams.f_norm_rms_eps);
+            Kn = ggml_mul(ctx0, Kn, layer.attn_k_norm);
 
-        // Concat along sequence dimension (ne[1])
-        ggml_tensor * K = ggml_concat(ctx0, Kctx, Kn, 1);  // [n_head_kv*n_embd_head, total_k]
-        ggml_tensor * V = ggml_concat(ctx0, Vctx, Vn, 1);
+            ggml_tensor * Vn = ggml_mul_mat(ctx0, layer.wv, hn);
+            Vn = ggml_reshape_3d(ctx0, Vn, n_embd_head, n_head_kv, n_tokens);
 
-        // Per-head K norm
-        K = ggml_reshape_3d(ctx0, K, n_embd_head, n_head_kv, total_k);
-        K = ggml_rms_norm(ctx0, K, hparams.f_norm_rms_eps);
-        K = ggml_mul(ctx0, K, layer.attn_k_norm);
-        cb(K, "K_normed", il);
+            K = ggml_concat(ctx0, Kctx, Kn, 2);
+            V = ggml_concat(ctx0, Vctx, Vn, 2);
+            cb(K, "K_normed", il);
+        } else {
+            // First compute K/V from target_feat (ctx_len tokens)
+            ggml_tensor * Kctx = ggml_mul_mat(ctx0, layer.wk, target_feat); // [n_head_kv*n_embd_head, ctx_len]
+            ggml_tensor * Vctx = ggml_mul_mat(ctx0, layer.wv, target_feat);
 
-        V = ggml_reshape_3d(ctx0, V, n_embd_head, n_head_kv, total_k);
+            // Then from noise (block_size tokens)
+            ggml_tensor * Kn = ggml_mul_mat(ctx0, layer.wk, hn);            // [n_head_kv*n_embd_head, block_size]
+            ggml_tensor * Vn = ggml_mul_mat(ctx0, layer.wv, hn);
+
+            // Concat along sequence dimension (ne[1])
+            K = ggml_concat(ctx0, Kctx, Kn, 1);  // [n_head_kv*n_embd_head, total_k]
+            V = ggml_concat(ctx0, Vctx, Vn, 1);
+
+            // Per-head K norm
+            K = ggml_reshape_3d(ctx0, K, n_embd_head, n_head_kv, total_k);
+            K = ggml_rms_norm(ctx0, K, hparams.f_norm_rms_eps);
+            K = ggml_mul(ctx0, K, layer.attn_k_norm);
+            cb(K, "K_normed", il);
+
+            V = ggml_reshape_3d(ctx0, V, n_embd_head, n_head_kv, total_k);
+        }
 
         // K RoPE-NEOX
         K = ggml_rope_ext(ctx0, K, pos_k, nullptr,
@@ -196,8 +283,26 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     if (model.output != nullptr) {
         ggml_tensor * logits = ggml_mul_mat(ctx0, model.output, out);
         cb(logits, "result_output", -1);
-        res->t_logits = logits;
-        ggml_build_forward_expand(gf, logits);
+
+        if (dflash_draft_top_k > 0) {
+            const int top_k = std::min<int64_t>(dflash_draft_top_k, logits->ne[0]);
+
+            ggml_tensor * top_ids = ggml_top_k(ctx0, logits, top_k);
+            cb(top_ids, "dflash_top_ids", -1);
+
+            ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], n_tokens);
+            ggml_tensor * top_logits  = ggml_get_rows(ctx0, logits_rows, top_ids);
+            top_logits = ggml_reshape_2d(ctx0, top_logits, top_k, n_tokens);
+            cb(top_logits, "dflash_top_logits", -1);
+
+            res->t_dflash_top_ids    = top_ids;
+            res->t_dflash_top_logits = top_logits;
+            ggml_build_forward_expand(gf, top_ids);
+            ggml_build_forward_expand(gf, top_logits);
+        } else {
+            res->t_logits = logits;
+            ggml_build_forward_expand(gf, logits);
+        }
     } else {
         ggml_build_forward_expand(gf, out);
     }
