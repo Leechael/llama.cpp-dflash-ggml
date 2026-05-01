@@ -541,6 +541,7 @@ public:
     virtual ~llm_graph_input_target_feat() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 
     // [5*n_embd, ctx_len] F32 — stacked hidden captures from target layers
     ggml_tensor * inp_target_feat_raw = nullptr;
@@ -623,6 +624,15 @@ struct llm_graph_params {
     const int64_t * pending_target_feat_n_embd_fc_ptr = nullptr;
     const int64_t * pending_target_feat_ctx_len_ptr   = nullptr;
     const int64_t * pending_draft_committed_pos_ptr   = nullptr;
+    ggml_tensor * const * pending_target_feat_tensor_ptr = nullptr;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_k_l = nullptr;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_v_l = nullptr;
+    int64_t dflash_kv_cache_dst_pos = 0;
+
+    bool dflash_target_feat_fused = false;
+    bool dflash_kv_update_only    = false;
+    bool dflash_fuse_only         = false;
+    int32_t dflash_draft_top_k = 0;
 
     // dflash Phase 2.4: per-layer SSM intermediate-state persist buffers.
     // Non-owning pointer into llama_context::dflash_persist_inter_l. Null when not in
@@ -700,6 +710,10 @@ struct llm_graph_params {
             loras          == other.loras          &&
             cross          == other.cross          &&
             capture_hidden == other.capture_hidden &&
+            dflash_target_feat_fused == other.dflash_target_feat_fused &&
+            dflash_kv_update_only == other.dflash_kv_update_only &&
+            dflash_fuse_only == other.dflash_fuse_only &&
+            dflash_draft_top_k == other.dflash_draft_top_k &&
             (dflash_persist_inter_l != nullptr) == (other.dflash_persist_inter_l != nullptr) &&
             (dflash_persist_conv_l  != nullptr) == (other.dflash_persist_conv_l  != nullptr);
     }
@@ -716,6 +730,8 @@ public:
     ggml_tensor * get_embd()           const { return t_embd; }
     ggml_tensor * get_embd_pooled()    const { return t_embd_pooled; }
     ggml_tensor * get_hidden_capture() const { return t_hidden_capture; }
+    ggml_tensor * get_dflash_top_logits() const { return t_dflash_top_logits; }
+    ggml_tensor * get_dflash_top_ids()    const { return t_dflash_top_ids; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -746,6 +762,10 @@ public:
     ggml_tensor * t_embd_pooled   = nullptr;
     // dflash hidden capture: [5*n_embd, n_tokens] F32, populated when capture_hidden=true in graph_params
     ggml_tensor * t_hidden_capture = nullptr;
+
+    // dflash-draft top-K graph outputs: [K, n_tokens]
+    ggml_tensor * t_dflash_top_logits = nullptr;
+    ggml_tensor * t_dflash_top_ids    = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -841,6 +861,11 @@ struct llm_graph_context {
     // Null when not in tree mode. Indexed by layer index il.
     const std::vector<ggml_tensor *> * dflash_persist_inter_l;
 
+    bool dflash_target_feat_fused;
+    bool dflash_kv_update_only;
+    bool dflash_fuse_only;
+    int32_t dflash_draft_top_k;
+
     // dflash Phase 5: per-layer conv post-state persist buffer pointers
     // (paired with dflash_persist_inter_l).
     const std::vector<ggml_tensor *> * dflash_persist_conv_l;
@@ -851,6 +876,10 @@ struct llm_graph_context {
     const int64_t * pending_target_feat_n_embd_fc_ptr;
     const int64_t * pending_target_feat_ctx_len_ptr;
     const int64_t * pending_draft_committed_pos_ptr;
+    ggml_tensor * const * pending_target_feat_tensor_ptr;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_k_l;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_v_l;
+    int64_t dflash_kv_cache_dst_pos;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
