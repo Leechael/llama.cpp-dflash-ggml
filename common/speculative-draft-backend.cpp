@@ -80,7 +80,9 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
         for (int64_t i = 1; i < block_size; ++i) {
             memcpy(noise_embd.data() + i * n_embd, mask_embd.data(), (size_t) n_embd * sizeof(float));
         }
-        llama_set_dflash_draft_top_k(draft_ctx, llama_speculative_draft_top_k_width((int) block_size, params));
+        llama_set_dflash_draft_top_k(draft_ctx,
+                                     std::min<int64_t>(llama_speculative_draft_top_k_width((int) block_size, params),
+                                                       n_vocab));
         return true;
     }
 
@@ -117,7 +119,7 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
                      llama_speculative_draft_decode_info &            info) override {
         info   = {};
         info.L = (int) block_size - 1;
-        info.K = llama_speculative_draft_top_k_width((int) block_size, params);
+        info.K = std::min<int64_t>(llama_speculative_draft_top_k_width((int) block_size, params), n_vocab);
 
         if (target_feat.ring == nullptr || target_feat.n_committed <= 0 || target_feat.cap <= 0 ||
             target_feat.n_embd_fc <= 0 || target_feat.n_embd_fc % 5 != 0) {

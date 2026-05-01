@@ -285,7 +285,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
         cb(logits, "result_output", -1);
 
         if (dflash_draft_top_k > 0) {
-            const int top_k = dflash_draft_top_k;
+            const int top_k = std::min<int64_t>(dflash_draft_top_k, logits->ne[0]);
 
             ggml_tensor * top_ids = ggml_top_k(ctx0, logits, top_k);
             cb(top_ids, "dflash_top_ids", -1);

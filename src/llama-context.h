@@ -483,6 +483,7 @@ private:
     mutable std::vector<float> hidden_capture_host;
     mutable int64_t            hidden_capture_ne0 = 0;
     mutable int64_t            hidden_capture_ne1 = 0;
+    mutable bool               hidden_capture_host_valid = false;
 
     // dflash draft target_feat injection: stashed by llama_set_target_feat_raw() before
     // llama_decode() on the draft context. The dflash-draft graph input reads from these

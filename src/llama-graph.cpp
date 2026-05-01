@@ -816,6 +816,8 @@ void llm_graph_result::reset() {
     t_embd          = nullptr;
     t_embd_pooled   = nullptr;
     t_hidden_capture = nullptr;
+    t_dflash_top_logits = nullptr;
+    t_dflash_top_ids = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
