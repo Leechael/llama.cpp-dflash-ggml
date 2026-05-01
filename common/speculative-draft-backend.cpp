@@ -86,6 +86,29 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
 
     const char * name() const override { return "dflash-topk"; }
 
+    bool ingest_target_capture(llama_context * target_ctx,
+                               const int32_t * dfs_indices,
+                               int32_t         n_dfs,
+                               int64_t         first_pos,
+                               int64_t         cap,
+                               double &        elapsed_ms) override {
+        const auto t0 = ddtree_draft_clock::now();
+        elapsed_ms = 0.0;
+        if (target_ctx == nullptr || n_dfs <= 0 || cap <= 0) {
+            return false;
+        }
+        const int ret = llama_dflash_draft_update_fused_cache_from_capture(draft_ctx, target_ctx, dfs_indices,
+                                                                           n_dfs, first_pos, cap);
+        elapsed_ms = draft_elapsed_ms(t0);
+        if (ret != 0) {
+            return false;
+        }
+        fused_target_feat_cap = cap;
+        fused_target_feat_n_embd = n_embd;
+        fused_target_feat_n_committed = first_pos + n_dfs;
+        return true;
+    }
+
     bool decode_topk(llama_token                                      root_token,
                      llama_pos                                        committed_pos,
                      const llama_speculative_draft_target_feat_view & target_feat,
@@ -114,21 +137,8 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
             info.t_draft_decode_ms += draft_elapsed_ms(t0);
         }
 
-        {
-            const auto t0 = ddtree_draft_clock::now();
-            llama_speculative_draft_target_feat_view fused_view {
-                fused_target_feat_ring.data(),
-                target_feat.n_committed,
-                target_feat.cap,
-                fused_n_embd,
-            };
-            if (!llama_speculative_draft_pack_target_feat(fused_view, target_feat_buf, info.ctx_len)) {
-                LOG_ERR("%s: fused target_feat ring is empty\n", __func__);
-                info.t_target_feat_pack_ms += draft_elapsed_ms(t0);
-                return false;
-            }
-            info.t_target_feat_pack_ms += draft_elapsed_ms(t0);
-        }
+        info.ctx_len = std::min(target_feat.n_committed, target_feat.cap);
+        const int64_t ring_start = target_feat.n_committed - info.ctx_len;
 
         {
             const auto t0 = ddtree_draft_clock::now();
@@ -152,9 +162,10 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
             draft_batch.logits    = logits.data();
             draft_batch.parent_id = nullptr;
 
-            const int ret = llama_dflash_draft_encode_top_k_fused(draft_ctx, draft_batch,
-                                                                  target_feat_buf.data(), fused_n_embd,
-                                                                  info.ctx_len, committed_pos, info.K);
+            const int ret = llama_dflash_draft_encode_top_k_cached(draft_ctx, draft_batch,
+                                                                   fused_n_embd, info.ctx_len,
+                                                                   ring_start, target_feat.cap,
+                                                                   committed_pos, info.K);
             if (ret != 0) {
                 LOG_ERR("%s: dflash draft encode-topK failed: %d\n", __func__, ret);
                 info.t_draft_decode_ms += draft_elapsed_ms(t0);
@@ -238,12 +249,10 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
         const int64_t ctx_len = std::min(target_feat.n_committed, target_feat.cap);
         const int64_t ring_start = target_feat.n_committed - ctx_len;
 
-        if (fused_target_feat_cap != target_feat.cap || fused_target_feat_n_embd != fused_n_embd ||
-            fused_target_feat_ring.size() != (size_t) target_feat.cap * fused_n_embd) {
+        if (fused_target_feat_cap != target_feat.cap || fused_target_feat_n_embd != fused_n_embd) {
             fused_target_feat_cap = target_feat.cap;
             fused_target_feat_n_embd = fused_n_embd;
             fused_target_feat_n_committed = ring_start;
-            fused_target_feat_ring.assign((size_t) target_feat.cap * fused_n_embd, 0.0f);
         }
 
         if (fused_target_feat_n_committed < ring_start || fused_target_feat_n_committed > target_feat.n_committed) {
@@ -264,21 +273,14 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
             memcpy(dst, src, (size_t) target_feat.n_embd_fc * sizeof(float));
         }
 
-        fused_fuse_buf.resize((size_t) fused_n_embd * missing);
-        const int ret = llama_dflash_draft_fuse_target_feat(draft_ctx, raw_fuse_buf.data(), target_feat.n_embd_fc,
-                                                            missing, fused_fuse_buf.data());
+        const int ret = llama_dflash_draft_update_fused_cache(draft_ctx, raw_fuse_buf.data(), target_feat.n_embd_fc,
+                                                              missing, fused_target_feat_n_committed,
+                                                              target_feat.cap);
         if (ret != 0) {
-            LOG_ERR("%s: dflash target_feat fuse failed: %d\n", __func__, ret);
+            LOG_ERR("%s: dflash target_feat cache update failed: %d\n", __func__, ret);
             return false;
         }
 
-        for (int64_t t = 0; t < missing; ++t) {
-            const int64_t logical_col = fused_target_feat_n_committed + t;
-            const int64_t ring_col = logical_col % fused_target_feat_cap;
-            const float * src = fused_fuse_buf.data() + t * fused_n_embd;
-            float * dst = fused_target_feat_ring.data() + ring_col * fused_n_embd;
-            memcpy(dst, src, (size_t) fused_n_embd * sizeof(float));
-        }
         fused_target_feat_n_committed = target_feat.n_committed;
         return true;
     }
@@ -293,8 +295,6 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
 
     std::vector<float>          target_feat_buf;
     std::vector<float>          raw_fuse_buf;
-    std::vector<float>          fused_fuse_buf;
-    std::vector<float>          fused_target_feat_ring;
     int64_t                     fused_target_feat_n_committed = 0;
     int64_t                     fused_target_feat_n_embd = 0;
     int64_t                     fused_target_feat_cap = 0;

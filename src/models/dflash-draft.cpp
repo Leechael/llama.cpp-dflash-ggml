@@ -44,10 +44,14 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     const int64_t ctx_len = (pending_target_feat_ctx_len_ptr && *pending_target_feat_ctx_len_ptr > 0)
                             ? *pending_target_feat_ctx_len_ptr
                             : n_ctx;
+    ggml_tensor * cached_target_feat = (pending_target_feat_tensor_ptr != nullptr)
+                                      ? *pending_target_feat_tensor_ptr
+                                      : nullptr;
+    const bool use_cached_target_feat = cached_target_feat != nullptr;
     const int64_t target_feat_width = dflash_target_feat_fused ? n_embd : n_embd_fc;
     llm_graph_input_target_feat * inp_tf = build_inp_target_feat(target_feat_width, ctx_len);
 
-    ggml_tensor * target_feat_in = inp_tf->inp_target_feat_raw;
+    ggml_tensor * target_feat_in = use_cached_target_feat ? cached_target_feat : inp_tf->inp_target_feat_raw;
     ggml_tensor * pos_q          = inp_tf->inp_pos_q;
     ggml_tensor * pos_k          = inp_tf->inp_pos_k;
 
@@ -56,6 +60,16 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     // The dedicated draft runtime can pass a cached fused target_feat directly.
     ggml_tensor * target_feat = target_feat_in;
     if (!dflash_target_feat_fused) {
+        if (use_cached_target_feat && target_feat_in->ne[0] == n_embd && target_feat_in->ne[1] == 5*ctx_len) {
+            ggml_tensor * packed = nullptr;
+            for (int l = 0; l < 5; ++l) {
+                ggml_tensor * layer = ggml_view_2d(ctx0, target_feat_in, n_embd, ctx_len,
+                                                   (size_t)n_embd * ggml_element_size(target_feat_in),
+                                                   (size_t)l * ctx_len * n_embd * ggml_element_size(target_feat_in));
+                packed = packed == nullptr ? layer : ggml_concat(ctx0, packed, layer, 0);
+            }
+            target_feat_in = packed;
+        }
         // fc:              [n_embd_fc, n_embd]   (ggml: ne[0]=n_embd_fc, ne[1]=n_embd)
         // target_feat_raw: [n_embd_fc, ctx_len]
         // Result:          [n_embd, ctx_len]
@@ -65,11 +79,46 @@ llm_build_dflash_draft::llm_build_dflash_draft(
         target_feat = ggml_rms_norm(ctx0, target_feat, hparams.f_norm_rms_eps);
         target_feat = ggml_mul(ctx0, target_feat, model.dflash_hidden_norm);
     }
+    GGML_ASSERT(target_feat->ne[0] == n_embd);
+    GGML_ASSERT(target_feat->ne[1] == ctx_len);
     cb(target_feat, "dflash_target_feat", -1);
 
-    if (dflash_fuse_only) {
+    if (dflash_fuse_only && !dflash_kv_update_only) {
         res->t_embd = target_feat;
         ggml_build_forward_expand(gf, target_feat);
+        return;
+    }
+
+    if (dflash_kv_update_only) {
+        GGML_ASSERT(dflash_kv_cache_k_l != nullptr);
+        GGML_ASSERT(dflash_kv_cache_v_l != nullptr);
+        GGML_ASSERT((int64_t) dflash_kv_cache_k_l->size() >= n_layer);
+        GGML_ASSERT((int64_t) dflash_kv_cache_v_l->size() >= n_layer);
+
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & layer = model.layers[il];
+
+            ggml_tensor * K = ggml_mul_mat(ctx0, layer.wk, target_feat);
+            K = ggml_reshape_3d(ctx0, K, n_embd_head, n_head_kv, ctx_len);
+            K = ggml_rms_norm(ctx0, K, hparams.f_norm_rms_eps);
+            K = ggml_mul(ctx0, K, layer.attn_k_norm);
+            cb(K, "dflash_k_cache_update", il);
+
+            ggml_tensor * V = ggml_mul_mat(ctx0, layer.wv, target_feat);
+            V = ggml_reshape_3d(ctx0, V, n_embd_head, n_head_kv, ctx_len);
+            cb(V, "dflash_v_cache_update", il);
+
+            ggml_tensor * Kdst = (*dflash_kv_cache_k_l)[il];
+            ggml_tensor * Vdst = (*dflash_kv_cache_v_l)[il];
+            GGML_ASSERT(Kdst != nullptr && Vdst != nullptr);
+            const int64_t n_el = n_embd_head * n_head_kv * ctx_len;
+            const size_t dst_off = (size_t) dflash_kv_cache_dst_pos * n_embd_head * n_head_kv * sizeof(float);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_view_1d(ctx0, K, n_el, 0),
+                                                    ggml_view_1d(ctx0, Kdst, n_el, dst_off)));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_view_1d(ctx0, V, n_el, 0),
+                                                    ggml_view_1d(ctx0, Vdst, n_el, dst_off)));
+        }
+        res->t_embd = target_feat;
         return;
     }
 
@@ -123,25 +172,51 @@ llm_build_dflash_draft::llm_build_dflash_draft(
         cb(Q, "Q_rope", il);
 
         // -- K and V from concat(target_feat, noise)
-        // First compute K/V from target_feat (ctx_len tokens)
-        ggml_tensor * Kctx = ggml_mul_mat(ctx0, layer.wk, target_feat); // [n_head_kv*n_embd_head, ctx_len]
-        ggml_tensor * Vctx = ggml_mul_mat(ctx0, layer.wv, target_feat);
+        ggml_tensor * K = nullptr;
+        ggml_tensor * V = nullptr;
+        const bool use_cached_kv = dflash_kv_cache_k_l != nullptr && dflash_kv_cache_v_l != nullptr &&
+                                   (int64_t) dflash_kv_cache_k_l->size() > il &&
+                                   (int64_t) dflash_kv_cache_v_l->size() > il &&
+                                   (*dflash_kv_cache_k_l)[il] != nullptr &&
+                                   (*dflash_kv_cache_v_l)[il] != nullptr;
+        if (use_cached_kv) {
+            ggml_tensor * Kctx = (*dflash_kv_cache_k_l)[il];
+            ggml_tensor * Vctx = (*dflash_kv_cache_v_l)[il];
+            GGML_ASSERT(Kctx->ne[0] == n_embd_head && Kctx->ne[1] == n_head_kv && Kctx->ne[2] == ctx_len);
+            GGML_ASSERT(Vctx->ne[0] == n_embd_head && Vctx->ne[1] == n_head_kv && Vctx->ne[2] == ctx_len);
 
-        // Then from noise (block_size tokens)
-        ggml_tensor * Kn = ggml_mul_mat(ctx0, layer.wk, hn);            // [n_head_kv*n_embd_head, block_size]
-        ggml_tensor * Vn = ggml_mul_mat(ctx0, layer.wv, hn);
+            ggml_tensor * Kn = ggml_mul_mat(ctx0, layer.wk, hn);
+            Kn = ggml_reshape_3d(ctx0, Kn, n_embd_head, n_head_kv, n_tokens);
+            Kn = ggml_rms_norm(ctx0, Kn, hparams.f_norm_rms_eps);
+            Kn = ggml_mul(ctx0, Kn, layer.attn_k_norm);
 
-        // Concat along sequence dimension (ne[1])
-        ggml_tensor * K = ggml_concat(ctx0, Kctx, Kn, 1);  // [n_head_kv*n_embd_head, total_k]
-        ggml_tensor * V = ggml_concat(ctx0, Vctx, Vn, 1);
+            ggml_tensor * Vn = ggml_mul_mat(ctx0, layer.wv, hn);
+            Vn = ggml_reshape_3d(ctx0, Vn, n_embd_head, n_head_kv, n_tokens);
 
-        // Per-head K norm
-        K = ggml_reshape_3d(ctx0, K, n_embd_head, n_head_kv, total_k);
-        K = ggml_rms_norm(ctx0, K, hparams.f_norm_rms_eps);
-        K = ggml_mul(ctx0, K, layer.attn_k_norm);
-        cb(K, "K_normed", il);
+            K = ggml_concat(ctx0, Kctx, Kn, 2);
+            V = ggml_concat(ctx0, Vctx, Vn, 2);
+            cb(K, "K_normed", il);
+        } else {
+            // First compute K/V from target_feat (ctx_len tokens)
+            ggml_tensor * Kctx = ggml_mul_mat(ctx0, layer.wk, target_feat); // [n_head_kv*n_embd_head, ctx_len]
+            ggml_tensor * Vctx = ggml_mul_mat(ctx0, layer.wv, target_feat);
 
-        V = ggml_reshape_3d(ctx0, V, n_embd_head, n_head_kv, total_k);
+            // Then from noise (block_size tokens)
+            ggml_tensor * Kn = ggml_mul_mat(ctx0, layer.wk, hn);            // [n_head_kv*n_embd_head, block_size]
+            ggml_tensor * Vn = ggml_mul_mat(ctx0, layer.wv, hn);
+
+            // Concat along sequence dimension (ne[1])
+            K = ggml_concat(ctx0, Kctx, Kn, 1);  // [n_head_kv*n_embd_head, total_k]
+            V = ggml_concat(ctx0, Vctx, Vn, 1);
+
+            // Per-head K norm
+            K = ggml_reshape_3d(ctx0, K, n_embd_head, n_head_kv, total_k);
+            K = ggml_rms_norm(ctx0, K, hparams.f_norm_rms_eps);
+            K = ggml_mul(ctx0, K, layer.attn_k_norm);
+            cb(K, "K_normed", il);
+
+            V = ggml_reshape_3d(ctx0, V, n_embd_head, n_head_kv, total_k);
+        }
 
         // K RoPE-NEOX
         K = ggml_rope_ext(ctx0, K, pos_k, nullptr,

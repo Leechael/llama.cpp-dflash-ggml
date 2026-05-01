@@ -1042,9 +1042,8 @@ extern "C" {
     LLAMA_API void           llama_set_capture_hidden(struct llama_context * ctx, bool enable);
     LLAMA_API struct ggml_tensor * llama_get_hidden_capture(struct llama_context * ctx);
 
-    // Host-side accessor: returns a pointer into a context-owned CPU buffer that
-    // mirrors the device-side capture tensor after llama_decode(). The buffer is
-    // populated via ggml_backend_tensor_get_async during decode synchronization.
+    // Host-side accessor: returns a pointer into a context-owned CPU buffer.
+    // The device-side capture tensor is synchronized lazily only when this is called.
     // Returns NULL when capture is disabled or no decode has run yet.
     // out_ne0 / out_ne1 receive the tensor dimensions.
     LLAMA_API const float * llama_get_hidden_capture_data(struct llama_context * ctx,
@@ -1087,6 +1086,29 @@ extern "C" {
                                                         int64_t                ctx_len,
                                                         int64_t                committed_pos,
                                                         int32_t                top_k);
+
+    LLAMA_API int llama_dflash_draft_update_fused_cache(struct llama_context * ctx,
+                                                        const float          * target_feat_raw,
+                                                        int64_t                n_embd_fc,
+                                                        int64_t                n_new,
+                                                        int64_t                first_pos,
+                                                        int64_t                cap);
+
+    LLAMA_API int llama_dflash_draft_update_fused_cache_from_capture(struct llama_context * draft_ctx,
+                                                                     struct llama_context * target_ctx,
+                                                                     const int32_t        * dfs_indices,
+                                                                     int32_t                n_dfs,
+                                                                     int64_t                first_pos,
+                                                                     int64_t                cap);
+
+    LLAMA_API int llama_dflash_draft_encode_top_k_cached(struct llama_context * ctx,
+                                                         struct llama_batch     batch,
+                                                         int64_t                n_embd,
+                                                         int64_t                ctx_len,
+                                                         int64_t                ring_start,
+                                                         int64_t                cap,
+                                                         int64_t                committed_pos,
+                                                         int32_t                top_k);
 
     // dflash Phase 2.4: persist-based SSM rollback after tree verify.
     // After llama_kv_cache_seq_compact_tree(), call this to copy the SSM state

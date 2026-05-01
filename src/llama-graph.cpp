@@ -925,11 +925,7 @@ void llm_graph_input_target_feat::set_input(const llama_ubatch * ubatch) {
     const int64_t fc      = *n_embd_fc_ptr;
     const int64_t ctx_len = *ctx_len_ptr;
 
-    // Sanity: if this graph input exists, the caller must have supplied data.
-    GGML_ASSERT(data != nullptr &&
-                "dflash-draft: llama_set_target_feat_raw() must be called before llama_decode()");
-
-    if (inp_target_feat_raw && inp_target_feat_raw->buffer != nullptr) {
+    if (inp_target_feat_raw && inp_target_feat_raw->buffer != nullptr && data != nullptr) {
         GGML_ASSERT(inp_target_feat_raw->ne[0] == fc);
         GGML_ASSERT(inp_target_feat_raw->ne[1] == ctx_len);
         ggml_backend_tensor_set(inp_target_feat_raw, data, 0, (size_t)fc * ctx_len * sizeof(float));
@@ -1051,6 +1047,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     capture_hidden   (params.capture_hidden),
     dflash_persist_inter_l(params.dflash_persist_inter_l),
     dflash_target_feat_fused(params.dflash_target_feat_fused),
+    dflash_kv_update_only(params.dflash_kv_update_only),
     dflash_fuse_only(params.dflash_fuse_only),
     dflash_draft_top_k(params.dflash_draft_top_k),
     dflash_persist_conv_l (params.dflash_persist_conv_l),
@@ -1058,6 +1055,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     pending_target_feat_n_embd_fc_ptr(params.pending_target_feat_n_embd_fc_ptr),
     pending_target_feat_ctx_len_ptr  (params.pending_target_feat_ctx_len_ptr),
     pending_draft_committed_pos_ptr  (params.pending_draft_committed_pos_ptr),
+    pending_target_feat_tensor_ptr   (params.pending_target_feat_tensor_ptr),
+    dflash_kv_cache_k_l              (params.dflash_kv_cache_k_l),
+    dflash_kv_cache_v_l              (params.dflash_kv_cache_v_l),
+    dflash_kv_cache_dst_pos          (params.dflash_kv_cache_dst_pos),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
