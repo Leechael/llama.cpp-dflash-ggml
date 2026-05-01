@@ -36,6 +36,21 @@ class llama_speculative_draft_backend {
 
     virtual const char * name() const = 0;
 
+    virtual bool ingest_target_capture(llama_context * target_ctx,
+                                       const int32_t * dfs_indices,
+                                       int32_t         n_dfs,
+                                       int64_t         first_pos,
+                                       int64_t         cap,
+                                       double &        elapsed_ms) {
+        GGML_UNUSED(target_ctx);
+        GGML_UNUSED(dfs_indices);
+        GGML_UNUSED(n_dfs);
+        GGML_UNUSED(first_pos);
+        GGML_UNUSED(cap);
+        elapsed_ms = 0.0;
+        return false;
+    }
+
     virtual bool decode_topk(llama_token                                      root_token,
                              llama_pos                                        committed_pos,
                              const llama_speculative_draft_target_feat_view & target_feat,

@@ -98,6 +98,11 @@ static bool ddtree_snapshot_fallback_enabled() {
     return e == nullptr || e[0] != '0';
 }
 
+static bool ddtree_capture_direct_enabled() {
+    const char * e = std::getenv("LLAMA_DDTREE_CAPTURE_DIRECT");
+    return e != nullptr && e[0] == '1';
+}
+
 static int64_t ddtree_target_feat_cap() {
     const char * e = std::getenv("LLAMA_DDTREE_TARGET_FEAT_CTX");
     if (!e || e[0] == '\0') {
@@ -211,9 +216,10 @@ static int32_t driver_ingest_capture(llama_speculative_tree_driver * d,
                                      int32_t         n_dfs,
                                      ingest_source   source) {
     const auto t0 = ddtree_clock::now();
-    int64_t ne0 = 0, ne1 = 0;
-    const float * capture = llama_get_hidden_capture_data(d->target_ctx, &ne0, &ne1);
-    if (!capture || ne0 == 0 || ne1 == 0) {
+    ggml_tensor * t_capture = llama_get_hidden_capture(d->target_ctx);
+    int64_t ne0 = t_capture != nullptr ? t_capture->ne[0] : 0;
+    int64_t ne1 = t_capture != nullptr ? t_capture->ne[1] : 0;
+    if (t_capture == nullptr || ne0 == 0 || ne1 == 0) {
         LOG_ERR("%s: no hidden capture data available\n", __func__);
         d->stats.t_ingest_capture_ms += elapsed_ms(t0);
         return 0;
@@ -239,6 +245,39 @@ static int32_t driver_ingest_capture(llama_speculative_tree_driver * d,
         LOG_WRN("%s: requested n_dfs=%d but capture only has n_tokens=%lld; clamping (ring will be incomplete)\n",
                 __func__, n_dfs, (long long)n_tokens);
         n_to_ingest = (int32_t)n_tokens;
+    }
+
+    if (ddtree_capture_direct_enabled() && d->draft_backend) {
+        double direct_ms = 0.0;
+        if (d->draft_backend->ingest_target_capture(d->target_ctx, dfs_indices, n_to_ingest,
+                                                    d->target_feat_n_committed, d->target_feat_cap,
+                                                    direct_ms)) {
+            d->target_feat_n_committed += (int64_t)n_to_ingest;
+            switch (source) {
+                case ingest_source::prompt:
+                    d->stats.n_prompt_ingest_calls++;
+                    d->stats.n_prompt_ingested_tokens += n_to_ingest;
+                    d->stats.t_prompt_ingest_ms += direct_ms;
+                    break;
+                case ingest_source::tree:
+                    d->stats.n_tree_ingested_tokens += n_to_ingest;
+                    d->stats.t_tree_ingest_ms += direct_ms;
+                    break;
+                case ingest_source::replay:
+                    d->stats.n_replay_ingested_tokens += n_to_ingest;
+                    d->stats.t_replay_ingest_ms += direct_ms;
+                    break;
+            }
+            d->stats.t_ingest_capture_ms += direct_ms;
+            return n_to_ingest;
+        }
+    }
+
+    const float * capture = llama_get_hidden_capture_data(d->target_ctx, &ne0, &ne1);
+    if (!capture || ne0 == 0 || ne1 == 0) {
+        LOG_ERR("%s: no hidden capture data available after direct-ingest fallback\n", __func__);
+        d->stats.t_ingest_capture_ms += elapsed_ms(t0);
+        return 0;
     }
 
     for (int32_t i = 0; i < n_to_ingest; ++i) {

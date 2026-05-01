@@ -624,8 +624,13 @@ struct llm_graph_params {
     const int64_t * pending_target_feat_n_embd_fc_ptr = nullptr;
     const int64_t * pending_target_feat_ctx_len_ptr   = nullptr;
     const int64_t * pending_draft_committed_pos_ptr   = nullptr;
+    ggml_tensor * const * pending_target_feat_tensor_ptr = nullptr;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_k_l = nullptr;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_v_l = nullptr;
+    int64_t dflash_kv_cache_dst_pos = 0;
 
     bool dflash_target_feat_fused = false;
+    bool dflash_kv_update_only    = false;
     bool dflash_fuse_only         = false;
     int32_t dflash_draft_top_k = 0;
 
@@ -706,6 +711,7 @@ struct llm_graph_params {
             cross          == other.cross          &&
             capture_hidden == other.capture_hidden &&
             dflash_target_feat_fused == other.dflash_target_feat_fused &&
+            dflash_kv_update_only == other.dflash_kv_update_only &&
             dflash_fuse_only == other.dflash_fuse_only &&
             dflash_draft_top_k == other.dflash_draft_top_k &&
             (dflash_persist_inter_l != nullptr) == (other.dflash_persist_inter_l != nullptr) &&
@@ -856,6 +862,7 @@ struct llm_graph_context {
     const std::vector<ggml_tensor *> * dflash_persist_inter_l;
 
     bool dflash_target_feat_fused;
+    bool dflash_kv_update_only;
     bool dflash_fuse_only;
     int32_t dflash_draft_top_k;
 
@@ -869,6 +876,10 @@ struct llm_graph_context {
     const int64_t * pending_target_feat_n_embd_fc_ptr;
     const int64_t * pending_target_feat_ctx_len_ptr;
     const int64_t * pending_draft_committed_pos_ptr;
+    ggml_tensor * const * pending_target_feat_tensor_ptr;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_k_l;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_v_l;
+    int64_t dflash_kv_cache_dst_pos;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
