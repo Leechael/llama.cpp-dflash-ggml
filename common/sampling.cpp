@@ -540,7 +540,36 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    llama_synchronize(ctx);
+    // Optional sub-timing instrumentation (LLAMA_DDTREE_PROFILE_CB=1).
+    // Splits the cb cost into the GPU sync wait vs the host-side sampler
+    // work so we can tell whether prefetching logits would help.
+    static const bool s_profile_cb = []{
+        const char * e = std::getenv("LLAMA_DDTREE_PROFILE_CB");
+        return e && e[0] == '1';
+    }();
+    int64_t cb_sync_us = 0;
+    int64_t cb_work_start_us = 0;
+    if (s_profile_cb) {
+        const int64_t t0 = ggml_time_us();
+        llama_synchronize(ctx);
+        cb_sync_us = ggml_time_us() - t0;
+        cb_work_start_us = ggml_time_us();
+    } else {
+        llama_synchronize(ctx);
+    }
+    struct cb_timing_guard {
+        bool    active;
+        int64_t sync_us;
+        int64_t work_start_us;
+        ~cb_timing_guard() {
+            if (active) {
+                const double work_ms = (ggml_time_us() - work_start_us) * 1e-3;
+                fprintf(stderr, "cb_timing: sync=%.3f work=%.3f total=%.3f ms\n",
+                        sync_us * 1e-3, work_ms, sync_us * 1e-3 + work_ms);
+            }
+        }
+    } cb_guard{ s_profile_cb, cb_sync_us, cb_work_start_us };
+    (void) cb_guard;
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
