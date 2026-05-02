@@ -3598,6 +3598,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ddtree-top-k"}, "N",
+        string_format("DDTree: per-position draft top-K width (default: %d, 0 = auto = max(1, budget))",
+                      params.speculative.ddtree_top_k),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--ddtree-top-k must be >= 0");
+            }
+            params.speculative.ddtree_top_k = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DDTREE_TOP_K"));
+    add_opt(common_arg(
         {"-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
             "KV cache data type for K for the draft model\n"
