@@ -403,7 +403,11 @@ static int32_t find_child_token(const llama_ddtree & tree, int32_t parent, llama
 static llama_token pick_current_logits(llama_speculative_tree_driver * d,
                                        const llama_speculative_tree_verify_cbs * verify_cbs) {
     if (verify_cbs != nullptr && verify_cbs->sample_cb != nullptr) {
-        return (llama_token) verify_cbs->sample_cb(verify_cbs->user_data, /*logits_row_idx=*/0);
+        // exact-chain mode: no precomputed batched argmax for this row, signal
+        // the cb to do a full sample with LLAMA_TOKEN_NULL.
+        return (llama_token) verify_cbs->sample_cb(verify_cbs->user_data,
+                                                   /*logits_row_idx=*/0,
+                                                   /*batched_pick=*/LLAMA_TOKEN_NULL);
     }
 
     const float * row = llama_get_logits_ith(d->target_ctx, 0);
@@ -777,6 +781,7 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
             const auto t0 = ddtree_clock::now();
             follow_verified_tree_cb(
                 tree,
+                d->posterior,
                 verify_cbs->sample_cb,
                 verify_cbs->advance_cb,
                 verify_cbs->user_data,
