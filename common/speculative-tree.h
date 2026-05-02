@@ -10,7 +10,7 @@ struct llama_ddtree_params {
     float temp       = 1.0f;  // temperature for log-prob computation
     bool  chain_seed = true;  // seed heap with greedy chain (recommended)
     int   block_size = 16;    // matches dflash draft block_size
-    int   top_k      = 0;     // 0 = auto (8 if budget > L else 1)
+    int   top_k      = 0;     // 0 = auto (match DDTree budget, clamped to vocab)
 };
 
 struct llama_ddtree_node {

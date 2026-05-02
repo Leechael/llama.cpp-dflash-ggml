@@ -20,10 +20,10 @@ static void test_top_k_width() {
     p.block_size = 16;
     p.budget     = 40;
     p.top_k      = 0;
-    REQUIRE(llama_speculative_draft_top_k_width(p.block_size, p) == 8);
+    REQUIRE(llama_speculative_draft_top_k_width(p.block_size, p) == 40);
 
     p.budget = 8;
-    REQUIRE(llama_speculative_draft_top_k_width(p.block_size, p) == 1);
+    REQUIRE(llama_speculative_draft_top_k_width(p.block_size, p) == 8);
 
     p.top_k = 4;
     REQUIRE(llama_speculative_draft_top_k_width(p.block_size, p) == 4);

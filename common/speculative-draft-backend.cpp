@@ -16,8 +16,8 @@ static double draft_elapsed_ms(ddtree_draft_clock::time_point t0) {
 }
 
 int llama_speculative_draft_top_k_width(int block_size, const llama_ddtree_params & params) {
-    const int L = block_size - 1;
-    return (params.top_k > 0) ? params.top_k : ((params.budget > L) ? 8 : 1);
+    (void) block_size;
+    return (params.top_k > 0) ? params.top_k : std::max(1, params.budget);
 }
 
 bool llama_speculative_draft_pack_target_feat(const llama_speculative_draft_target_feat_view & view,
@@ -222,9 +222,11 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
                     return a.logit > b.logit;
                 });
 
-                if (info.K == 1) {
-                    top_log_probs[(size_t) i] = 0.0f;
-                    top_token_ids[(size_t) i] = row_top[0].token;
+                if (std::abs(proposal_temp - 1.0f) < 1e-6f) {
+                    for (int k = 0; k < info.K; ++k) {
+                        top_log_probs[(size_t) i * info.K + k] = row_top[(size_t) k].logit;
+                        top_token_ids[(size_t) i * info.K + k] = row_top[(size_t) k].token;
+                    }
                     continue;
                 }
 
