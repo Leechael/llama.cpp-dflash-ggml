@@ -3233,8 +3233,19 @@ private:
                 // LLAMA_DDTREE_NO_GRAMMAR_VERIFY=1 disables this and falls back
                 // to internal argmax (diagnostic; baseline for accept-rate
                 // comparison).
-                static const bool s_no_grammar_verify = []{
-                    const char * e = getenv("LLAMA_DDTREE_NO_GRAMMAR_VERIFY");
+                // Spec verify is grammar-free by default. Reference DFlash /
+                // DDTree implementations verify with greedy target argmax
+                // only — grammar / penalties / dry are the main sampler's
+                // responsibility on commit, not the verify walk's. Running
+                // grammar inside the verify walk costs ~50 ms / cb on
+                // tool-call JSON schemas for zero acceptance change
+                // (batched_exact_diff = 0 measured across multi-turn agent
+                // runs; see archived/GRAMMAR_VERIFY_DEFAULT_OFF_2026-05-02.md).
+                //
+                // LLAMA_DDTREE_GRAMMAR_VERIFY=1 opts back in if a future
+                // grammar-tight workload needs it.
+                static const bool s_grammar_verify = []{
+                    const char * e = getenv("LLAMA_DDTREE_GRAMMAR_VERIFY");
                     return e && e[0] == '1';
                 }();
                 // Opt-in batched-argmax short-circuit. Skips the full sampler
@@ -3256,7 +3267,7 @@ private:
                     bool             use_shortcircuit;
                 };
                 ddtree_verify_state vstate{
-                    /*smpl=*/             (!s_no_grammar_verify && slot.smpl) ? common_sampler_clone(slot.smpl.get()) : nullptr,
+                    /*smpl=*/             (s_grammar_verify && slot.smpl) ? common_sampler_clone(slot.smpl.get()) : nullptr,
                     /*ctx =*/             ctx,
                     /*use_shortcircuit=*/ s_batched_shortcircuit,
                 };
