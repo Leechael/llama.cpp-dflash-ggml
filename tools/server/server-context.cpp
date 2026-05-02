@@ -3250,10 +3250,19 @@ private:
                 }
                 llama_speculative_tree_verify_cbs vcbs{};
                 vcbs.user_data  = &vstate;
-                vcbs.sample_cb  = [](void * ud, int32_t logits_row_idx) -> int32_t {
+                vcbs.sample_cb  = [](void * ud, int32_t logits_row_idx, llama_token batched_pick) -> int32_t {
                     auto * s = (ddtree_verify_state *)ud;
                     if (!s->smpl) {
                         return 0; // shouldn't happen; driver falls back if cb null
+                    }
+                    // Short-circuit: the driver already computed the full-vocab
+                    // argmax for this row. If the sampler+grammar would accept
+                    // it, return without re-sampling over n_vocab (saves ~30 ms
+                    // per call: llama_synchronize + set_logits over 248K vocab
+                    // + full sampler chain).
+                    if (batched_pick != LLAMA_TOKEN_NULL &&
+                        common_sampler_grammar_token_valid(s->smpl, batched_pick)) {
+                        return (int32_t)batched_pick;
                     }
                     return (int32_t)common_sampler_sample(s->smpl, s->ctx, logits_row_idx, /*grammar_first=*/true);
                 };

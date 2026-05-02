@@ -65,16 +65,22 @@ void follow_verified_tree(
 // Lets callers (server) plug in grammar-aware sampling so the chain only
 // accepts tokens the sampler+grammar would have produced.
 //
-//   sample_cb (ud, logits_row_idx) -> picked token at this row (no state advance)
-//   advance_cb(ud, accepted_token)  -> caller must advance its sampler/grammar
+//   sample_cb (ud, logits_row_idx, batched_pick) -> picked token at this row
+//   advance_cb(ud, accepted_token)               -> caller must advance its sampler/grammar
+//
+// batched_pick is the driver's already-computed full-vocab argmax for this
+// row (LLAMA_TOKEN_NULL when not available, e.g. exact-chain mode). The
+// callback may short-circuit by returning batched_pick when the caller's
+// grammar/sampler would accept it, avoiding a full re-sample over n_vocab.
 //
 // advance_cb is invoked every time the chain accepts a child (= the picked
 // token matched a child of `current`). It is NOT invoked for the bonus token.
-typedef int32_t (*llama_speculative_pick_cb)   (void * user_data, int32_t logits_row_idx);
+typedef int32_t (*llama_speculative_pick_cb)   (void * user_data, int32_t logits_row_idx, llama_token batched_pick);
 typedef void    (*llama_speculative_advance_cb)(void * user_data, llama_token accepted_token);
 
 void follow_verified_tree_cb(
     const llama_ddtree           & tree,
+    const std::vector<int32_t>   & posterior,
     llama_speculative_pick_cb      sample_cb,
     llama_speculative_advance_cb   advance_cb,
     void                         * user_data,
