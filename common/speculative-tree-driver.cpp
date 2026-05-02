@@ -869,6 +869,34 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
         d->stats.max_committed_tokens_per_step =
             std::max(d->stats.max_committed_tokens_per_step, commit_n);
 
+        if (std::getenv("LLAMA_DDTREE_DUMP_STEP") != nullptr) {
+            const int32_t rollback_node = (commit_n > 0) ? accepted_dfs[commit_n - 1] : 0;
+            LOG_INF("ddtree_dump: step=%lld pos=%d root=%d N=%d budget=%d top_k=%d commit_n=%d next=%d rollback_node=%d\n",
+                    (long long)d->stats.n_steps,
+                    (int)committed_pos,
+                    (int)root_token,
+                    N,
+                    d->params.budget,
+                    d->params.top_k,
+                    commit_n,
+                    (int)next_token,
+                    (int)rollback_node);
+            LOG_INF("ddtree_dump: accepted_dfs=");
+            for (int i = 0; i < (int)accepted_dfs.size(); ++i) {
+                LOG_INF("%s%d", i == 0 ? "" : ",", (int)accepted_dfs[i]);
+            }
+            LOG_INF("\n");
+            for (int i = 0; i < N; ++i) {
+                const int32_t post = (i < (int)d->posterior.size()) ? d->posterior[i] : -1;
+                LOG_INF("ddtree_dump: node=%d parent=%d depth=%d tok=%d posterior=%d\n",
+                        i,
+                        (int)tree.nodes[i].parent_idx,
+                        (int)tree.nodes[i].depth,
+                        (int)tree.nodes[i].token_id,
+                        (int)post);
+            }
+        }
+
         release_snap();
 
         std::vector<llama_token> result;
