@@ -429,6 +429,22 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
+bool common_sampler_grammar_token_valid(struct common_sampler * gsmpl, llama_token token) {
+    if (!gsmpl) {
+        return false;
+    }
+    if (!grammar_should_apply(gsmpl)) {
+        return true;
+    }
+    // Apply the grammar sampler to a single-token candidate array. The grammar
+    // sampler masks invalid tokens to -INFINITY; we only inspect the result and
+    // do not advance any sampler state.
+    llama_token_data       single       = { token, 1.0f, 0.0f };
+    llama_token_data_array single_array = { &single, 1, -1, false };
+    llama_sampler_apply(gsmpl->grmr, &single_array);
+    return single_array.data[0].logit != -INFINITY;
+}
+
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool accept_grammar) {
     if (!gsmpl) {
         return;
