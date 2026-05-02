@@ -31,7 +31,7 @@ static bool llama_dflash_fast_rollback_enabled() {
         return false;
     }
     const char * e = std::getenv("LLAMA_DDTREE_FAST_ROLLBACK");
-    if (e != nullptr) {
+    if (e != nullptr && e[0] != '\0') {
         return e[0] == '1';
     }
     return true;
@@ -4672,6 +4672,10 @@ int llama_dflash_draft_encode_top_k_cached(llama_context * ctx,
                                            int64_t         committed_pos,
                                            int32_t         top_k) {
     return ctx->dflash_draft_encode_top_k_cached(batch, n_embd, ctx_len, ring_start, cap, committed_pos, top_k);
+}
+
+void llama_dflash_ensure_persist_capacity(struct llama_context * ctx, int64_t n_tokens) {
+    ctx->ensure_dflash_persist_capacity(n_tokens);
 }
 
 bool llama_dflash_rollback_ssm_to_dfs(

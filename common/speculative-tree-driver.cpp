@@ -184,6 +184,10 @@ llama_speculative_tree_driver * llama_speculative_tree_driver_init(
     d->target_feat_cap         = ddtree_target_feat_cap();
     d->target_feat_ring.assign((size_t)d->target_feat_n_embd_fc * d->target_feat_cap, 0.0f);
 
+    if (ddtree_paper_verifier_enabled()) {
+        llama_dflash_ensure_persist_capacity(target_ctx, params.budget);
+    }
+
     d->draft_backend = llama_speculative_draft_backend_init_llama(
             draft_ctx, target_model, d->n_embd, d->n_vocab, d->block_size, d->mask_token_id, d->params);
     if (!d->draft_backend) {
