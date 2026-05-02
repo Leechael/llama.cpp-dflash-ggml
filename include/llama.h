@@ -1111,6 +1111,10 @@ extern "C" {
                                                          int32_t                top_k);
 
     // dflash Phase 2.4: persist-based SSM rollback after tree verify.
+    LLAMA_API void llama_dflash_ensure_persist_capacity(
+            struct llama_context * ctx,
+            int64_t                n_tokens);
+
     // After llama_kv_cache_seq_compact_tree(), call this to copy the SSM state
     // captured at DFS node accepted_dfs_node from the persist buffer back into
     // the live recurrent cache for seq_id, replacing the snapshot/restore/replay path.

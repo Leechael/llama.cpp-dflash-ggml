@@ -327,6 +327,9 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // Ensure the DDTree persist buffers can hold n_tokens columns; reallocates if needed.
+    void ensure_dflash_persist_capacity(int64_t n_tokens);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -468,9 +471,6 @@ private:
     // [K_conv-1, conv_channels, n_tokens] F32. Read by dflash_rollback_ssm_to_dfs
     // to roll the live conv state (r_l[il]) back to the accepted DFS node.
     std::vector<ggml_tensor *>  dflash_persist_conv_l;     // [n_layer], nullptr for non-recurrent
-
-    // Ensure the persist buffers can hold n_tokens columns; reallocates if needed.
-    void ensure_dflash_persist_capacity(int64_t n_tokens);
 
     // Returns the per-layer SSM/conv persist tensors for layer il, or nullptr if not
     // a recurrent layer or the buffers have not yet been allocated.
