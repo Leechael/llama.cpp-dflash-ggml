@@ -1737,42 +1737,50 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
             tree_min_pos = std::min(tree_min_pos, ubatch->pos[i]);
         }
 
-        std::fill(data, data + n_kv * n_tps, -INFINITY);
-
         const llama_seq_id seq0    = ubatch->seq_id[0][0];
         const auto &       cells   = v_cells.at(seq_to_stream[seq0]);
 
+        // Pass 1: classify every KV cell once (O(n_kv)). past_visible[j] = 1
+        // means cell j belongs to a committed token and is unconditionally
+        // visible to every tree query. Tree-region cells stay 0 here and are
+        // turned on per-query in pass 3.
+        std::vector<uint8_t> past_visible(n_kv, 0);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j) || !cells.seq_has(j, seq0)) {
+                continue;
+            }
+            if (cells.pos_get(j) < tree_min_pos) {
+                past_visible[j] = 1;
+            }
+        }
+
+        // Pass 2: for each query i, fill the row with -INF, then write 0.0f
+        // for every past_visible cell. Tree-region cells remain -INF until
+        // pass 3 marks the query's own ancestors. Total cost is O(N * n_kv)
+        // for fills + O(N * depth) for ancestor walks instead of the previous
+        // O(N * n_kv * 64) where the inner 64-element ancestor scan was
+        // duplicated against every KV cell.
         for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
-            // Collect exact KV cell indices for query i's tree ancestors,
-            // including the node itself.
-            uint32_t ancestor_slot[64];
-            int       n_anc = 0;
-            int32_t   cur   = (int32_t) i;
-            while (cur >= 0 && n_anc < 64) {
-                ancestor_slot[n_anc++] = sinfo.idxs[0][cur];
+            float * row = data + i * n_kv;
+            std::fill(row, row + n_kv, -INFINITY);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (past_visible[j]) {
+                    row[j] = 0.0f;
+                }
+            }
+
+            // Walk up the parent chain to the root and mark each ancestor's
+            // KV slot visible. Bounded by tree depth (<= L+1 < 64 in practice)
+            // and only touches ancestors of this query.
+            int32_t cur = (int32_t) i;
+            while (cur >= 0) {
+                const uint32_t slot = sinfo.idxs[0][cur];
+                if (slot < (uint32_t) n_kv && !cells.is_empty(slot) && cells.seq_has(slot, seq0)) {
+                    row[slot] = 0.0f;
+                }
                 const int32_t p = ubatch->parent_id[cur];
                 if (p < 0) break;
                 cur = p;
-            }
-
-            for (int64_t j = 0; j < n_kv; ++j) {
-                if (cells.is_empty(j) || !cells.seq_has(j, seq0)) {
-                    continue;
-                }
-                const llama_pos p0 = cells.pos_get(j);
-                bool visible = false;
-                if (p0 < tree_min_pos) {
-                    // Past KV (prompt or earlier accepted tokens): always visible.
-                    visible = true;
-                } else {
-                    // Tree region: visible only for the exact ancestor cells.
-                    for (int k = 0; k < n_anc; ++k) {
-                        if ((uint32_t) j == ancestor_slot[k]) { visible = true; break; }
-                    }
-                }
-                if (visible) {
-                    data[i * n_kv + j] = 0.0f;
-                }
             }
         }
         return;
