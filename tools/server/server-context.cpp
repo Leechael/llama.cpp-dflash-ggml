@@ -3237,13 +3237,28 @@ private:
                     const char * e = getenv("LLAMA_DDTREE_NO_GRAMMAR_VERIFY");
                     return e && e[0] == '1';
                 }();
+                // Opt-in batched-argmax short-circuit. Skips the full sampler
+                // chain when the driver's raw argmax is already grammar-valid,
+                // saving ~30 ms per cb call. NOT safe when the chain contains
+                // score-modifying samplers (penalties/dry/xtc) whose effect
+                // can shift the argmax: those are exactly the samplers that
+                // prevent agent reasoning loops, so dropping them lets the
+                // model re-emit the same tool call indefinitely. Stays off
+                // unless explicitly enabled by env var; greedy chains with
+                // only mask-style samplers (top_k/top_p/min_p/temp) can opt in.
+                static const bool s_batched_shortcircuit = []{
+                    const char * e = std::getenv("LLAMA_DDTREE_BATCHED_SHORTCIRCUIT");
+                    return e && e[0] == '1';
+                }();
                 struct ddtree_verify_state {
                     common_sampler * smpl;
                     llama_context  * ctx;
+                    bool             use_shortcircuit;
                 };
                 ddtree_verify_state vstate{
-                    /*smpl=*/ (!s_no_grammar_verify && slot.smpl) ? common_sampler_clone(slot.smpl.get()) : nullptr,
-                    /*ctx =*/ ctx,
+                    /*smpl=*/             (!s_no_grammar_verify && slot.smpl) ? common_sampler_clone(slot.smpl.get()) : nullptr,
+                    /*ctx =*/             ctx,
+                    /*use_shortcircuit=*/ s_batched_shortcircuit,
                 };
                 if (vstate.smpl) {
                     common_sampler_accept(vstate.smpl, slot.ddtree_root_tok, true);
@@ -3255,12 +3270,8 @@ private:
                     if (!s->smpl) {
                         return 0; // shouldn't happen; driver falls back if cb null
                     }
-                    // Short-circuit: the driver already computed the full-vocab
-                    // argmax for this row. If the sampler+grammar would accept
-                    // it, return without re-sampling over n_vocab (saves ~30 ms
-                    // per call: llama_synchronize + set_logits over 248K vocab
-                    // + full sampler chain).
-                    if (batched_pick != LLAMA_TOKEN_NULL &&
+                    if (s->use_shortcircuit &&
+                        batched_pick != LLAMA_TOKEN_NULL &&
                         common_sampler_grammar_token_valid(s->smpl, batched_pick)) {
                         return (int32_t)batched_pick;
                     }
