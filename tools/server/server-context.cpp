@@ -2990,6 +2990,7 @@ private:
                         dp.budget     = params_base.speculative.ddtree_budget;
                         dp.temp       = params_base.speculative.ddtree_temp;
                         dp.chain_seed = params_base.speculative.ddtree_chain_seed;
+                        dp.top_k      = params_base.speculative.ddtree_top_k;
                         dp.block_size = 16;
                         slot.spec_driver = llama_speculative_tree_driver_init(ctx, ctx_ddtree_dft, dp);
                         if (!slot.spec_driver) {

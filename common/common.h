@@ -361,6 +361,7 @@ struct common_params_speculative {
     int32_t ddtree_budget      = 22;   // tree node budget (matches dflash default)
     float   ddtree_temp        = 1.0f; // temperature for draft log-prob extraction
     bool    ddtree_chain_seed  = true; // seed the tree heap with greedy chain (recommended)
+    int32_t ddtree_top_k       = 0;    // per-position draft top-K width; 0 = auto = max(1, budget)
 };
 
 struct common_params_vocoder {
