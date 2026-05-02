@@ -764,6 +764,7 @@ public:
     ggml_tensor * t_hidden_capture = nullptr;
 
     // dflash-draft top-K graph outputs: [K, n_tokens]
+    // t_dflash_top_logits stores full-vocab-normalized log-probs for the selected ids.
     ggml_tensor * t_dflash_top_logits = nullptr;
     ggml_tensor * t_dflash_top_ids    = nullptr;
 

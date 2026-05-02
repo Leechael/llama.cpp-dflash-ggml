@@ -1209,6 +1209,8 @@ void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
     // per-layer allocations fit into fragmented GPU memory where one large
     // (~1.7 GiB) contiguous block would fail.
     size_t total_bytes = 0;
+    size_t total_ssm_bytes = 0;
+    size_t total_conv_bytes = 0;
     for (int il = 0; il < n_layer; ++il) {
         if (!hparams.is_recurrent(il)) {
             continue; // full-attn layer — no persist buffer needed
@@ -1252,10 +1254,19 @@ void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
         ggml_format_name(tc, "dflash_persist_conv_il%d", il);
         dflash_persist_conv_l[il] = tc;
 
+        const size_t layer_ssm_bytes = ggml_nbytes(ts);
+        const size_t layer_conv_bytes = ggml_nbytes(tc);
+        total_ssm_bytes += layer_ssm_bytes;
+        total_conv_bytes += layer_conv_bytes;
+
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
         if (!buf) {
-            LLAMA_LOG_ERROR("%s: failed to allocate persist buffer for layer %d (n_tokens=%lld)\n",
-                            __func__, il, (long long)n_tokens);
+            LLAMA_LOG_ERROR("%s: failed to allocate persist buffer for layer %d (n_tokens=%lld, layer_ssm=%.2f MiB, layer_conv=%.2f MiB, total_ssm=%.2f MiB, total_conv=%.2f MiB)\n",
+                            __func__, il, (long long)n_tokens,
+                            (double)layer_ssm_bytes / (1024.0 * 1024.0),
+                            (double)layer_conv_bytes / (1024.0 * 1024.0),
+                            (double)total_ssm_bytes / (1024.0 * 1024.0),
+                            (double)total_conv_bytes / (1024.0 * 1024.0));
             dflash_persist_inter_l.clear();
             dflash_persist_conv_l.clear();
             dflash_persist_ctxs_bufs.clear();
@@ -1269,10 +1280,12 @@ void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
     dflash_persist_max_n_tokens = n_tokens;
     dflash_persist_failed_n_tokens = 0;
 
-    LLAMA_LOG_INFO("%s: allocated dflash persist buffers: %d layers, %lld tokens, %.2f MiB across %zu backend buffers\n",
+    LLAMA_LOG_INFO("%s: allocated dflash persist buffers: %d layers, %lld tokens, %.2f MiB across %zu backend buffers (ssm=%.2f MiB, conv=%.2f MiB)\n",
                    __func__, n_layer, (long long)n_tokens,
                    (double)total_bytes / (1024.0 * 1024.0),
-                   dflash_persist_ctxs_bufs.size());
+                   dflash_persist_ctxs_bufs.size(),
+                   (double)total_ssm_bytes / (1024.0 * 1024.0),
+                   (double)total_conv_bytes / (1024.0 * 1024.0));
 }
 
 void llama_context::set_target_feat_raw(const float * data, int64_t n_embd_fc, int64_t ctx_len,

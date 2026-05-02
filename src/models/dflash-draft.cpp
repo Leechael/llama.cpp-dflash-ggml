@@ -295,10 +295,18 @@ llm_build_dflash_draft::llm_build_dflash_draft(
             top_logits = ggml_reshape_2d(ctx0, top_logits, top_k, n_tokens);
             cb(top_logits, "dflash_top_logits", -1);
 
+            ggml_tensor * probs = ggml_soft_max(ctx0, logits);
+            cb(probs, "dflash_probs", -1);
+            ggml_tensor * probs_rows = ggml_reshape_3d(ctx0, probs, 1, probs->ne[0], n_tokens);
+            ggml_tensor * top_log_probs = ggml_get_rows(ctx0, probs_rows, top_ids);
+            top_log_probs = ggml_log(ctx0, top_log_probs);
+            top_log_probs = ggml_reshape_2d(ctx0, top_log_probs, top_k, n_tokens);
+            cb(top_log_probs, "dflash_top_log_probs", -1);
+
             res->t_dflash_top_ids    = top_ids;
-            res->t_dflash_top_logits = top_logits;
+            res->t_dflash_top_logits = top_log_probs;
             ggml_build_forward_expand(gf, top_ids);
-            ggml_build_forward_expand(gf, top_logits);
+            ggml_build_forward_expand(gf, top_log_probs);
         } else {
             res->t_logits = logits;
             ggml_build_forward_expand(gf, logits);
