@@ -16,8 +16,12 @@ static double draft_elapsed_ms(ddtree_draft_clock::time_point t0) {
 }
 
 int llama_speculative_draft_top_k_width(int block_size, const llama_ddtree_params & params) {
-    (void) block_size;
-    return (params.top_k > 0) ? params.top_k : std::max(1, params.budget);
+    if (params.top_k > 0) {
+        return params.top_k;
+    }
+    // Standalone DFlash only asks the draft for top-K branches when the DDTree
+    // budget can grow beyond the greedy chain; it uses K=8 in that case.
+    return (params.budget > std::max(0, block_size - 1)) ? 8 : 1;
 }
 
 bool llama_speculative_draft_pack_target_feat(const llama_speculative_draft_target_feat_view & view,

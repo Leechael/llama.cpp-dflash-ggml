@@ -358,10 +358,10 @@ struct common_params_speculative {
 
     // DDTree speculative decoding parameters (Phase 5)
     bool    ddtree_mode        = false; // true when --speculative-mode ddtree is set
-    int32_t ddtree_budget      = 22;   // tree node budget (matches dflash default)
+    int32_t ddtree_budget      = 22;   // non-root tree node budget (matches dflash default)
     float   ddtree_temp        = 1.0f; // temperature for draft log-prob extraction
     bool    ddtree_chain_seed  = true; // seed the tree heap with greedy chain (recommended)
-    int32_t ddtree_top_k       = 0;    // per-position draft top-K width; 0 = auto = max(1, budget)
+    int32_t ddtree_top_k       = 0;    // per-position draft top-K width; 0 = standalone-compatible auto
 };
 
 struct common_params_vocoder {

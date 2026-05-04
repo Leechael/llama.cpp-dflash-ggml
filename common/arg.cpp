@@ -3599,7 +3599,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--ddtree-top-k"}, "N",
-        string_format("DDTree: per-position draft top-K width (default: %d, 0 = auto = max(1, budget))",
+        string_format("DDTree: per-position draft top-K width (default: %d, 0 = standalone-compatible auto)",
                       params.speculative.ddtree_top_k),
         [](common_params & params, int value) {
             if (value < 0) {
