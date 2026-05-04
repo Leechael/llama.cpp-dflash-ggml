@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--budget", type=int, default=22)
     ap.add_argument("--top-k", type=int, default=0)
     ap.add_argument("--proposal-temp", type=float, default=1.0)
-    ap.add_argument("--target-feat-ctx", type=int, default=128)
+    ap.add_argument("--target-feat-ctx", type=int, default=2048)
     ap.add_argument("--verifier", default="paper", choices=["paper", "exact"])
     ap.add_argument("--exact-validation", action="store_true")
     ap.add_argument("--grammar-verify", action="store_true")

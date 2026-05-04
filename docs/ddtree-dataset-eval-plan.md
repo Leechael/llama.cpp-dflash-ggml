@@ -12,7 +12,7 @@ Castle through `test-speculative-tree-e2e`.
 - Generation: greedy, `n_gen=256`.
 - Primary Python-compatible config: `budget=22` non-root DDTree nodes,
   `top_k=0` (auto => K=8 when branching), `proposal_temp=1`,
-  `target_feat_ctx=128`, `q8_0` KV.
+  `target_feat_ctx=2048`, `q8_0` KV.
 - Harness: `build-server/bin/test-speculative-tree-e2e`.
 - Correctness gate: greedy token trajectory must be bit-equal between chain and
   spec output for every sample.
@@ -25,14 +25,28 @@ does not check bit-equal token trajectories; direct standalone testing on
 HumanEval_01 shows this fast path diverges from standalone AR at generated token
 34 for `n_gen=64`.
 
-Castle 4090 llama.cpp fast batched result with the Python-compatible parameters,
+Castle 4090 llama.cpp exact-gated result with the Python-compatible parameters,
 Qwen3.5-27B Q4_K_M target + DFlash draft, `n_gen=256`, 10 prompts per dataset:
 
 | dataset | AR tok/s | DFlash tok/s | AL | speedup | bit-equal |
 |---|---:|---:|---:|---:|---:|
-| HumanEval | 46.33 | 111.48 | 6.83 | 2.41x | 7/10 |
-| GSM8K | 46.32 | 100.29 | 5.97 | 2.16x | 2/10 |
-| Math500 | 46.33 | 98.12 | 5.87 | 2.12x | 5/10 |
+| HumanEval | 46.32 | 40.23 | 8.34 | 0.87x | 10/10 |
+| GSM8K | 46.31 | 40.12 | 6.72 | 0.87x | 10/10 |
+| Math500 | 46.33 | 40.05 | 7.30 | 0.86x | 10/10 |
+
+The exact-gated path is slower than AR because it still runs one exact target
+decode per generated token, then adds the draft pass. On the 30-prompt run the
+target AR cost is ~21.59 ms/token; exact-gated DDTree costs ~24.9 ms/token
+after draft overhead is amortized.
+
+For throughput experiments, the fast batched path with
+`LLAMA_DDTREE_TRUST_BATCHED=1` is not a correctness row:
+
+| dataset | AR tok/s | DFlash tok/s | AL | speedup | bit-equal |
+|---|---:|---:|---:|---:|---:|
+| HumanEval | 46.34 | 129.70 | 8.36 | 2.80x | 7/10 |
+| GSM8K | 46.31 | 105.65 | 6.44 | 2.28x | 1/10 |
+| Math500 | 46.32 | 119.01 | 7.44 | 2.57x | 3/10 |
 
 For performance experiments, `LLAMA_DDTREE_TRUST_BATCHED=1` restores the fast
 batched posterior behavior. Rows where `bit_equal` is not 10/10 must be treated
