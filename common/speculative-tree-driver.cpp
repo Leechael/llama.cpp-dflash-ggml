@@ -116,6 +116,11 @@ static bool ddtree_fast_batched_enabled() {
     return e != nullptr && e[0] == '1';
 }
 
+static bool ddtree_target_top1_enabled() {
+    const char * e = std::getenv("LLAMA_DDTREE_TARGET_TOP1");
+    return e != nullptr && e[0] == '1';
+}
+
 static bool ddtree_fast_rollback_enabled() {
     const char * e = std::getenv("LLAMA_DDTREE_FAST_ROLLBACK");
     return e != nullptr && e[0] == '1';
@@ -132,7 +137,7 @@ static bool ddtree_capture_direct_enabled() {
 }
 
 static bool ddtree_trust_batched_posterior() {
-    const char * e = std::getenv("LLAMA_DDTREE_TRUST_BATCHED");
+    const char * e = std::getenv("LLAMA_DDTREE_UNSAFE_TRUST_BATCHED");
     return e != nullptr && e[0] == '1';
 }
 
@@ -144,6 +149,11 @@ static bool ddtree_diag_batched_enabled() {
 static bool ddtree_exact_ar_fallback_enabled() {
     const char * e = std::getenv("LLAMA_DDTREE_EXACT_AR_FALLBACK");
     return e == nullptr || e[0] != '0';
+}
+
+static bool ddtree_unsafe_fast_tree_state_enabled() {
+    const char * e = std::getenv("LLAMA_DDTREE_UNSAFE_FAST_TREE_STATE");
+    return e != nullptr && e[0] == '1';
 }
 
 static int64_t ddtree_target_feat_cap() {
@@ -700,6 +710,11 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     const bool trace_batched  = std::getenv("LLAMA_DDTREE_TRACE") != nullptr ||
                                 std::getenv("LLAMA_DDTREE_TRACE_CHAIN_ROOT") != nullptr;
     const bool need_batched_tree = fast_batched || trace_batched;
+    const bool use_target_top1 = ddtree_target_top1_enabled() &&
+                                 trust_batched &&
+                                 verify_cbs == nullptr &&
+                                 !diag_batched &&
+                                 !trace_batched;
 
     if (!need_batched_tree) {
         std::vector<int32_t> accepted_dfs;
@@ -731,7 +746,9 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     const bool fast_rollback = fast_batched && (paper_verifier || ddtree_fast_rollback_enabled()) &&
                                !d->fast_rollback_unavailable;
     const bool exact_gate_batched = paper_verifier && N > 1 && !trust_batched;
+    const bool unsafe_fast_tree_state = ddtree_unsafe_fast_tree_state_enabled();
     const bool keep_snapshot = exact_gate_batched ||
+                               (paper_verifier && fast_batched && fast_rollback && !unsafe_fast_tree_state) ||
                                (!paper_verifier &&
                                 (!fast_batched || !fast_rollback || ddtree_snapshot_fallback_enabled()));
 
@@ -774,6 +791,9 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     // Build a tree batch of N tokens and run target decode.
     {
         const auto t0 = ddtree_clock::now();
+        if (use_target_top1) {
+            llama_set_dflash_draft_top_k(d->target_ctx, 1);
+        }
         llama_batch tree_batch = llama_batch_init_tree(N, 0, 1);
         tree_batch.n_tokens = N;
         for (int i = 0; i < N; ++i) {
@@ -785,6 +805,9 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
             tree_batch.parent_id[i]  = tree.nodes[i].parent_idx; // -1 for root
         }
         int ret = llama_decode(d->target_ctx, tree_batch);
+        if (use_target_top1) {
+            llama_set_dflash_draft_top_k(d->target_ctx, 0);
+        }
         llama_batch_free(tree_batch);
         if (ret != 0) {
             LOG_ERR("%s: target tree llama_decode failed: %d\n", __func__, ret);
@@ -803,39 +826,62 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     posterior_margins.resize(N);
     {
         const auto t0 = ddtree_clock::now();
-        for (int i = 0; i < N; ++i) {
-            const float * row = llama_get_logits_ith(d->target_ctx, i);
-            if (!row) {
-                LOG_ERR("%s: target logits[%d] unavailable\n", __func__, i);
+        const float * top_logits = nullptr;
+        const llama_token * top_ids = nullptr;
+        int32_t top_rows = 0;
+        int32_t top_k = 0;
+        if (use_target_top1 &&
+                llama_get_dflash_draft_top_k(d->target_ctx, &top_logits, &top_ids, &top_rows, &top_k)) {
+            if (top_k < 1 || top_rows < N || top_ids == nullptr) {
+                LOG_ERR("%s: target top1 output has invalid shape: rows=%d k=%d expected rows>=%d k>=1\n",
+                        __func__, (int)top_rows, (int)top_k, N);
                 release_snap();
                 return {};
             }
-            int32_t best = 0;
-            float best_val = row[0];
-            int32_t second = 0;
-            float second_val = row[0];
-            if (n_vocab > 1) {
-                second = 1;
-                second_val = row[1];
-                if (second_val > best_val) {
-                    std::swap(best, second);
-                    std::swap(best_val, second_val);
-                }
+            for (int i = 0; i < N; ++i) {
+                d->posterior[i] = (int32_t) top_ids[(size_t)i * top_k];
+                posterior_margins[i] = 0.0f;
             }
-            for (int64_t v = 2; v < n_vocab; ++v) {
-                const float val = row[v];
-                if (val > best_val) {
-                    second = best;
-                    second_val = best_val;
-                    best = (int32_t)v;
-                    best_val = val;
-                } else if (val > second_val) {
-                    second = (int32_t)v;
-                    second_val = val;
-                }
+        } else {
+            if (use_target_top1) {
+                LOG_ERR("%s: target top1 output unavailable\n", __func__);
+                release_snap();
+                return {};
             }
-            d->posterior[i] = best;
-            posterior_margins[i] = best_val - second_val;
+            for (int i = 0; i < N; ++i) {
+                const float * row = llama_get_logits_ith(d->target_ctx, i);
+                if (!row) {
+                    LOG_ERR("%s: target logits[%d] unavailable\n", __func__, i);
+                    release_snap();
+                    return {};
+                }
+                int32_t best = 0;
+                float best_val = row[0];
+                int32_t second = 0;
+                float second_val = row[0];
+                if (n_vocab > 1) {
+                    second = 1;
+                    second_val = row[1];
+                    if (second_val > best_val) {
+                        std::swap(best, second);
+                        std::swap(best_val, second_val);
+                    }
+                }
+                for (int64_t v = 2; v < n_vocab; ++v) {
+                    const float val = row[v];
+                    if (val > best_val) {
+                        second = best;
+                        second_val = best_val;
+                        best = (int32_t)v;
+                        best_val = val;
+                    } else if (val > second_val) {
+                        second = (int32_t)v;
+                        second_val = val;
+                    }
+                }
+                d->posterior[i] = best;
+                posterior_margins[i] = best_val - second_val;
+            }
         }
         d->stats.t_posterior_scan_ms += elapsed_ms(t0);
     }
@@ -905,6 +951,27 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
             } else if (batched_commit_n < (int)exact_accepted_dfs.size()) {
                 d->stats.n_batched_exact_shorter++;
             }
+            if (std::getenv("LLAMA_DDTREE_TRACE") != nullptr) {
+                auto min_margin_for = [&](const std::vector<int32_t> & path) {
+                    float min_margin = 0.0f;
+                    for (int i = 0; i < (int)path.size(); ++i) {
+                        const int32_t idx = path[i];
+                        const float margin = (idx >= 0 && idx < (int)posterior_margins.size()) ? posterior_margins[idx] : 0.0f;
+                        min_margin = (i == 0) ? margin : std::min(min_margin, margin);
+                    }
+                    return min_margin;
+                };
+                LOG_INF("ddtree_trace_fast: step=%lld pos=%d same=%d exact_commit_n=%d batched_commit_n=%d exact_next=%d batched_next=%d exact_min_margin=%.6g batched_min_margin=%.6g\n",
+                        (long long)d->stats.n_steps,
+                        (int)committed_pos,
+                        batched_accepted_dfs == exact_accepted_dfs && batched_next_token == exact_next_token,
+                        (int)exact_accepted_dfs.size(),
+                        batched_commit_n,
+                        (int)exact_next_token,
+                        (int)batched_next_token,
+                        (double)min_margin_for(exact_accepted_dfs),
+                        (double)min_margin_for(batched_accepted_dfs));
+            }
 
             accepted_dfs = std::move(exact_accepted_dfs);
             next_token   = exact_next_token;
@@ -913,8 +980,9 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
 
         const int accept_depth = (int)accepted_dfs.size(); // includes root node (index 0)
         const int commit_n     = accept_depth;
+        const bool fast_path_state_safe = unsafe_fast_tree_state;
 
-        if (!did_commit_state && fast_rollback && N > 1) {
+        if (!did_commit_state && fast_rollback && fast_path_state_safe && N > 1) {
             {
                 const auto t0 = ddtree_clock::now();
                 llama_kv_cache_seq_compact_tree(
@@ -959,12 +1027,6 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
         }
 
         if (N > 1 && !did_commit_state) {
-            if (paper_verifier) {
-                LOG_ERR("%s: paper verifier requires tree-state rollback; no snapshot/replay fallback is allowed\n",
-                        __func__);
-                release_snap();
-                return {};
-            }
             if (snap == LLAMA_MEM_SNAPSHOT_INVALID || !llama_seq_restore(d->target_ctx, snap)) {
                 LOG_ERR("%s: fast rollback failed and snapshot fallback is unavailable\n", __func__);
                 release_snap();

@@ -1028,7 +1028,7 @@ bool llama_context::get_dflash_draft_top_k(
         *k = dflash_draft_top_k;
     }
     return dflash_draft_top_rows > 0 && dflash_draft_top_k > 0 &&
-           !dflash_draft_top_logits.empty() && !dflash_draft_top_token_ids.empty();
+           !dflash_draft_top_token_ids.empty();
 }
 
 
@@ -1237,11 +1237,23 @@ void llama_context::ensure_dflash_persist_capacity(int64_t n_tokens) {
             return;
         }
 
-        // SSM persist: [S_v, S_v, H_v, n_tokens]. CPU layers keep F32 for exact
-        // equivalence. CUDA layers use F16 to keep DDTree rollback feasible on
-        // 24 GiB cards when the draft model is also resident.
-        const ggml_type persist_s_type =
-            (buft == ggml_backend_cpu_buffer_type()) ? GGML_TYPE_F32 : GGML_TYPE_F16;
+        // SSM persist: [S_v, S_v, H_v, n_tokens]. Keep F32 by default so fast
+        // rollback restores the same recurrent state precision as chain decode.
+        // The unsafe DDTree path mirrors standalone DFlash's F16 intermediates;
+        // use LLAMA_DDTREE_PERSIST_S_F32=1 to force strict storage there.
+        const bool persist_s_f16 = []{
+            const char * force_f32 = getenv("LLAMA_DDTREE_PERSIST_S_F32");
+            if (force_f32 && force_f32[0] == '1') {
+                return false;
+            }
+            const char * force_f16 = getenv("LLAMA_DDTREE_PERSIST_S_F16");
+            if (force_f16 && force_f16[0] == '1') {
+                return true;
+            }
+            const char * unsafe = getenv("LLAMA_DDTREE_UNSAFE_FAST_TREE_STATE");
+            return unsafe && unsafe[0] == '1';
+        }();
+        const ggml_type persist_s_type = persist_s_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
         ggml_tensor * ts = ggml_new_tensor_4d(ctx,
                 persist_s_type, head_v_dim, head_v_dim, num_v_heads, n_tokens);
         ggml_format_name(ts, "dflash_persist_il%d", il);
@@ -1945,6 +1957,11 @@ static ggml_backend_buffer_type_t dflash_preferred_cache_buft(
     return fallback;
 }
 
+static bool dflash_draft_kv_cache_enabled() {
+    const char * e = getenv("LLAMA_DFLASH_DRAFT_KV_CACHE");
+    return e == nullptr || e[0] != '0';
+}
+
 static bool dflash_graph_copy_1d(
         ggml_backend_t backend,
         ggml_tensor *  src,
@@ -1967,6 +1984,58 @@ static bool dflash_graph_copy_1d(
     ggml_tensor * dst_view = ggml_view_1d(ctx.get(), dst, ne, dst_off);
     ggml_tensor * out = ggml_cpy(ctx.get(), src_view, dst_view);
     ggml_build_forward_expand(gf, out);
+
+    return ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+}
+
+static bool dflash_graph_pack_capture(
+        ggml_backend_t backend,
+        ggml_tensor *  src,
+        ggml_tensor *  dst,
+        int64_t        n_embd,
+        int64_t        n_tokens,
+        const int32_t * dfs_indices,
+        int32_t        done,
+        int64_t        valid,
+        int64_t        width) {
+    const int64_t n_copies = dfs_indices == nullptr ? 5 : 5 * valid;
+    const size_t src_elt = ggml_element_size(src);
+    const size_t dst_elt = ggml_element_size(dst);
+    struct ggml_init_params params = {
+        /* mem_size   = */ ggml_tensor_overhead() * (size_t)(3 * n_copies + 8) +
+                            ggml_graph_overhead_custom((size_t)(n_copies + 8), false),
+        /* mem_buffer = */ nullptr,
+        /* no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), (size_t)(n_copies + 8), false);
+    if (dfs_indices == nullptr) {
+        for (int64_t l = 0; l < 5; ++l) {
+            const size_t src_off = (size_t)(l * n_tokens + done) * n_embd * src_elt;
+            const size_t dst_off = (size_t)l * width * n_embd * dst_elt;
+            ggml_tensor * src_view = ggml_view_1d(ctx.get(), src, n_embd * valid, src_off);
+            ggml_tensor * dst_view = ggml_view_1d(ctx.get(), dst, n_embd * valid, dst_off);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx.get(), src_view, dst_view));
+        }
+    } else {
+        for (int64_t i = 0; i < valid; ++i) {
+            const int64_t src_col = (int64_t)dfs_indices[(int64_t)done + i];
+            if (src_col < 0 || src_col >= n_tokens) {
+                return false;
+            }
+            for (int64_t l = 0; l < 5; ++l) {
+                const size_t src_off = (size_t)(l * n_tokens + src_col) * n_embd * src_elt;
+                const size_t dst_off = ((size_t)l * width + (size_t)i) * n_embd * dst_elt;
+                ggml_tensor * src_view = ggml_view_1d(ctx.get(), src, n_embd, src_off);
+                ggml_tensor * dst_view = ggml_view_1d(ctx.get(), dst, n_embd, dst_off);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx.get(), src_view, dst_view));
+            }
+        }
+    }
 
     return ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
 }
@@ -2318,7 +2387,8 @@ int llama_context::dflash_draft_update_fused_cache(
         copied += n_part;
     }
 
-    if (dflash_draft_update_kv_cache(nullptr, n_embd, n_new, first_pos, cap) != 0) {
+    if (dflash_draft_kv_cache_enabled() &&
+            dflash_draft_update_kv_cache(nullptr, n_embd, n_new, first_pos, cap) != 0) {
         LLAMA_LOG_ERROR("%s: failed to update draft K/V cache\n", __func__);
         return -3;
     }
@@ -2368,7 +2438,7 @@ int llama_context::dflash_draft_update_fused_cache_from_capture(
     while (done < n_dfs) {
         const int64_t dst_col = (first_pos + done) % cap;
         const int64_t valid = std::min<int64_t>({(int64_t)n_dfs - done, update_chunk, cap - dst_col});
-        const int64_t width = std::min<int64_t>(update_chunk, cap - dst_col);
+        const int64_t width = valid;
         if (valid <= 0 || width <= 0) {
             return -3;
         }
@@ -2380,40 +2450,42 @@ int llama_context::dflash_draft_update_fused_cache_from_capture(
             return -3;
         }
 
-        ggml_backend_tensor_set(dflash_packed_target_feat, zeros.data(), 0,
-                                (size_t)n_embd * 5 * width * sizeof(float));
+        if (width > valid) {
+            ggml_backend_tensor_set(dflash_packed_target_feat, zeros.data(), 0,
+                                    (size_t)n_embd * 5 * width * sizeof(float));
+        }
 
         if (dfs_indices == nullptr) {
-            for (int64_t l = 0; l < 5; ++l) {
-                const size_t src_off = (size_t)(l * n_tokens + done) * n_embd * sizeof(float);
-                const size_t dst_off = (size_t)l * width * n_embd * sizeof(float);
-                const size_t nbytes = (size_t)n_embd * valid * sizeof(float);
-                if (src_backend != nullptr && src_backend == dst_backend) {
-                    if (!dflash_graph_copy_1d(src_backend, t_cap, dflash_packed_target_feat,
-                                              n_embd * valid, src_off, dst_off)) {
-                        return -3;
-                    }
-                } else {
+            if (src_backend != nullptr && src_backend == dst_backend) {
+                if (!dflash_graph_pack_capture(src_backend, t_cap, dflash_packed_target_feat,
+                                               n_embd, n_tokens, nullptr, done, valid, width)) {
+                    return -3;
+                }
+            } else {
+                for (int64_t l = 0; l < 5; ++l) {
+                    const size_t src_off = (size_t)(l * n_tokens + done) * n_embd * sizeof(float);
+                    const size_t dst_off = (size_t)l * width * n_embd * sizeof(float);
+                    const size_t nbytes = (size_t)n_embd * valid * sizeof(float);
                     std::vector<float> layer_bounce((size_t)n_embd * valid);
                     ggml_backend_tensor_get(t_cap, layer_bounce.data(), src_off, nbytes);
                     ggml_backend_tensor_set(dflash_packed_target_feat, layer_bounce.data(), dst_off, nbytes);
                 }
             }
         } else {
-            for (int64_t i = 0; i < valid; ++i) {
-                const int64_t src_col = (int64_t)dfs_indices[done + i];
-                if (src_col < 0 || src_col >= n_tokens) {
-                    return -1;
+            if (src_backend != nullptr && src_backend == dst_backend) {
+                if (!dflash_graph_pack_capture(src_backend, t_cap, dflash_packed_target_feat,
+                                               n_embd, n_tokens, dfs_indices, done, valid, width)) {
+                    return -3;
                 }
-                for (int64_t l = 0; l < 5; ++l) {
-                    const size_t src_off = (size_t)(l * n_tokens + src_col) * n_embd * sizeof(float);
-                    const size_t dst_off = ((size_t)l * width + (size_t)i) * n_embd * sizeof(float);
-                    if (src_backend != nullptr && src_backend == dst_backend) {
-                        if (!dflash_graph_copy_1d(src_backend, t_cap, dflash_packed_target_feat,
-                                                  n_embd, src_off, dst_off)) {
-                            return -3;
-                        }
-                    } else {
+            } else {
+                for (int64_t i = 0; i < valid; ++i) {
+                    const int64_t src_col = (int64_t)dfs_indices[done + i];
+                    if (src_col < 0 || src_col >= n_tokens) {
+                        return -1;
+                    }
+                    for (int64_t l = 0; l < 5; ++l) {
+                        const size_t src_off = (size_t)(l * n_tokens + src_col) * n_embd * sizeof(float);
+                        const size_t dst_off = ((size_t)l * width + (size_t)i) * n_embd * sizeof(float);
                         ggml_backend_tensor_get(t_cap, bounce.data(), src_off, (size_t)n_embd * sizeof(float));
                         ggml_backend_tensor_set(dflash_packed_target_feat, bounce.data(), dst_off, (size_t)n_embd * sizeof(float));
                     }
@@ -2488,18 +2560,19 @@ int llama_context::dflash_draft_update_fused_cache_from_capture(
         ggml_backend_t cache_backend = dflash_tensor_backend(backends, dflash_fused_cache);
         if (fused_backend != nullptr && fused_backend == cache_backend) {
             if (!dflash_graph_copy_1d(fused_backend, t_fused, dflash_fused_cache,
-                                      n_embd * width, 0, (size_t)dst_col * n_embd * sizeof(float))) {
+                                      n_embd * valid, 0, (size_t)dst_col * n_embd * sizeof(float))) {
                 return -3;
             }
         } else {
-            std::vector<float> fused_bounce((size_t)n_embd * width);
-            ggml_backend_tensor_get(t_fused, fused_bounce.data(), 0, (size_t)n_embd * width * sizeof(float));
+            std::vector<float> fused_bounce((size_t)n_embd * valid);
+            ggml_backend_tensor_get(t_fused, fused_bounce.data(), 0, (size_t)n_embd * valid * sizeof(float));
             ggml_backend_tensor_set(dflash_fused_cache, fused_bounce.data(),
                                     (size_t)dst_col * n_embd * sizeof(float),
-                                    (size_t)n_embd * width * sizeof(float));
+                                    (size_t)n_embd * valid * sizeof(float));
         }
 
-        if (dflash_draft_update_kv_cache(nullptr, n_embd, width, first_pos + done, cap) != 0) {
+        if (dflash_draft_kv_cache_enabled() &&
+                dflash_draft_update_kv_cache(nullptr, n_embd, valid, first_pos + done, cap) != 0) {
             return -3;
         }
 
@@ -2688,11 +2761,21 @@ int llama_context::dflash_draft_encode_top_k_cached(
         copied += n_part;
     }
 
-    const int64_t n_embd_head = model.hparams.n_embd_head_k();
-    const int64_t n_head_kv   = model.hparams.n_head_kv();
-    if (dflash_draft_pack_kv_cache(n_embd_head, n_head_kv, ctx_len, ring_start, cap) != 0) {
-        LLAMA_LOG_ERROR("%s: failed to pack draft K/V cache\n", __func__);
-        return -3;
+    if (dflash_draft_kv_cache_enabled()) {
+        const int64_t n_embd_head = model.hparams.n_embd_head_k();
+        const int64_t n_head_kv   = model.hparams.n_head_kv();
+        if (dflash_draft_pack_kv_cache(n_embd_head, n_head_kv, ctx_len, ring_start, cap) != 0) {
+            LLAMA_LOG_ERROR("%s: failed to pack draft K/V cache\n", __func__);
+            return -3;
+        }
+    } else {
+        dflash_kv_packed_ctx.reset();
+        dflash_kv_packed_buf.reset();
+        dflash_k_packed_l.clear();
+        dflash_v_packed_l.clear();
+        dflash_kv_packed_head_dim = 0;
+        dflash_kv_packed_n_head_kv = 0;
+        dflash_kv_packed_ctx_len = 0;
     }
 
     pending_target_feat_raw       = nullptr;
@@ -3205,7 +3288,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && dflash_draft_top_k_req <= 0 &&
+                needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -3217,6 +3301,42 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
+        }
+
+        if (dflash_draft_top_k_req > 0 && res->get_dflash_top_ids() != nullptr) {
+            ggml_tensor * t_top_logits = res->get_dflash_top_logits();
+            ggml_tensor * t_top_ids    = res->get_dflash_top_ids();
+            ggml_backend_t backend_ids    = ggml_backend_sched_get_tensor_backend(sched.get(), t_top_ids);
+            ggml_backend_t backend_logits = t_top_logits != nullptr
+                ? ggml_backend_sched_get_tensor_backend(sched.get(), t_top_logits)
+                : nullptr;
+            GGML_ASSERT(backend_ids != nullptr);
+            GGML_ASSERT(t_top_logits == nullptr || backend_logits != nullptr);
+
+            const int64_t top_k = t_top_ids->ne[0];
+            const int64_t rows  = t_top_ids->ne[1];
+            GGML_ASSERT(t_top_logits == nullptr || (t_top_logits->ne[0] == top_k && t_top_logits->ne[1] == rows));
+            GGML_ASSERT(rows == n_outputs);
+
+            if (n_outputs_prev == 0) {
+                dflash_draft_top_k    = (int32_t) top_k;
+                dflash_draft_top_rows = (int32_t) n_outputs_all;
+                dflash_draft_top_logits.resize((size_t) top_k * n_outputs_all);
+                dflash_draft_top_token_ids.resize((size_t) top_k * n_outputs_all);
+            }
+
+            GGML_ASSERT(dflash_draft_top_k == (int32_t) top_k);
+            float * top_logits_out = dflash_draft_top_logits.data() + (size_t) top_k * n_outputs_prev;
+            llama_token * top_ids_out = dflash_draft_top_token_ids.data() + (size_t) top_k * n_outputs_prev;
+            if (t_top_logits != nullptr) {
+                ggml_backend_tensor_get_async(backend_logits, t_top_logits, top_logits_out, 0, ggml_nbytes(t_top_logits));
+            }
+            ggml_backend_tensor_get_async(backend_ids, t_top_ids, top_ids_out, 0, ggml_nbytes(t_top_ids));
+        } else if (dflash_draft_top_k_req > 0 && n_outputs_prev == 0) {
+            dflash_draft_top_k = 0;
+            dflash_draft_top_rows = 0;
+            dflash_draft_top_logits.clear();
+            dflash_draft_top_token_ids.clear();
         }
 
         if (capture_hidden && res->t_hidden_capture != nullptr) {

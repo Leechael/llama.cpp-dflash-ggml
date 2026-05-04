@@ -39,18 +39,18 @@ decode per generated token, then adds the draft pass. On the 30-prompt run the
 target AR cost is ~21.59 ms/token; exact-gated DDTree costs ~24.9 ms/token
 after draft overhead is amortized.
 
-For throughput experiments, the fast batched path with
-`LLAMA_DDTREE_TRUST_BATCHED=1` is not a correctness row:
+For throughput experiments, the unsafe fast batched path with
+`LLAMA_DDTREE_UNSAFE_TRUST_BATCHED=1` is not a correctness row:
 
 | dataset | AR tok/s | DFlash tok/s | AL | speedup | bit-equal |
 |---|---:|---:|---:|---:|---:|
-| HumanEval | 46.34 | 129.70 | 8.36 | 2.80x | 7/10 |
-| GSM8K | 46.31 | 105.65 | 6.44 | 2.28x | 1/10 |
-| Math500 | 46.32 | 119.01 | 7.44 | 2.57x | 3/10 |
+| HumanEval | 46.33 | 145.82 | 8.14 | 3.15x | 4/10 |
+| GSM8K | 46.31 | 120.68 | 6.57 | 2.61x | 2/10 |
+| Math500 | 46.31 | 131.32 | 7.20 | 2.84x | 5/10 |
 
-For performance experiments, `LLAMA_DDTREE_TRUST_BATCHED=1` restores the fast
-batched posterior behavior. Rows where `bit_equal` is not 10/10 must be treated
-as non-correctness-gated throughput rows, matching the limitation of the
+For performance experiments, `LLAMA_DDTREE_UNSAFE_TRUST_BATCHED=1` restores the
+fast batched posterior behavior. Rows where `bit_equal` is not 10/10 must be
+treated as non-correctness-gated throughput rows, matching the limitation of the
 standalone Python benchmark. `LLAMA_DDTREE_DIAG_BATCHED=1` restores the
 diagnostic batched+exact path.
 
