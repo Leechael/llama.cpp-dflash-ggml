@@ -16,25 +16,29 @@ Castle through `test-speculative-tree-e2e`.
 - Correctness gate: greedy token trajectory must be bit-equal between chain and
   spec output for every sample.
 
-Current status after the paper verifier fix: the default paper path keeps the
-batched posterior as a diagnostic candidate, then gates final acceptance through
-exact chain validation unless `LLAMA_DDTREE_TRUST_BATCHED=1` is set. This clears
-the bit-equal gate on the 30-prompt `gen=256` Castle run, but it is slower than
-AR because each DDTree step pays the exact validation/replay cost.
+Current status after the paper verifier fix: the default paper path does not
+trust q4 KV batched/tree logits. It skips the redundant tree verifier and gates
+final acceptance through exact one-token chain validation. This clears the
+bit-equal gate on the 30-prompt `gen=256` Castle run and is faster than the
+diagnostic batched+exact path, but it is still slower than AR because each
+DDTree step pays exact validation cost.
 
 Castle 4090 reference result, Qwen3.5-27B Q4_K_M target + DFlash draft,
 `n_gen=256`, 10 prompts per dataset:
 
 | dataset | AR tok/s | DFlash tok/s | AL | speedup | bit-equal |
 |---|---:|---:|---:|---:|---:|
-| HumanEval | 46.23 | 24.40 | 6.01 | 0.53x | 10/10 |
-| GSM8K | 46.21 | 22.61 | 4.95 | 0.49x | 10/10 |
-| Math500 | 46.23 | 23.66 | 5.61 | 0.51x | 10/10 |
+| HumanEval | 46.23 | 39.61 | 6.01 | 0.86x | 10/10 |
+| GSM8K | 46.21 | 39.34 | 4.95 | 0.85x | 10/10 |
+| Math500 | 46.23 | 39.24 | 5.61 | 0.85x | 10/10 |
 
 For performance experiments, `LLAMA_DDTREE_TRUST_BATCHED=1` restores the old
 fast batched posterior behavior, but q4 KV has known token-trajectory
 divergences on this benchmark and those rows must be treated as correctness
-failures.
+failures. `LLAMA_DDTREE_DIAG_BATCHED=1` restores the diagnostic
+batched+exact path. A single chain-batch exact gate was tested as a possible
+optimization, but q4 KV testing found it is not AR-equivalent and it must not
+be used for correctness rows.
 
 ## Metrics
 

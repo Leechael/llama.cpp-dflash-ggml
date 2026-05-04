@@ -136,6 +136,11 @@ static bool ddtree_trust_batched_posterior() {
     return e != nullptr && e[0] == '1';
 }
 
+static bool ddtree_diag_batched_enabled() {
+    const char * e = std::getenv("LLAMA_DDTREE_DIAG_BATCHED");
+    return e != nullptr && e[0] == '1';
+}
+
 static int64_t ddtree_target_feat_cap() {
     const char * e = std::getenv("LLAMA_DDTREE_TARGET_FEAT_CTX");
     if (!e || e[0] == '\0') {
@@ -622,8 +627,14 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     d->stats.n_tree_nodes_total += N;
     d->stats.max_tree_nodes = std::max(d->stats.max_tree_nodes, N);
 
-    const bool paper_verifier = ddtree_paper_verifier_enabled();
-    const bool fast_batched   = paper_verifier || ddtree_fast_batched_enabled();
+    const bool paper_verifier    = ddtree_paper_verifier_enabled();
+    const bool trust_batched     = ddtree_trust_batched_posterior();
+    const bool diag_batched      = ddtree_diag_batched_enabled();
+    // Q4 KV batched/tree logits are not AR-equivalent. In paper mode, keep the
+    // safe exact verifier as the default and only pay for tree decode when the
+    // caller explicitly opts into unsafe trust or diagnostic comparison.
+    const bool paper_needs_tree  = paper_verifier && (trust_batched || diag_batched);
+    const bool fast_batched      = paper_needs_tree || ddtree_fast_batched_enabled();
     const bool trace_batched  = std::getenv("LLAMA_DDTREE_TRACE") != nullptr ||
                                 std::getenv("LLAMA_DDTREE_TRACE_CHAIN_ROOT") != nullptr;
     const bool need_batched_tree = fast_batched || trace_batched;
@@ -657,7 +668,7 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
 
     const bool fast_rollback = fast_batched && (paper_verifier || ddtree_fast_rollback_enabled()) &&
                                !d->fast_rollback_unavailable;
-    const bool exact_gate_batched = paper_verifier && N > 1 && !ddtree_trust_batched_posterior();
+    const bool exact_gate_batched = paper_verifier && N > 1 && !trust_batched;
     const bool keep_snapshot = exact_gate_batched ||
                                (!paper_verifier &&
                                 (!fast_batched || !fast_rollback || ddtree_snapshot_fallback_enabled()));
