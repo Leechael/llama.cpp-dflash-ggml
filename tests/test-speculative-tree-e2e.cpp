@@ -105,6 +105,7 @@ static void usage(const char * prog) {
         "  --n-ctx N               (default 4096)\n"
         "  --n-batch N             (logical prompt batch; default min(n_ctx, 2048))\n"
         "  --n-ubatch N            (physical prompt batch; default 512)\n"
+        "  --prompt-chunk N        (prompt ingest chunk; default n_ubatch)\n"
         "  --no-flash-attn         (disable Flash Attention)\n"
         "\n"
         "Pass --temp 0 (greedy) to enable token-trajectory bit-equal assertion.\n",
@@ -427,6 +428,7 @@ int main(int argc, char ** argv) {
     int32_t     n_ctx         = 4096;
     int32_t     n_batch_arg   = 0;
     int32_t     n_ubatch_arg  = 512;
+    int32_t     prompt_chunk_arg = 0;
     float       temp          = 0.0f;
     std::string kv_type_str   = "f16"; // "f16", "q8_0", or "q4_0"
     bool        require_ddtree = false;
@@ -483,6 +485,8 @@ int main(int argc, char ** argv) {
             n_batch_arg = std::atoi(argv[++i]);
         } else if (arg == "--n-ubatch" && i + 1 < argc) {
             n_ubatch_arg = std::atoi(argv[++i]);
+        } else if (arg == "--prompt-chunk" && i + 1 < argc) {
+            prompt_chunk_arg = std::atoi(argv[++i]);
         } else if (arg == "--no-flash-attn") {
             no_flash_attn = true;
         } else if (arg == "--kv-type" && i + 1 < argc) {
@@ -581,7 +585,9 @@ int main(int argc, char ** argv) {
         if (no_flash_attn) {
             target_cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         }
-        const int32_t prompt_chunk = (int32_t)target_cparams.n_ubatch;
+        const int32_t prompt_chunk = prompt_chunk_arg > 0
+            ? std::min<int32_t>(prompt_chunk_arg, (int32_t)target_cparams.n_batch)
+            : (int32_t)target_cparams.n_ubatch;
 
         // Draft context: dflash-draft doesn't keep a prompt KV cache; it consumes
         // KV slots only for spec block decode (pos = committed_pos+i). A short

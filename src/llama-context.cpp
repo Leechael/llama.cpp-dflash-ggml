@@ -176,6 +176,12 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
+    if (const char * e = std::getenv("LLAMA_FUSED_GDN_AR")) {
+        cparams.fused_gdn_ar = std::atoi(e) != 0;
+    }
+    if (const char * e = std::getenv("LLAMA_FUSED_GDN_CH")) {
+        cparams.fused_gdn_ch = std::atoi(e) != 0;
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
