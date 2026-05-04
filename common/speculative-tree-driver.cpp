@@ -141,6 +141,11 @@ static bool ddtree_diag_batched_enabled() {
     return e != nullptr && e[0] == '1';
 }
 
+static bool ddtree_exact_ar_fallback_enabled() {
+    const char * e = std::getenv("LLAMA_DDTREE_EXACT_AR_FALLBACK");
+    return e == nullptr || e[0] != '0';
+}
+
 static int64_t ddtree_target_feat_cap() {
     const char * e = std::getenv("LLAMA_DDTREE_TARGET_FEAT_CTX");
     if (!e || e[0] == '\0') {
@@ -510,6 +515,55 @@ static bool validate_tree_with_chain(llama_speculative_tree_driver * d,
     return true;
 }
 
+static std::vector<llama_token> decode_exact_ar_fallback_step(
+        llama_speculative_tree_driver * d,
+        llama_token                     root_token,
+        llama_pos                       committed_pos,
+        ddtree_clock::time_point        t_step0) {
+    llama_memory_t mem = llama_get_memory(d->target_ctx);
+    if (!llama_memory_seq_rm(mem, /*seq_id=*/0, committed_pos, /*p1=*/-1)) {
+        LOG_ERR("%s: failed to clear target future range before AR fallback at pos %d\n",
+                __func__, (int)committed_pos);
+        return {};
+    }
+
+    llama_batch b = llama_batch_init(1, /*embd=*/0, /*n_seq_max=*/1);
+    b.n_tokens     = 1;
+    b.token[0]     = root_token;
+    b.pos[0]       = committed_pos;
+    b.n_seq_id[0]  = 1;
+    b.seq_id[0][0] = 0;
+    b.logits[0]    = 1;
+
+    const auto t_decode0 = ddtree_clock::now();
+    const int ret = llama_decode(d->target_ctx, b);
+    d->stats.t_exact_decode_ms += elapsed_ms(t_decode0);
+    d->stats.n_exact_validate_nodes++;
+    llama_batch_free(b);
+    if (ret != 0) {
+        LOG_ERR("%s: AR fallback llama_decode failed: %d\n", __func__, ret);
+        return {};
+    }
+
+    driver_ingest_capture(d, nullptr, 1, ingest_source::replay);
+
+    const auto t_sample0 = ddtree_clock::now();
+    const llama_token next_token = pick_current_logits(d, nullptr);
+    d->stats.t_exact_sample_ms += elapsed_ms(t_sample0);
+    if (next_token == LLAMA_TOKEN_NULL) {
+        LOG_ERR("%s: failed to pick AR fallback token\n", __func__);
+        return {};
+    }
+
+    d->stats.n_steps++;
+    d->stats.n_committed_tokens++;
+    d->stats.max_committed_tokens_per_step =
+        std::max(d->stats.max_committed_tokens_per_step, 1);
+    d->stats.t_step_ms += elapsed_ms(t_step0);
+
+    return { root_token, next_token };
+}
+
 static llama_token diagnose_chain_root_argmax(llama_speculative_tree_driver * d,
                                               llama_token root_token,
                                               llama_pos   committed_pos) {
@@ -565,6 +619,14 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
     const auto t_step0 = ddtree_clock::now();
 
     const int64_t n_vocab = d->n_vocab;
+
+    if (verify_cbs == nullptr &&
+            ddtree_paper_verifier_enabled() &&
+            !ddtree_trust_batched_posterior() &&
+            !ddtree_diag_batched_enabled() &&
+            ddtree_exact_ar_fallback_enabled()) {
+        return decode_exact_ar_fallback_step(d, root_token, committed_pos, t_step0);
+    }
 
     llama_speculative_draft_decode_info draft_info;
     llama_speculative_draft_target_feat_view target_feat_view {
