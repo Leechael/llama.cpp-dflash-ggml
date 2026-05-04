@@ -6,11 +6,11 @@
 #include <vector>
 
 struct llama_ddtree_params {
-    int   budget     = 22;    // total tree node count cap (including root)
+    int   budget     = 22;    // non-root tree node cap; flat tree has root + budget
     float temp       = 1.0f;  // temperature for log-prob computation
     bool  chain_seed = true;  // seed heap with greedy chain (recommended)
     int   block_size = 16;    // matches dflash draft block_size
-    int   top_k      = 0;     // 0 = auto (match DDTree budget, clamped to vocab)
+    int   top_k      = 0;     // 0 = auto (standalone-compatible: 8 when branching)
 };
 
 struct llama_ddtree_node {

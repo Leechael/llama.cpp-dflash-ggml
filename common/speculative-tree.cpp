@@ -23,8 +23,9 @@ llama_ddtree build_ddtree(
     // Node 0 is always the root (last committed token).
     tree.nodes.push_back({root_token, /*parent_idx*/ -1, /*depth*/ 0});
 
-    // budget = total node cap including root. budget=1 means root-only.
-    const int budget = (p.budget < 1) ? 1 : p.budget;
+    // Match standalone DFlash: --ddtree-budget counts non-root nodes, while
+    // flat tree storage also includes slot 0 = root.
+    const int budget = (p.budget < 0) ? 1 : p.budget + 1;
 
     if (budget <= 1 || L <= 0) {
         tree.visibility.assign(1, 1);
