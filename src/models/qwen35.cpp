@@ -139,9 +139,35 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     cur = build_lora_mm(model.output, cur);
 
     cb(cur, "result_output", -1);
-    res->t_logits = cur;
 
-    ggml_build_forward_expand(gf, cur);
+    if (dflash_draft_top_k > 0) {
+        const int top_k = std::min<int64_t>(dflash_draft_top_k, cur->ne[0]);
+
+        if (top_k == 1) {
+            ggml_tensor * top_ids = ggml_argmax(ctx0, cur);
+            top_ids = ggml_reshape_2d(ctx0, top_ids, 1, cur->ne[1]);
+            cb(top_ids, "dflash_target_argmax_ids", -1);
+
+            res->t_dflash_top_ids = top_ids;
+            ggml_build_forward_expand(gf, top_ids);
+        } else {
+            ggml_tensor * top_ids = ggml_top_k(ctx0, cur, top_k);
+            cb(top_ids, "dflash_target_top_ids", -1);
+
+            ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, cur, 1, cur->ne[0], cur->ne[1]);
+            ggml_tensor * top_logits  = ggml_get_rows(ctx0, logits_rows, top_ids);
+            top_logits = ggml_reshape_2d(ctx0, top_logits, top_k, cur->ne[1]);
+            cb(top_logits, "dflash_target_top_logits", -1);
+
+            res->t_dflash_top_ids    = top_ids;
+            res->t_dflash_top_logits = top_logits;
+            ggml_build_forward_expand(gf, top_ids);
+            ggml_build_forward_expand(gf, top_logits);
+        }
+    } else {
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_qkvz(

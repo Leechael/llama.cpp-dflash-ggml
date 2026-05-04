@@ -133,16 +133,6 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
             return false;
         }
 
-        const int64_t fused_n_embd = target_feat.n_embd_fc / 5;
-        {
-            const auto t0 = ddtree_draft_clock::now();
-            if (!ensure_fused_target_feat(target_feat, fused_n_embd)) {
-                info.t_draft_decode_ms += draft_elapsed_ms(t0);
-                return false;
-            }
-            info.t_draft_decode_ms += draft_elapsed_ms(t0);
-        }
-
         info.ctx_len = std::min(target_feat.n_committed, target_feat.cap);
         const int64_t ring_start = target_feat.n_committed - info.ctx_len;
 
@@ -168,6 +158,11 @@ class llama_speculative_llama_draft_backend final : public llama_speculative_dra
             draft_batch.logits    = logits.data();
             draft_batch.parent_id = nullptr;
 
+            const int64_t fused_n_embd = target_feat.n_embd_fc / 5;
+            if (!ensure_fused_target_feat(target_feat, fused_n_embd)) {
+                info.t_draft_decode_ms += draft_elapsed_ms(t0);
+                return false;
+            }
             const int ret = llama_dflash_draft_encode_top_k_cached(draft_ctx, draft_batch,
                                                                    fused_n_embd, info.ctx_len,
                                                                    ring_start, target_feat.cap,
