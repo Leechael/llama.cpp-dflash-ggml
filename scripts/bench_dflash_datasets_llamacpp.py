@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--n-ctx", type=int, default=4096)
     ap.add_argument("--n-batch", type=int, default=64)
     ap.add_argument("--n-ubatch", type=int, default=64)
+    ap.add_argument("--prompt-chunk", type=int, default=8)
     ap.add_argument("--kv-type", default="q8_0", choices=["f16", "q8_0", "q4_0"])
     ap.add_argument("--timeout-sec", type=int, default=900)
     ap.add_argument("--skip-longer-than", type=int, default=3500)
@@ -193,6 +194,7 @@ def run_one(args: argparse.Namespace, out_dir: Path, bench: Bench, idx: int, pro
         "--n-ctx", str(args.n_ctx),
         "--n-batch", str(args.n_batch),
         "--n-ubatch", str(args.n_ubatch),
+        "--prompt-chunk", str(args.prompt_chunk),
         "--kv-type", args.kv_type,
     ]
     env = os.environ.copy()
@@ -250,6 +252,7 @@ def write_outputs(out_dir: Path, rows: list[dict], args: argparse.Namespace) -> 
         f"- budget/top_k: {args.budget}/{args.top_k}",
         f"- verifier: {args.verifier}",
         f"- ctx/batch/ubatch: {args.n_ctx}/{args.n_batch}/{args.n_ubatch}",
+        f"- prompt_chunk: {args.prompt_chunk}",
         f"- kv: {args.kv_type}",
         "",
         "| dataset | n | AR tok/s | DFlash tok/s | AL | speedup | bit-equal |",

@@ -12,7 +12,7 @@ Castle through `test-speculative-tree-e2e`.
 - Generation: greedy, `n_gen=256`.
 - Primary Python-compatible config: `budget=22` non-root DDTree nodes,
   `top_k=0` (auto => K=8 when branching), `proposal_temp=1`,
-  `target_feat_ctx=2048`, `q8_0` KV.
+  `target_feat_ctx=2048`, `q8_0` KV, `prompt_chunk=8`.
 - Harness: `build-server/bin/test-speculative-tree-e2e`.
 - Correctness gate: greedy token trajectory must be bit-equal between chain and
   spec output for every sample.
@@ -47,6 +47,16 @@ For throughput experiments, the unsafe fast batched path with
 | HumanEval | 46.33 | 145.82 | 8.14 | 3.15x | 4/10 |
 | GSM8K | 46.31 | 120.68 | 6.57 | 2.61x | 2/10 |
 | Math500 | 46.31 | 131.32 | 7.20 | 2.84x | 5/10 |
+
+After separating prompt ingest chunking from runtime `n_ubatch`, the
+`q8_0` run should use `--prompt-chunk 8` to keep prompt prefill AR-equivalent
+while preserving `n_batch/n_ubatch=64` for tree verify. Castle 4090 result:
+
+| dataset | AR tok/s | DFlash tok/s | AL | speedup | bit-equal |
+|---|---:|---:|---:|---:|---:|
+| HumanEval | 46.38 | 155.64 | 8.82 | 3.36x | 6/10 |
+| GSM8K | 46.38 | 125.39 | 6.91 | 2.70x | 3/10 |
+| Math500 | 46.38 | 129.60 | 7.15 | 2.79x | 5/10 |
 
 For performance experiments, `LLAMA_DDTREE_UNSAFE_TRUST_BATCHED=1` restores the
 fast batched posterior behavior. Rows where `bit_equal` is not 10/10 must be
