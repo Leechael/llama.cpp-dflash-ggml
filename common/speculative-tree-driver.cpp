@@ -131,6 +131,11 @@ static bool ddtree_capture_direct_enabled() {
     return e != nullptr && e[0] == '1';
 }
 
+static bool ddtree_trust_batched_posterior() {
+    const char * e = std::getenv("LLAMA_DDTREE_TRUST_BATCHED");
+    return e != nullptr && e[0] == '1';
+}
+
 static int64_t ddtree_target_feat_cap() {
     const char * e = std::getenv("LLAMA_DDTREE_TARGET_FEAT_CTX");
     if (!e || e[0] == '\0') {
@@ -652,8 +657,10 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
 
     const bool fast_rollback = fast_batched && (paper_verifier || ddtree_fast_rollback_enabled()) &&
                                !d->fast_rollback_unavailable;
-    const bool keep_snapshot = !paper_verifier &&
-                               (!fast_batched || !fast_rollback || ddtree_snapshot_fallback_enabled());
+    const bool exact_gate_batched = paper_verifier && N > 1 && !ddtree_trust_batched_posterior();
+    const bool keep_snapshot = exact_gate_batched ||
+                               (!paper_verifier &&
+                                (!fast_batched || !fast_rollback || ddtree_snapshot_fallback_enabled()));
 
     // ── Step 6: snapshot before target verify ────────────────────────────────
     // By default fast-rollback mode still keeps a snapshot as a safety net.
@@ -794,11 +801,47 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
             next_token   = batched_next_token;
         }
 
+        bool did_commit_state = false;
+        if (exact_gate_batched && verify_cbs == nullptr) {
+            if (snap == LLAMA_MEM_SNAPSHOT_INVALID || !llama_seq_restore(d->target_ctx, snap)) {
+                LOG_ERR("%s: exact gate failed to restore snapshot before chain validation\n", __func__);
+                release_snap();
+                return {};
+            }
+            d->stats.n_snapshot_replays++;
+
+            std::vector<int32_t> exact_accepted_dfs;
+            llama_token exact_next_token = LLAMA_TOKEN_NULL;
+            {
+                const auto t0 = ddtree_clock::now();
+                if (!validate_tree_with_chain(d, tree, committed_pos, verify_cbs,
+                                              exact_accepted_dfs, exact_next_token)) {
+                    release_snap();
+                    return {};
+                }
+                d->stats.t_exact_validate_ms += elapsed_ms(t0);
+            }
+
+            if (batched_accepted_dfs == exact_accepted_dfs && batched_next_token == exact_next_token) {
+                d->stats.n_batched_exact_same++;
+            } else {
+                d->stats.n_batched_exact_diff++;
+            }
+            if (batched_commit_n > (int)exact_accepted_dfs.size()) {
+                d->stats.n_batched_exact_longer++;
+            } else if (batched_commit_n < (int)exact_accepted_dfs.size()) {
+                d->stats.n_batched_exact_shorter++;
+            }
+
+            accepted_dfs = std::move(exact_accepted_dfs);
+            next_token   = exact_next_token;
+            did_commit_state = true;
+        }
+
         const int accept_depth = (int)accepted_dfs.size(); // includes root node (index 0)
         const int commit_n     = accept_depth;
 
-        bool did_commit_state = false;
-        if (fast_rollback && N > 1) {
+        if (!did_commit_state && fast_rollback && N > 1) {
             {
                 const auto t0 = ddtree_clock::now();
                 llama_kv_cache_seq_compact_tree(
@@ -864,7 +907,7 @@ std::vector<llama_token> llama_speculative_tree_driver_step(
                 }
                 d->stats.t_replay_ms += elapsed_ms(t0);
             }
-        } else {
+        } else if (!did_commit_state) {
             // Root-only verify is already a normal one-token forward. Keep its
             // live target state and ingest its hidden capture for the next draft.
             driver_ingest_capture(d, nullptr, commit_n, ingest_source::replay);
