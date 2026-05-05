@@ -58,6 +58,54 @@ while preserving `n_batch/n_ubatch=64` for tree verify. Castle 4090 result:
 | GSM8K | 46.38 | 125.39 | 6.91 | 2.70x | 3/10 |
 | Math500 | 46.38 | 129.60 | 7.15 | 2.79x | 5/10 |
 
+The matching Python standalone reference run
+`/tmp/dflash_python_bitequal_gen256_b22_q8/results.json` reported:
+
+| dataset | AR tok/s | DFlash tok/s | AL | bit-equal |
+|---|---:|---:|---:|---:|
+| HumanEval | 42.59 | 146.30 | 8.01 | 3/10 |
+| GSM8K | 42.56 | 126.55 | 6.89 | 3/10 |
+| Math500 | 42.58 | 131.34 | 7.12 | 3/10 |
+
+Under the same non-correctness-gated comparison, llama.cpp is now close to the
+Python implementation: GSM8K and Math500 are within roughly 1-2%, and HumanEval
+is faster but has a different bit-equal pass count. This is not a 10/10
+correctness row; it is the apples-to-apples comparison with the Python fast
+batched condition.
+
+## Megakernel-style optimization notes
+
+The existing `repo/megakernel` implementation is a Qwen3.5-0.8B BF16,
+batch-size-1 autoregressive decode proof of concept. It is not directly
+integrable into the current Qwen3.5-27B Q4_K_M DDTree target-tree verifier.
+The useful idea to borrow is to reduce graph/kernel boundaries and redundant
+state traffic in the target tree path.
+
+Two low-risk changes were applied on 2026-05-05:
+
+- `11a119d77 Skip Qwen35 tree live state writes`: in tree mode with persist
+  rollback available, skip writing live recurrent state that will be overwritten
+  by rollback.
+- `4f6760fe5 Skip read-only recurrent state maintenance in Qwen35 tree`: skip
+  recurrent zero/copy-extra maintenance for read-only tree state loads.
+
+Castle single-prompt GSM-style smoke, Qwen3.5-27B Q4_K_M target + DFlash draft,
+`gen=128`, `budget=22`, `q8_0`, `prompt_chunk=8`, `n_batch=n_ubatch=64`:
+
+| variant | graph nodes | cpy ops | target_tree avg | bit-equal |
+|---|---:|---:|---:|---:|
+| before skip-live | 3671 | 193 | 36.78 ms | pass |
+| skip live writes | 3383 | 97 | 36.43 ms | pass |
+| read-only recurrent state | 2902 | 1 | 36.36 ms | pass |
+
+This confirms the redundant-state path exists, but it is not the main runtime
+bottleneck. The remaining tree graph still has about 497 `mul_mat`, 48
+`gated_delta_net`, 48 `ssm_conv`, and 16 attention ops for a 23-node tree.
+The next meaningful megakernel-style step is a larger recurrent-layer fusion,
+for example combining tree conv, SiLU, q/k/v normalization, gated delta net,
+and persist writes behind one Qwen35 tree op. Further small graph-maintenance
+cleanup is unlikely to produce a large speedup.
+
 For performance experiments, `LLAMA_DDTREE_UNSAFE_TRUST_BATCHED=1` restores the
 fast batched posterior behavior. Rows where `bit_equal` is not 10/10 must be
 treated as non-correctness-gated throughput rows, matching the limitation of the
