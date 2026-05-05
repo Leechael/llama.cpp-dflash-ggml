@@ -91,6 +91,12 @@ struct llama_context {
     const llama_token * get_sampled_candidates_ith(int32_t idx);
     size_t get_sampled_candidates_count(int32_t idx);
 
+    bool get_dflash_draft_top_k(
+            const float **       top_logits,
+            const llama_token ** top_token_ids,
+            int32_t *            n_rows,
+            int32_t *            k);
+
     void attach_threadpool(
             ggml_threadpool_t threadpool,
             ggml_threadpool_t threadpool_batch);
@@ -104,6 +110,92 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+
+    // dflash hidden capture API
+    void          set_capture_hidden(bool enable);
+    ggml_tensor * get_hidden_capture() const;
+    void          set_dflash_draft_top_k(int32_t k);
+
+    // dflash Phase 2.4: persist-based SSM rollback.
+    // Copies the SSM state stored in dflash_persist_inter_l[il] at DFS column
+    // accepted_dfs_node back into the live s_l[il] tensor at the seq's tail cell.
+    // Returns false if the context has no recurrent memory or buffers are unallocated.
+    bool dflash_rollback_ssm_to_dfs(llama_seq_id seq_id, int32_t accepted_dfs_node);
+
+    // Host-side accessor: returns pointer into hidden_capture_host (always CPU).
+    // Returns nullptr if capture is disabled or no decode has run.
+    const float * get_hidden_capture_data(int64_t * out_ne0, int64_t * out_ne1) const;
+
+    // dflash draft target_feat injection API (Task 1).
+    // Stashes host pointer + dims so the next llama_decode() on this draft context
+    // can copy the data into the dflash_target_feat_raw GGML input tensor.
+    // committed_pos is the number of tokens committed in the target context so far.
+    void set_target_feat_raw(const float * data, int64_t n_embd_fc, int64_t ctx_len,
+                             int64_t committed_pos);
+    void set_target_feat_fused(const float * data, int64_t n_embd, int64_t ctx_len,
+                               int64_t committed_pos);
+    int dflash_draft_fuse_target_feat(const float * target_feat_raw,
+                                      int64_t       n_embd_fc,
+                                      int64_t       ctx_len,
+                                      float *       target_feat_fused);
+    int dflash_draft_update_fused_cache(const float * target_feat_raw,
+                                        int64_t       n_embd_fc,
+                                        int64_t       n_new,
+                                        int64_t       first_pos,
+                                        int64_t       cap);
+    int dflash_draft_update_fused_cache_from_capture(llama_context * target_ctx,
+                                                     const int32_t * dfs_indices,
+                                                     int32_t         n_dfs,
+                                                     int64_t         first_pos,
+                                                     int64_t         cap);
+    int dflash_draft_encode_top_k_cached(const llama_batch & batch_inp,
+                                         int64_t             n_embd,
+                                         int64_t             ctx_len,
+                                         int64_t             ring_start,
+                                         int64_t             cap,
+                                         int64_t             committed_pos,
+                                         int32_t             top_k);
+    bool dflash_draft_ensure_fused_cache_tensor(int64_t                    n_embd,
+                                                int64_t                    cap,
+                                                ggml_backend_buffer_type_t buft);
+    bool dflash_draft_ensure_packed_target_feat_tensor(int64_t                    n_embd,
+                                                       int64_t                    ctx_len,
+                                                       ggml_backend_buffer_type_t buft);
+    bool dflash_draft_ensure_kv_cache_tensors(int64_t                    n_embd_head,
+                                              int64_t                    n_head_kv,
+                                              int64_t                    cap,
+                                              ggml_backend_buffer_type_t buft);
+    bool dflash_draft_ensure_packed_kv_tensors(int64_t                    n_embd_head,
+                                               int64_t                    n_head_kv,
+                                               int64_t                    ctx_len,
+                                               ggml_backend_buffer_type_t buft);
+    bool dflash_draft_ensure_top_output_tensors(int64_t                    top_k,
+                                                int64_t                    rows,
+                                                ggml_backend_buffer_type_t buft);
+    int dflash_draft_update_kv_cache(const float * target_feat_fused,
+                                     int64_t       n_embd,
+                                     int64_t       n_new,
+                                     int64_t       first_pos,
+                                     int64_t       cap);
+    int dflash_draft_pack_kv_cache(int64_t n_embd_head,
+                                   int64_t n_head_kv,
+                                   int64_t ctx_len,
+                                   int64_t ring_start,
+                                   int64_t cap);
+    int dflash_draft_encode_top_k(const llama_batch & batch_inp,
+                                  const float *       target_feat_raw,
+                                  int64_t             n_embd_fc,
+                                  int64_t             ctx_len,
+                                  int64_t             committed_pos,
+                                  int32_t             top_k);
+    int dflash_draft_encode_top_k_fused(const llama_batch & batch_inp,
+                                        const float *       target_feat_fused,
+                                        int64_t             n_embd,
+                                        int64_t             ctx_len,
+                                        int64_t             committed_pos,
+                                        int32_t             top_k);
+    int dflash_draft_encode_top_k_pending(const llama_batch & batch_inp,
+                                          int32_t             top_k);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -227,6 +319,7 @@ public:
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_backend_sched_t sched_use, ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -234,12 +327,16 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // Ensure the DDTree persist buffers can hold n_tokens columns; reallocates if needed.
+    void ensure_dflash_persist_capacity(int64_t n_tokens);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                  ggml_backend_sched_t      sched_use = nullptr) const;
 
     llm_graph_cb graph_get_cb() const;
 
@@ -291,6 +388,12 @@ private:
 
     sampling_info sampling;
 
+    int32_t                  dflash_draft_top_k_req = 0;
+    std::vector<float>       dflash_draft_top_logits;
+    std::vector<llama_token> dflash_draft_top_token_ids;
+    int32_t                  dflash_draft_top_rows = 0;
+    int32_t                  dflash_draft_top_k    = 0;
+
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
@@ -334,11 +437,103 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+    llm_graph_result_ptr dflash_res_fuse;
+    llm_graph_result_ptr dflash_res_kv;
+    llm_graph_result_ptr dflash_res_draft;
+    ggml_backend_sched_ptr dflash_sched_fuse;
+    ggml_backend_sched_ptr dflash_sched_kv;
+    ggml_backend_sched_ptr dflash_sched_draft;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
     bool has_evaluated_once = false;
+
+    // dflash hidden capture: when true, qwen35 forward writes captured hidden states
+    // into a graph output tensor; accessible via get_hidden_capture() after decode.
+    bool capture_hidden = false;
+
+    // dflash Phase 2.4: per-layer SSM intermediate-state persist buffers.
+    // Allocated on first tree-mode decode; one tensor per delta-net layer (nullptr for
+    // full-attn layers). Shape: [S_v, S_v, H_v, n_tokens] F16, contiguous.
+    // After tree verify, llama_dflash_rollback_ssm_to_dfs() copies column[accepted_dfs_node]
+    // back into the live SSM state, replacing the snapshot/restore/replay path.
+    std::vector<ggml_tensor *>  dflash_persist_inter_l;   // [n_layer], nullptr for non-recurrent
+    ggml_context_ptr            dflash_persist_inter_ctx;  // ggml context owning the tensors
+    ggml_backend_buffer_ptr     dflash_persist_inter_buf;  // backend buffer owning the data
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>>
+                                dflash_persist_ctxs_bufs; // per backend buffer type for mixed CPU/GPU offload
+    int64_t                     dflash_persist_max_n_tokens = 0; // current capacity
+    int64_t                     dflash_persist_failed_n_tokens = 0; // suppress repeated OOM retries
+
+    // dflash Phase 5 fix: per-token conv post-state persist buffer used by
+    // ggml_ssm_conv_tree_persist. One tensor per delta-net layer; shape
+    // [K_conv-1, conv_channels, n_tokens] F32. Read by dflash_rollback_ssm_to_dfs
+    // to roll the live conv state (r_l[il]) back to the accepted DFS node.
+    std::vector<ggml_tensor *>  dflash_persist_conv_l;     // [n_layer], nullptr for non-recurrent
+
+    // Returns the per-layer SSM/conv persist tensors for layer il, or nullptr if not
+    // a recurrent layer or the buffers have not yet been allocated.
+    ggml_tensor * dflash_get_persist_inter(int32_t il) const;
+    ggml_tensor * dflash_get_persist_conv (int32_t il) const;
+
+    // host-side mirror of t_hidden_capture, populated via ggml_backend_tensor_get_async
+    // after each decode. get_hidden_capture_data() returns into this buffer so callers
+    // don't dereference device pointers.
+    mutable std::vector<float> hidden_capture_host;
+    mutable int64_t            hidden_capture_ne0 = 0;
+    mutable int64_t            hidden_capture_ne1 = 0;
+    mutable bool               hidden_capture_host_valid = false;
+
+    // dflash draft target_feat injection: stashed by llama_set_target_feat_raw() before
+    // llama_decode() on the draft context. The dflash-draft graph input reads from these
+    // fields in set_input() and copies them into the host-pinned GGML input tensors.
+    // Non-owning pointer — caller (speculative-tree-driver) owns the lifetime.
+    // Mutable so graph_params() (a const method) can take their address for the param struct.
+    mutable const float * pending_target_feat_raw      = nullptr;
+    mutable int64_t       pending_target_feat_n_embd_fc = 0;
+    mutable int64_t       pending_target_feat_ctx_len   = 0;
+    mutable int64_t       pending_draft_committed_pos   = 0;
+    mutable bool          pending_target_feat_fused     = false;
+    mutable bool          pending_dflash_fuse_only      = false;
+    mutable bool          pending_dflash_kv_update_only = false;
+    mutable int64_t       pending_dflash_kv_update_dst_pos = 0;
+    mutable ggml_tensor * pending_target_feat_tensor    = nullptr;
+
+    ggml_context_ptr        dflash_fused_cache_ctx;
+    ggml_backend_buffer_ptr dflash_fused_cache_buf;
+    ggml_tensor *           dflash_fused_cache = nullptr;
+    int64_t                 dflash_fused_cache_n_embd = 0;
+    int64_t                 dflash_fused_cache_cap = 0;
+
+    ggml_context_ptr        dflash_packed_target_feat_ctx;
+    ggml_backend_buffer_ptr dflash_packed_target_feat_buf;
+    ggml_tensor *           dflash_packed_target_feat = nullptr;
+    int64_t                 dflash_packed_target_feat_n_embd = 0;
+    int64_t                 dflash_packed_target_feat_ctx_len = 0;
+
+    ggml_context_ptr        dflash_kv_cache_ctx;
+    ggml_backend_buffer_ptr dflash_kv_cache_buf;
+    std::vector<ggml_tensor *> dflash_k_cache_l;
+    std::vector<ggml_tensor *> dflash_v_cache_l;
+    int64_t                 dflash_kv_cache_head_dim = 0;
+    int64_t                 dflash_kv_cache_n_head_kv = 0;
+    int64_t                 dflash_kv_cache_cap = 0;
+
+    ggml_context_ptr        dflash_kv_packed_ctx;
+    ggml_backend_buffer_ptr dflash_kv_packed_buf;
+    std::vector<ggml_tensor *> dflash_k_packed_l;
+    std::vector<ggml_tensor *> dflash_v_packed_l;
+    int64_t                 dflash_kv_packed_head_dim = 0;
+    int64_t                 dflash_kv_packed_n_head_kv = 0;
+    int64_t                 dflash_kv_packed_ctx_len = 0;
+
+    ggml_context_ptr        dflash_top_output_ctx;
+    ggml_backend_buffer_ptr dflash_top_output_buf;
+    ggml_tensor *           dflash_top_logits_fixed = nullptr;
+    ggml_tensor *           dflash_top_ids_fixed = nullptr;
+    int64_t                 dflash_top_output_k = 0;
+    int64_t                 dflash_top_output_rows = 0;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

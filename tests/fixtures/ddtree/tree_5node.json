@@ -1,0 +1,11 @@
+{
+  "committed_offset": 0,
+  "comment": "Phase 1 fixture. 5 nodes: 1 root + 4 verify nodes. Mix of chain + 1 sibling for branching coverage. Token IDs are placeholders in the Qwen3.5 mid-range vocab; real test runs may regenerate via make_short_prompt.py with actual sampled tokens.",
+  "nodes": [
+    { "flat_idx": 0, "token_id": 13374, "parent_idx": -1, "depth": 0 },
+    { "flat_idx": 1, "token_id":  7922, "parent_idx":  0, "depth": 1 },
+    { "flat_idx": 2, "token_id": 42073, "parent_idx":  1, "depth": 2 },
+    { "flat_idx": 3, "token_id": 18435, "parent_idx":  1, "depth": 2 },
+    { "flat_idx": 4, "token_id": 30722, "parent_idx":  2, "depth": 3 }
+  ]
+}

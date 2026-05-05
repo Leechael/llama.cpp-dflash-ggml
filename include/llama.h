@@ -48,6 +48,8 @@
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 #define LLAMA_STATE_SEQ_VERSION 2
 
+#define LLAMA_MEM_SNAPSHOT_INVALID -1
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -68,6 +70,9 @@ extern "C" {
     typedef int32_t llama_pos;
     typedef int32_t llama_token;
     typedef int32_t llama_seq_id;
+
+    // opaque handle returned by llama_seq_snapshot / used by llama_seq_restore and llama_seq_release
+    typedef int32_t llama_mem_snapshot_id;
 
     enum llama_vocab_type {
         LLAMA_VOCAB_TYPE_NONE   = 0, // For models without vocab
@@ -241,6 +246,10 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+
+        // tree-mode parent indices: parent_id[i] is the index of token i's parent in the batch
+        // -1 means root (no parent). NULL means chain mode (default behavior unchanged).
+        int32_t      *  parent_id;
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -289,6 +298,9 @@ extern "C" {
 
         // NULL-terminated list of buffer types to use for tensors that match a pattern
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
+
+        // optional target model for auxiliary models that share target tensors
+        const struct llama_model * target_model;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
@@ -642,6 +654,16 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    // Copy one token-embedding row from model->tok_embd into caller-supplied buffer.
+    // out_n must be >= model->hparams.n_embd. The embedding is returned as F32
+    // regardless of the on-disk storage type (conversion happens on the backend).
+    // Returns 0 on success, -1 if token is out of range or tok_embd is unavailable.
+    LLAMA_API int llama_model_token_embd_lookup(
+            const struct llama_model * model,
+            llama_token                token,
+            float                    * out,
+            int64_t                    out_n);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,
@@ -780,6 +802,28 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    // Snapshot/restore the recurrent state (SSM + conv) for seq_id.
+    // snapshot() allocates per-layer backup buffers and copies the current state into them.
+    // restore() copies the backed-up state back; release() frees the backup buffers.
+    // These are no-ops on non-recurrent memory types (returns LLAMA_MEM_SNAPSHOT_INVALID).
+    // The caller is responsible for calling release() after each snapshot.
+    LLAMA_API llama_mem_snapshot_id llama_seq_snapshot(struct llama_context * ctx, llama_seq_id seq_id);
+    LLAMA_API bool                  llama_seq_restore (struct llama_context * ctx, llama_mem_snapshot_id snap_id);
+    LLAMA_API void                  llama_seq_release (struct llama_context * ctx, llama_mem_snapshot_id snap_id);
+
+    // Compact the KV cache after a tree-verify forward pass.
+    // The tree was placed at slots [spine_start, spine_start+N); after this call
+    // the accepted spine occupies slots [spine_start, spine_start+commit_n) in
+    // DFS order, and prompt cells (slots < spine_start) are untouched.
+    // No-op on non-KV memory types (e.g. pure SSM models).
+    LLAMA_API void llama_kv_cache_seq_compact_tree(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            const int32_t        * accepted_dfs,
+            int32_t                n_accepted,
+            int32_t                commit_n,
+            int32_t                spine_start);
 
     //
     // State / sessions
@@ -932,7 +976,14 @@ extern "C" {
             int32_t embd,
             int32_t n_seq_max);
 
-    // Frees a batch of tokens allocated with llama_batch_init()
+    // Like llama_batch_init but also allocates parent_id[n_tokens], filled with -1 (tree roots).
+    // Callers must free with llama_batch_free().
+    LLAMA_API struct llama_batch llama_batch_init_tree(
+            int32_t n_tokens,
+            int32_t embd,
+            int32_t n_seq_max);
+
+    // Frees a batch of tokens allocated with llama_batch_init() or llama_batch_init_tree()
     LLAMA_API void llama_batch_free(struct llama_batch batch);
 
     // Process a batch of tokens.
@@ -983,6 +1034,107 @@ extern "C" {
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+
+    // dflash hidden capture: when enabled, qwen35 forward writes per-layer hidden states
+    // for the 5 dflash target capture layers into an output tensor readable via
+    // llama_get_hidden_capture() after llama_decode(). Toggling this triggers a graph
+    // reserve. If disabled (default), behavior is byte-for-byte identical to baseline.
+    LLAMA_API void           llama_set_capture_hidden(struct llama_context * ctx, bool enable);
+    LLAMA_API struct ggml_tensor * llama_get_hidden_capture(struct llama_context * ctx);
+
+    // Host-side accessor: returns a pointer into a context-owned CPU buffer.
+    // The device-side capture tensor is synchronized lazily only when this is called.
+    // Returns NULL when capture is disabled or no decode has run yet.
+    // out_ne0 / out_ne1 receive the tensor dimensions.
+    LLAMA_API const float * llama_get_hidden_capture_data(struct llama_context * ctx,
+                                                          int64_t * out_ne0,
+                                                          int64_t * out_ne1);
+
+    // dflash draft target_feat injection (Task 1 Phase 4 gap fix).
+    LLAMA_API void llama_set_dflash_draft_top_k(struct llama_context * ctx, int32_t k);
+
+    // Must be called on the draft context before llama_decode() when running a
+    // dflash-draft (LLM_ARCH_DFLASH_DRAFT) model. The driver supplies a packed
+    // [5*n_embd, ctx_len] F32 host buffer with per-layer hidden captures from the
+    // target model. committed_pos is the number of tokens already committed in the
+    // target context; it drives the RoPE position indices for Q and K in the draft.
+    // The data pointer is non-owning; it must remain valid until llama_decode() returns.
+    LLAMA_API void llama_set_target_feat_raw(struct llama_context * ctx,
+                                             const float           * data,
+                                             int64_t                 n_embd_fc,
+                                             int64_t                 ctx_len,
+                                             int64_t                 committed_pos);
+
+    LLAMA_API int llama_dflash_draft_fuse_target_feat(struct llama_context * ctx,
+                                                      const float          * target_feat_raw,
+                                                      int64_t                n_embd_fc,
+                                                      int64_t                ctx_len,
+                                                      float                * target_feat_fused);
+
+    LLAMA_API int llama_dflash_draft_encode_top_k(struct llama_context * ctx,
+                                                  struct llama_batch     batch,
+                                                  const float          * target_feat_raw,
+                                                  int64_t                n_embd_fc,
+                                                  int64_t                ctx_len,
+                                                  int64_t                committed_pos,
+                                                  int32_t                top_k);
+
+    LLAMA_API int llama_dflash_draft_encode_top_k_fused(struct llama_context * ctx,
+                                                        struct llama_batch     batch,
+                                                        const float          * target_feat_fused,
+                                                        int64_t                n_embd,
+                                                        int64_t                ctx_len,
+                                                        int64_t                committed_pos,
+                                                        int32_t                top_k);
+
+    LLAMA_API int llama_dflash_draft_update_fused_cache(struct llama_context * ctx,
+                                                        const float          * target_feat_raw,
+                                                        int64_t                n_embd_fc,
+                                                        int64_t                n_new,
+                                                        int64_t                first_pos,
+                                                        int64_t                cap);
+
+    LLAMA_API int llama_dflash_draft_update_fused_cache_from_capture(struct llama_context * draft_ctx,
+                                                                     struct llama_context * target_ctx,
+                                                                     const int32_t        * dfs_indices,
+                                                                     int32_t                n_dfs,
+                                                                     int64_t                first_pos,
+                                                                     int64_t                cap);
+
+    LLAMA_API int llama_dflash_draft_encode_top_k_cached(struct llama_context * ctx,
+                                                         struct llama_batch     batch,
+                                                         int64_t                n_embd,
+                                                         int64_t                ctx_len,
+                                                         int64_t                ring_start,
+                                                         int64_t                cap,
+                                                         int64_t                committed_pos,
+                                                         int32_t                top_k);
+
+    // dflash Phase 2.4: persist-based SSM rollback after tree verify.
+    LLAMA_API void llama_dflash_ensure_persist_capacity(
+            struct llama_context * ctx,
+            int64_t                n_tokens);
+
+    // After llama_kv_cache_seq_compact_tree(), call this to copy the SSM state
+    // captured at DFS node accepted_dfs_node from the persist buffer back into
+    // the live recurrent cache for seq_id, replacing the snapshot/restore/replay path.
+    // Must be called after the tree-mode llama_decode() and before the next decode.
+    // Returns true on success, false if persist buffers are unavailable.
+    // KNOWN LIMITATION: conv state is NOT rolled back (see Phase 2.4 Task 4 — option b).
+    // Conv-state divergence decays within ~K_conv tokens; the chain-vs-spec test may
+    // diverge by a few tokens at each tree boundary before reconverging.
+    LLAMA_API bool llama_dflash_rollback_ssm_to_dfs(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            int32_t                accepted_dfs_node);
+
+    // After persist-based rollback, adjust the recurrent cache bookkeeping so
+    // seq_pos_max() reflects the accepted chain position rather than the DFS
+    // tree position left by the tree-mode forward.
+    LLAMA_API bool llama_dflash_set_recurrent_tail_pos(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_pos              pos);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
@@ -1053,6 +1205,15 @@ extern "C" {
     // Returns NULL if no candidates were sampled.
     LLAMA_API llama_token * llama_get_sampled_candidates_ith      (struct llama_context * ctx, int32_t i);
     LLAMA_API uint32_t      llama_get_sampled_candidates_count_ith(struct llama_context * ctx, int32_t i);
+
+    // DFlash draft graph top-K tensors. Returns false when the last eval was not a
+    // dflash-draft graph with top-K output. Layout is row-major [n_rows, k].
+    LLAMA_API bool llama_get_dflash_draft_top_k(
+            struct llama_context * ctx,
+            const float **         logits,
+            const llama_token **   token_ids,
+            int32_t *              n_rows,
+            int32_t *              k);
 
     //
     // Vocab

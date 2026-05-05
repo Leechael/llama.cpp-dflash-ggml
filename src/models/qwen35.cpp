@@ -14,9 +14,33 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    // dflash hidden capture: per-slot tensors collected during the forward pass.
+    // Slots are ggml_concat'd into a single [n_embd, 5*n_tokens] tensor AFTER
+    // the layer loop and registered as t_hidden_capture (OUTPUT).  This ensures
+    // the concat node is a real compute graph output that gallocr / the sched
+    // execute and sync back to the host — avoiding the INPUT-leaf + cpy-to-view
+    // pattern which silently produces all-zeros on GPU (cpy dst is CPU-pinned
+    // while the src lives on the device backend).
+    ggml_tensor * cap_slots[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+
     inpL = build_inp_embd(model.tok_embd);
 
     cb(inpL, "model.input_embed", -1);
+
+    // build tree-mode inputs when parent_ids are present in the ubatch.
+    // LLAMA_DDTREE_FORCE_CHAIN_KERNEL=1 skips the tree input wiring; downstream
+    // conv/delta-net dispatch then falls back to the chain kernel (parent_ids
+    // member stays null). Diagnostic only — sibling/cousin tokens are wrong,
+    // root token stays equivalent to chain.
+    if (ubatch.parent_id != nullptr) {
+        static const bool s_ddtree_force_chain_kernel = []{
+            const char * e = getenv("LLAMA_DDTREE_FORCE_CHAIN_KERNEL");
+            return e && e[0] == '1';
+        }();
+        if (!s_ddtree_force_chain_kernel) {
+            build_inp_tree();
+        }
+    }
 
     auto * inp = build_inp_mem_hybrid();
 
@@ -64,6 +88,21 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_ffn", il);
 
+        // dflash hidden capture: stash cur in cap_slots[k] for later concat.
+        // Critical invariant: this block is NOT entered when capture_hidden==false,
+        // so the baseline qwen35 forward is byte-for-byte unchanged.
+        if (capture_hidden) {
+            const auto & cl = hparams.dflash_target_capture_layers;
+            for (int k = 0; k < 5; ++k) {
+                if ((int)cl[k] == il) {
+                    // ggml_cont ensures the slot is a standalone contiguous node
+                    // (cur may be a non-owning view after certain ops).
+                    cap_slots[k] = ggml_cont(ctx0, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens));
+                    break;
+                }
+            }
+        }
+
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
@@ -71,6 +110,24 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         inpL = cur;
     }
     cur = inpL;
+
+    // dflash hidden capture: concat the 5 collected slots along dim 1 into
+    // [n_embd, 5*n_tokens] and register as t_hidden_capture (OUTPUT).
+    // The concat result is a regular compute node — gallocr schedules it on the
+    // device backend and the sched syncs it to host after the forward pass.
+    if (capture_hidden) {
+        for (int k = 0; k < 5; ++k) {
+            GGML_ASSERT(cap_slots[k] != nullptr &&
+                "dflash_target_capture_layers must cover all 5 slots; check hparams");
+        }
+        ggml_tensor * cap = ggml_concat(ctx0, cap_slots[0], cap_slots[1], 1);
+        cap = ggml_concat(ctx0, cap, cap_slots[2], 1);
+        cap = ggml_concat(ctx0, cap, cap_slots[3], 1);
+        cap = ggml_concat(ctx0, cap, cap_slots[4], 1);
+        ggml_set_name(cap, "dflash_hidden_capture");
+        ggml_build_forward_expand(gf, cap);
+        res->t_hidden_capture = cap;
+    }
 
     // Final norm
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
@@ -82,9 +139,35 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     cur = build_lora_mm(model.output, cur);
 
     cb(cur, "result_output", -1);
-    res->t_logits = cur;
 
-    ggml_build_forward_expand(gf, cur);
+    if (dflash_draft_top_k > 0) {
+        const int top_k = std::min<int64_t>(dflash_draft_top_k, cur->ne[0]);
+
+        if (top_k == 1) {
+            ggml_tensor * top_ids = ggml_argmax(ctx0, cur);
+            top_ids = ggml_reshape_2d(ctx0, top_ids, 1, cur->ne[1]);
+            cb(top_ids, "dflash_target_argmax_ids", -1);
+
+            res->t_dflash_top_ids = top_ids;
+            ggml_build_forward_expand(gf, top_ids);
+        } else {
+            ggml_tensor * top_ids = ggml_top_k(ctx0, cur, top_k);
+            cb(top_ids, "dflash_target_top_ids", -1);
+
+            ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, cur, 1, cur->ne[0], cur->ne[1]);
+            ggml_tensor * top_logits  = ggml_get_rows(ctx0, logits_rows, top_ids);
+            top_logits = ggml_reshape_2d(ctx0, top_logits, top_k, cur->ne[1]);
+            cb(top_logits, "dflash_target_top_logits", -1);
+
+            res->t_dflash_top_ids    = top_ids;
+            res->t_dflash_top_logits = top_logits;
+            ggml_build_forward_expand(gf, top_ids);
+            ggml_build_forward_expand(gf, top_logits);
+        }
+    } else {
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_qkvz(
@@ -253,6 +336,29 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
+    ggml_tensor * conv_persist = nullptr;
+    if (parent_ids != nullptr && dflash_persist_conv_l != nullptr &&
+            il >= 0 && il < (int32_t)dflash_persist_conv_l->size()) {
+        conv_persist = (*dflash_persist_conv_l)[il];
+    }
+
+    ggml_tensor * ssm_persist = nullptr;
+    if (parent_ids != nullptr && dflash_persist_inter_l != nullptr &&
+            il >= 0 && il < (int32_t)dflash_persist_inter_l->size()) {
+        ssm_persist = (*dflash_persist_inter_l)[il];
+    }
+
+    static const bool s_skip_tree_live_updates = []{
+        const char * e = getenv("LLAMA_DDTREE_SKIP_TREE_LIVE_UPDATES");
+        return e == nullptr || e[0] != '0';
+    }();
+    const bool skip_tree_live_updates =
+        s_skip_tree_live_updates &&
+        parent_ids != nullptr &&
+        n_seq_tokens > 1 &&
+        conv_persist != nullptr &&
+        ssm_persist != nullptr;
+
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
@@ -274,13 +380,25 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
                      kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
     cb(state_update_target, "state_update_target", il);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    if (!skip_tree_live_updates) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    }
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    // use tree conv when parent_ids are set; identical output shape to ggml_ssm_conv.
+    // Phase 5 fix: when a per-layer conv-persist buffer is allocated, use the
+    // _persist variant so each token writes its post-state for SSM rollback.
+    ggml_tensor * conv_output_proper;
+    if (parent_ids != nullptr) {
+        conv_output_proper = (conv_persist != nullptr)
+            ? ggml_ssm_conv_tree_persist(ctx0, conv_input, conv_kernel, parent_ids, conv_persist)
+            : ggml_ssm_conv_tree        (ctx0, conv_input, conv_kernel, parent_ids);
+    } else {
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    }
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
@@ -344,10 +462,12 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(new_state, "new_state", il);
 
     // Update the recurrent states
-    ggml_build_forward_expand(gf,
-            ggml_cpy(ctx0, new_state,
-                ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    if (!skip_tree_live_updates) {
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, new_state,
+                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

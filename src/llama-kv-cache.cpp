@@ -608,6 +608,109 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     return cells.seq_pos_max(seq_id);
 }
 
+void llama_kv_cache::seq_compact_tree(
+        llama_seq_id seq_id,
+        const std::vector<int32_t> & accepted_dfs,
+        int32_t commit_n,
+        int32_t spine_start) {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    GGML_ASSERT(commit_n >= 0 && commit_n <= (int32_t) accepted_dfs.size());
+    GGML_ASSERT(spine_start >= 0);
+
+    if (commit_n == 0) {
+        return;
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+    auto & cells = v_cells[strm];
+
+    // accepted_dfs[i] is the tree-local DFS index of the i-th accepted node.
+    // The tree was placed at slots [spine_start, spine_start + N), so absolute
+    // src/dst slot indices need spine_start added.
+    //
+    // Copy K/V rows via ggml_backend_tensor_get/set with explicit offsets
+    // (ggml_backend_tensor_copy doesn't follow view_src->buffer).
+    std::vector<uint8_t> bounce;
+
+    for (int32_t i = 0; i < commit_n; ++i) {
+        const int32_t src_slot = spine_start + accepted_dfs[i];
+        const int32_t dst_slot = spine_start + i;
+
+        if (src_slot == dst_slot) {
+            continue;
+        }
+
+        GGML_ASSERT(src_slot >= 0 && (uint32_t) src_slot < cells.size());
+        GGML_ASSERT(dst_slot >= 0 && (uint32_t) dst_slot < cells.size());
+
+        for (auto & layer : layers) {
+            if (layer.k) {
+                const size_t k_row_bytes      = ggml_row_size(layer.k->type, layer.k->ne[0]);
+                const size_t k_row_stride     = layer.k->nb[1];
+                const size_t k_stride_stream  = layer.k->nb[2];
+
+                if (bounce.size() < k_row_bytes) bounce.resize(k_row_bytes);
+
+                const size_t src_off = strm * k_stride_stream + (size_t) src_slot * k_row_stride;
+                const size_t dst_off = strm * k_stride_stream + (size_t) dst_slot * k_row_stride;
+
+                ggml_backend_tensor_get(layer.k, bounce.data(), src_off, k_row_bytes);
+                ggml_backend_tensor_set(layer.k, bounce.data(), dst_off, k_row_bytes);
+            }
+
+            if (layer.v && !v_trans) {
+                const size_t v_row_bytes      = ggml_row_size(layer.v->type, layer.v->ne[0]);
+                const size_t v_row_stride     = layer.v->nb[1];
+                const size_t v_stride_stream  = layer.v->nb[2];
+
+                if (bounce.size() < v_row_bytes) bounce.resize(v_row_bytes);
+
+                const size_t src_off = strm * v_stride_stream + (size_t) src_slot * v_row_stride;
+                const size_t dst_off = strm * v_stride_stream + (size_t) dst_slot * v_row_stride;
+
+                ggml_backend_tensor_get(layer.v, bounce.data(), src_off, v_row_bytes);
+                ggml_backend_tensor_set(layer.v, bounce.data(), dst_off, v_row_bytes);
+            }
+        }
+    }
+
+    // Update cell metadata: only touch the tree region [spine_start, spine_start+N).
+    // Past prompt cells (slots < spine_start) are left untouched.
+    //
+    // Snapshot positions from the accepted source slots first to avoid aliasing
+    // when src_slot < dst_slot.
+    std::vector<llama_pos> accepted_pos(commit_n);
+    for (int32_t i = 0; i < commit_n; ++i) {
+        const uint32_t src = (uint32_t) (spine_start + accepted_dfs[i]);
+        accepted_pos[i] = cells.is_empty(src) ? -1 : cells.pos_get(src);
+    }
+
+    // Clear all tree slots used by seq_id (i.e. cells with slot >= spine_start
+    // and pos >= the tree start position). To be conservative, scan the entire
+    // tree region width: assume the tree had at most max(accepted_dfs)+1 nodes,
+    // but we don't know N here — use the max of accepted_dfs as a lower bound
+    // and rely on the caller passing the correct spine_start. Clear all cells
+    // that belong to this seq with slot >= spine_start.
+    const uint32_t kv_size = cells.size();
+    for (uint32_t slot = (uint32_t) spine_start; slot < kv_size; ++slot) {
+        if (!cells.is_empty(slot) && cells.seq_has(slot, seq_id)) {
+            cells.rm(slot);
+        }
+    }
+
+    // Set the spine slots [spine_start, spine_start+commit_n) with accepted positions
+    for (int32_t i = 0; i < commit_n; ++i) {
+        if (accepted_pos[i] >= 0) {
+            const uint32_t slot = (uint32_t) (spine_start + i);
+            cells.pos_set(slot, accepted_pos[i]);
+            cells.seq_add(slot, seq_id);
+        }
+    }
+
+    // Search head moves to just past the spine.
+    v_heads[strm] = (uint32_t) (spine_start + commit_n);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
@@ -1607,7 +1710,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1620,6 +1723,68 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
+
+    // Tree-mode mask: each query node attends to all past (committed) KV cells
+    // unconditionally, plus its exact tree ancestors in the current ubatch.
+    // Do not match tree nodes by position: siblings share the same depth/pos.
+    if (ubatch->parent_id != nullptr) {
+        GGML_ASSERT(n_stream == 1 && "tree-mode requires n_stream == 1 in Phase 4");
+        GGML_ASSERT(sinfo.n_stream() == 1 && sinfo.size() == n_tokens);
+
+        // Find the boundary between past KV and the current tree ubatch.
+        llama_pos tree_min_pos = std::numeric_limits<llama_pos>::max();
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            tree_min_pos = std::min(tree_min_pos, ubatch->pos[i]);
+        }
+
+        const llama_seq_id seq0    = ubatch->seq_id[0][0];
+        const auto &       cells   = v_cells.at(seq_to_stream[seq0]);
+
+        // Pass 1: classify every KV cell once (O(n_kv)). past_visible[j] = 1
+        // means cell j belongs to a committed token and is unconditionally
+        // visible to every tree query. Tree-region cells stay 0 here and are
+        // turned on per-query in pass 3.
+        std::vector<uint8_t> past_visible(n_kv, 0);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j) || !cells.seq_has(j, seq0)) {
+                continue;
+            }
+            if (cells.pos_get(j) < tree_min_pos) {
+                past_visible[j] = 1;
+            }
+        }
+
+        // Pass 2: for each query i, fill the row with -INF, then write 0.0f
+        // for every past_visible cell. Tree-region cells remain -INF until
+        // pass 3 marks the query's own ancestors. Total cost is O(N * n_kv)
+        // for fills + O(N * depth) for ancestor walks instead of the previous
+        // O(N * n_kv * 64) where the inner 64-element ancestor scan was
+        // duplicated against every KV cell.
+        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
+            float * row = data + i * n_kv;
+            std::fill(row, row + n_kv, -INFINITY);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (past_visible[j]) {
+                    row[j] = 0.0f;
+                }
+            }
+
+            // Walk up the parent chain to the root and mark each ancestor's
+            // KV slot visible. Bounded by tree depth (<= L+1 < 64 in practice)
+            // and only touches ancestors of this query.
+            int32_t cur = (int32_t) i;
+            while (cur >= 0) {
+                const uint32_t slot = sinfo.idxs[0][cur];
+                if (slot < (uint32_t) n_kv && !cells.is_empty(slot) && cells.seq_has(slot, seq0)) {
+                    row[slot] = 0.0f;
+                }
+                const int32_t p = ubatch->parent_id[cur];
+                if (p < 0) break;
+                cur = p;
+            }
+        }
+        return;
+    }
 
     //const int64_t t_start = ggml_time_us();
 
@@ -2490,7 +2655,7 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

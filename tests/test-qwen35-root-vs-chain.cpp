@@ -1,0 +1,635 @@
+// test-qwen35-root-vs-chain.cpp
+//
+// DDTree diagnostic: verify that a single tree-mode forward at the root node
+// (parent_id = -1) is equivalent to a chain forward of the same token at the
+// same position.
+//
+// Two passes inside the same process (model loaded once):
+//   pass A (chain): chain prefill tokens[0 .. N-1], record logits at index N-1
+//   pass B (tree-root): chain prefill tokens[0 .. N-2], then a single
+//     tree-mode batch with one node {token = tokens[N-1], parent_id = -1,
+//     pos = N-1}, record logits at index 0
+//
+// If the tree kernel + tree input wiring are correct, A and B should match
+// within numerical tolerance for that one position.
+//
+// Build: -DLLAMA_BUILD_TESTS_QWEN35_ROOT_VS_CHAIN=ON
+//   ./build-server/bin/test-qwen35-root-vs-chain \
+//       --model PATH --prompt-tokens tokens.bin --out-summary diff.txt
+
+#include "llama.h"
+#include "common.h"
+#include "log.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+static void usage(const char * prog) {
+    fprintf(stderr,
+        "Usage: %s\n"
+        "  --model PATH             (GGUF; required)\n"
+        "  --prompt-tokens PATH     (binary int32 LE token IDs)\n"
+        "  --prompt-text STR        (alternative to --prompt-tokens; tokenized in-process)\n"
+        "  --prompt-text-file PATH  (alternative to --prompt-text; UTF-8 text file)\n"
+        "  --out-summary PATH       (text summary; required)\n"
+        "  --n-siblings N           (extra sibling nodes at depth 1; default 0)\n"
+        "  --n-spec-steps N         (1 or 2; default 1; 2 chains step1 -> compact/rollback -> step2)\n"
+        "  --gapped-accept          (two-step diagnostic: accept DFS path 0,16,19)\n"
+        "  --skip-rollback          (diagnostic: compact accepted root but do not rollback SSM)\n"
+        "  --n-gpu-layers N         (default 99)\n"
+        "  --n-ctx N                (default 4096)\n",
+        prog);
+}
+
+static std::vector<int32_t> read_prompt_tokens(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        throw std::runtime_error("cannot open prompt-tokens file: " + path);
+    }
+    f.seekg(0, std::ios::end);
+    auto size = f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (size % sizeof(int32_t) != 0) {
+        throw std::runtime_error("prompt-tokens file size not a multiple of 4: " + path);
+    }
+    std::vector<int32_t> tokens(size / sizeof(int32_t));
+    f.read(reinterpret_cast<char *>(tokens.data()), size);
+    return tokens;
+}
+
+static std::vector<float> run_chain_capture_last(llama_model * model,
+                                                 const llama_context_params & cparams,
+                                                 const std::vector<int32_t> & tokens,
+                                                 std::vector<float> * hidden_last = nullptr) {
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        throw std::runtime_error("failed to create chain context");
+    }
+    if (hidden_last != nullptr) {
+        llama_set_capture_hidden(ctx, true);
+    }
+
+    const int32_t n_tokens   = (int32_t)tokens.size();
+    const auto * vocab       = llama_model_get_vocab(model);
+    const int32_t vocab_size = llama_vocab_n_tokens(vocab);
+
+    llama_batch batch = llama_batch_init(n_tokens, /*embd=*/0, /*n_seq_max=*/1);
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        batch.token[i]     = (llama_token)tokens[i];
+        batch.pos[i]       = i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = (i == n_tokens - 1) ? 1 : 0;
+    }
+    batch.n_tokens = n_tokens;
+
+    if (llama_decode(ctx, batch) != 0) {
+        llama_batch_free(batch);
+        llama_free(ctx);
+        throw std::runtime_error("chain llama_decode failed");
+    }
+
+    const float * row = llama_get_logits_ith(ctx, n_tokens - 1);
+    std::vector<float> out(vocab_size);
+    memcpy(out.data(), row, (size_t)vocab_size * sizeof(float));
+
+    if (hidden_last != nullptr) {
+        int64_t ne0 = 0;
+        int64_t ne1 = 0;
+        const float * cap = llama_get_hidden_capture_data(ctx, &ne0, &ne1);
+        if (cap == nullptr || ne0 <= 0 || ne1 != 5 * n_tokens) {
+            llama_batch_free(batch);
+            llama_free(ctx);
+            throw std::runtime_error("chain hidden capture unavailable or shape mismatch");
+        }
+        hidden_last->assign((size_t)5 * ne0, 0.0f);
+        for (int64_t l = 0; l < 5; ++l) {
+            const float * src = cap + (l * n_tokens + (n_tokens - 1)) * ne0;
+            float * dst = hidden_last->data() + l * ne0;
+            memcpy(dst, src, (size_t)ne0 * sizeof(float));
+        }
+    }
+
+    llama_batch_free(batch);
+    llama_free(ctx);
+    return out;
+}
+
+// Build a tree batch of (1 + n_siblings) nodes at the given root pos.
+// Sibling tokens come from the prompt history (cyclic) so they are distinct.
+static llama_batch build_tree_batch(const std::vector<int32_t> & tokens,
+                                    int32_t root_pos,
+                                    llama_token root_token,
+                                    int n_siblings) {
+    const int n_nodes = 1 + n_siblings;
+    llama_batch tb = llama_batch_init_tree(n_nodes, /*embd=*/0, /*n_seq_max=*/1);
+    tb.token[0]     = root_token;
+    tb.pos[0]       = root_pos;
+    tb.n_seq_id[0]  = 1;
+    tb.seq_id[0][0] = 0;
+    tb.parent_id[0] = -1;
+    tb.logits[0]    = 1;
+    for (int i = 1; i < n_nodes; ++i) {
+        const int n = (int)tokens.size();
+        const int src = ((root_pos - i) % n + n) % n;
+        tb.token[i]     = (llama_token)tokens[src];
+        tb.pos[i]       = root_pos + 1;
+        tb.n_seq_id[i]  = 1;
+        tb.seq_id[i][0] = 0;
+        tb.parent_id[i] = 0;
+        tb.logits[i]    = 0;
+    }
+    tb.n_tokens = n_nodes;
+    return tb;
+}
+
+static llama_batch build_tree_gapped_accept_batch(const std::vector<int32_t> & tokens,
+                                                  int32_t root_pos) {
+    const int n_nodes = 20;
+    llama_batch tb = llama_batch_init_tree(n_nodes, /*embd=*/0, /*n_seq_max=*/1);
+    for (int i = 0; i < n_nodes; ++i) {
+        const int n = (int)tokens.size();
+        const int src = ((root_pos - 1 - i) % n + n) % n;
+        tb.token[i]     = (llama_token)tokens[src];
+        tb.pos[i]       = root_pos + 1;
+        tb.n_seq_id[i]  = 1;
+        tb.seq_id[i][0] = 0;
+        tb.parent_id[i] = 0;
+        tb.logits[i]    = 0;
+    }
+
+    tb.token[0]     = (llama_token)tokens[root_pos];
+    tb.pos[0]       = root_pos;
+    tb.parent_id[0] = -1;
+    tb.logits[0]    = 1;
+
+    tb.token[16]     = (llama_token)tokens[root_pos + 1];
+    tb.pos[16]       = root_pos + 1;
+    tb.parent_id[16] = 0;
+
+    tb.token[19]     = (llama_token)tokens[root_pos + 2];
+    tb.pos[19]       = root_pos + 2;
+    tb.parent_id[19] = 16;
+
+    tb.n_tokens = n_nodes;
+    return tb;
+}
+
+// Two-spec-step variant: chain prefill [0..N-3], step1 (root=tokens[N-2]), accept
+// root only -> compact+rollback, step2 (root=tokens[N-1]); return logits at step2 root.
+static std::vector<float> run_chain_then_tree_two_step(llama_model * model,
+                                                       const llama_context_params & cparams,
+                                                       const std::vector<int32_t> & tokens,
+                                                       int n_siblings,
+                                                       bool skip_rollback,
+                                                       bool gapped_accept,
+                                                       std::vector<float> * hidden_root = nullptr) {
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        throw std::runtime_error("failed to create two-step context");
+    }
+    if (hidden_root != nullptr) {
+        llama_set_capture_hidden(ctx, true);
+    }
+    const int32_t N            = (int32_t)tokens.size();
+    const int32_t accept_depth = gapped_accept ? 3 : 1;
+    const int32_t n_prefix     = N - accept_depth - 1;
+    const auto * vocab     = llama_model_get_vocab(model);
+    const int32_t vocab_sz = llama_vocab_n_tokens(vocab);
+
+    // chain prefill
+    if (n_prefix > 0) {
+        llama_batch b = llama_batch_init(n_prefix, /*embd=*/0, /*n_seq_max=*/1);
+        for (int32_t i = 0; i < n_prefix; ++i) {
+            b.token[i] = (llama_token)tokens[i]; b.pos[i] = i;
+            b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 0;
+        }
+        b.n_tokens = n_prefix;
+        if (llama_decode(ctx, b) != 0) {
+            llama_batch_free(b); llama_free(ctx);
+            throw std::runtime_error("two-step: prefill failed");
+        }
+        llama_batch_free(b);
+    }
+
+    // spec step 1: root @ pos n_prefix (token = tokens[n_prefix])
+    {
+        llama_batch t = gapped_accept
+            ? build_tree_gapped_accept_batch(tokens, n_prefix)
+            : build_tree_batch(tokens, n_prefix, (llama_token)tokens[n_prefix], n_siblings);
+        if (llama_decode(ctx, t) != 0) {
+            llama_batch_free(t); llama_free(ctx);
+            throw std::runtime_error("two-step: spec step 1 failed");
+        }
+        llama_batch_free(t);
+    }
+    // accept root only -> compact tree + SSM rollback
+    int32_t accepted_dfs_root[1] = {0};
+    int32_t accepted_dfs_gapped[3] = {0, 16, 19};
+    int32_t * accepted_dfs = gapped_accept ? accepted_dfs_gapped : accepted_dfs_root;
+    llama_kv_cache_seq_compact_tree(ctx, /*seq_id=*/0, accepted_dfs,
+                                    /*n_accepted=*/accept_depth, /*commit_n=*/accept_depth,
+                                    /*spine_start=*/n_prefix);
+    if (!skip_rollback) {
+        llama_dflash_rollback_ssm_to_dfs(ctx, /*seq_id=*/0, /*accepted_dfs_node=*/accepted_dfs[accept_depth - 1]);
+        llama_dflash_set_recurrent_tail_pos(ctx, /*seq_id=*/0, /*pos=*/n_prefix + accept_depth - 1);
+    }
+
+    // spec step 2: root after the accepted chain.
+    std::vector<float> out(vocab_sz);
+    {
+        llama_batch t = build_tree_batch(tokens, n_prefix + accept_depth,
+                                         (llama_token)tokens[n_prefix + accept_depth], n_siblings);
+        if (llama_decode(ctx, t) != 0) {
+            llama_batch_free(t); llama_free(ctx);
+            throw std::runtime_error("two-step: spec step 2 failed");
+        }
+        memcpy(out.data(), llama_get_logits_ith(ctx, 0),
+               (size_t)vocab_sz * sizeof(float));
+        if (hidden_root != nullptr) {
+            int64_t ne0 = 0;
+            int64_t ne1 = 0;
+            const float * cap = llama_get_hidden_capture_data(ctx, &ne0, &ne1);
+            const int n_nodes = 1 + n_siblings;
+            if (cap == nullptr || ne0 <= 0 || ne1 != 5 * n_nodes) {
+                llama_batch_free(t);
+                llama_free(ctx);
+                throw std::runtime_error("two-step hidden capture unavailable or shape mismatch");
+            }
+            hidden_root->assign((size_t)5 * ne0, 0.0f);
+            for (int64_t l = 0; l < 5; ++l) {
+                const float * src = cap + l * n_nodes * ne0;
+                float * dst = hidden_root->data() + l * ne0;
+                memcpy(dst, src, (size_t)ne0 * sizeof(float));
+            }
+        }
+        llama_batch_free(t);
+    }
+
+    llama_free(ctx);
+    return out;
+}
+
+static std::vector<float> run_chain_then_tree_root(llama_model * model,
+                                                   const llama_context_params & cparams,
+                                                   const std::vector<int32_t> & tokens,
+                                                   int n_siblings,
+                                                   std::vector<float> * hidden_root = nullptr) {
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        throw std::runtime_error("failed to create tree-root context");
+    }
+    if (hidden_root != nullptr) {
+        llama_set_capture_hidden(ctx, true);
+    }
+
+    const int32_t n_tokens   = (int32_t)tokens.size();
+    const auto * vocab       = llama_model_get_vocab(model);
+    const int32_t vocab_size = llama_vocab_n_tokens(vocab);
+    const int32_t n_prefix   = n_tokens - 1;
+
+    // chain prefill tokens[0 .. n_prefix - 1]
+    if (n_prefix > 0) {
+        llama_batch batch = llama_batch_init(n_prefix, /*embd=*/0, /*n_seq_max=*/1);
+        for (int32_t i = 0; i < n_prefix; ++i) {
+            batch.token[i]     = (llama_token)tokens[i];
+            batch.pos[i]       = i;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]    = 0;
+        }
+        batch.n_tokens = n_prefix;
+
+        if (llama_decode(ctx, batch) != 0) {
+            llama_batch_free(batch);
+            llama_free(ctx);
+            throw std::runtime_error("chain prefill llama_decode failed");
+        }
+        llama_batch_free(batch);
+    }
+
+    // tree batch: root at index 0 + n_siblings nodes at depth 1 (parent = root)
+    const int n_nodes = 1 + n_siblings;
+    llama_batch tbatch = llama_batch_init_tree(/*n_tokens=*/n_nodes, /*embd=*/0, /*n_seq_max=*/1);
+    // root
+    tbatch.token[0]     = (llama_token)tokens[n_prefix];
+    tbatch.pos[0]       = n_prefix;
+    tbatch.n_seq_id[0]  = 1;
+    tbatch.seq_id[0][0] = 0;
+    tbatch.parent_id[0] = -1;
+    tbatch.logits[0]    = 1;
+    // siblings: depth 1, parent = root, token taken from prompt history (cyclic)
+    // so the tree batch has *distinct* tokens like a real spec verify ubatch.
+    for (int i = 1; i < n_nodes; ++i) {
+        const int src = (n_prefix - 1 - i + (int)tokens.size()) % (int)tokens.size();
+        tbatch.token[i]     = (llama_token)tokens[(src < 0 ? src + (int)tokens.size() : src)];
+        tbatch.pos[i]       = n_prefix + 1;
+        tbatch.n_seq_id[i]  = 1;
+        tbatch.seq_id[i][0] = 0;
+        tbatch.parent_id[i] = 0;
+        tbatch.logits[i]    = 0;
+    }
+    tbatch.n_tokens = n_nodes;
+
+    if (llama_decode(ctx, tbatch) != 0) {
+        llama_batch_free(tbatch);
+        llama_free(ctx);
+        throw std::runtime_error("tree-root llama_decode failed");
+    }
+
+    const float * row = llama_get_logits_ith(ctx, 0);
+    std::vector<float> out(vocab_size);
+    memcpy(out.data(), row, (size_t)vocab_size * sizeof(float));
+
+    if (hidden_root != nullptr) {
+        int64_t ne0 = 0;
+        int64_t ne1 = 0;
+        const float * cap = llama_get_hidden_capture_data(ctx, &ne0, &ne1);
+        if (cap == nullptr || ne0 <= 0 || ne1 != 5 * n_nodes) {
+            llama_batch_free(tbatch);
+            llama_free(ctx);
+            throw std::runtime_error("tree hidden capture unavailable or shape mismatch");
+        }
+        hidden_root->assign((size_t)5 * ne0, 0.0f);
+        for (int64_t l = 0; l < 5; ++l) {
+            const float * src = cap + l * n_nodes * ne0;
+            float * dst = hidden_root->data() + l * ne0;
+            memcpy(dst, src, (size_t)ne0 * sizeof(float));
+        }
+    }
+
+    llama_batch_free(tbatch);
+    llama_free(ctx);
+    return out;
+}
+
+static std::vector<float> run_chain_then_tree_gapped_last(llama_model * model,
+                                                          const llama_context_params & cparams,
+                                                          const std::vector<int32_t> & tokens,
+                                                          std::vector<float> * hidden_last = nullptr) {
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        throw std::runtime_error("failed to create gapped tree context");
+    }
+    if (hidden_last != nullptr) {
+        llama_set_capture_hidden(ctx, true);
+    }
+
+    const int32_t n_tokens = (int32_t)tokens.size();
+    const int32_t n_prefix = n_tokens - 3;
+    const auto * vocab = llama_model_get_vocab(model);
+    const int32_t vocab_size = llama_vocab_n_tokens(vocab);
+
+    if (n_prefix > 0) {
+        llama_batch batch = llama_batch_init(n_prefix, /*embd=*/0, /*n_seq_max=*/1);
+        for (int32_t i = 0; i < n_prefix; ++i) {
+            batch.token[i] = (llama_token)tokens[i];
+            batch.pos[i] = i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = 0;
+        }
+        batch.n_tokens = n_prefix;
+        if (llama_decode(ctx, batch) != 0) {
+            llama_batch_free(batch);
+            llama_free(ctx);
+            throw std::runtime_error("gapped prefill llama_decode failed");
+        }
+        llama_batch_free(batch);
+    }
+
+    llama_batch tbatch = build_tree_gapped_accept_batch(tokens, n_prefix);
+    tbatch.logits[0] = 0;
+    tbatch.logits[19] = 1;
+    if (llama_decode(ctx, tbatch) != 0) {
+        llama_batch_free(tbatch);
+        llama_free(ctx);
+        throw std::runtime_error("gapped tree llama_decode failed");
+    }
+
+    const float * row = llama_get_logits_ith(ctx, 19);
+    std::vector<float> out(vocab_size);
+    memcpy(out.data(), row, (size_t)vocab_size * sizeof(float));
+
+    if (hidden_last != nullptr) {
+        int64_t ne0 = 0;
+        int64_t ne1 = 0;
+        const float * cap = llama_get_hidden_capture_data(ctx, &ne0, &ne1);
+        const int n_nodes = 20;
+        if (cap == nullptr || ne0 <= 0 || ne1 != 5 * n_nodes) {
+            llama_batch_free(tbatch);
+            llama_free(ctx);
+            throw std::runtime_error("gapped hidden capture unavailable or shape mismatch");
+        }
+        hidden_last->assign((size_t)5 * ne0, 0.0f);
+        for (int64_t l = 0; l < 5; ++l) {
+            const float * src = cap + (l * n_nodes + 19) * ne0;
+            float * dst = hidden_last->data() + l * ne0;
+            memcpy(dst, src, (size_t)ne0 * sizeof(float));
+        }
+    }
+
+    llama_batch_free(tbatch);
+    llama_free(ctx);
+    return out;
+}
+
+struct DiffStats {
+    double max_abs_diff;
+    double mean_abs_diff;
+    int    argmax_a;
+    int    argmax_b;
+    std::vector<int> top5_a;
+    std::vector<int> top5_b;
+};
+
+static std::vector<int> top_k_indices(const std::vector<float> & v, int k) {
+    std::vector<int> idx(v.size());
+    std::iota(idx.begin(), idx.end(), 0);
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+        [&](int a, int b) { return v[a] > v[b]; });
+    idx.resize(k);
+    return idx;
+}
+
+static DiffStats diff_logits(const std::vector<float> & a, const std::vector<float> & b) {
+    DiffStats s = {};
+    if (a.size() != b.size() || a.empty()) {
+        throw std::runtime_error("logits size mismatch");
+    }
+    double sum_abs = 0.0;
+    double max_abs = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const double d = std::fabs((double)a[i] - (double)b[i]);
+        sum_abs += d;
+        if (d > max_abs) max_abs = d;
+    }
+    s.max_abs_diff  = max_abs;
+    s.mean_abs_diff = sum_abs / (double)a.size();
+    s.argmax_a = (int)(std::max_element(a.begin(), a.end()) - a.begin());
+    s.argmax_b = (int)(std::max_element(b.begin(), b.end()) - b.begin());
+    s.top5_a = top_k_indices(a, 5);
+    s.top5_b = top_k_indices(b, 5);
+    return s;
+}
+
+static std::string read_text_file(const std::string & path) {
+    std::ifstream f(path);
+    if (!f) {
+        throw std::runtime_error("cannot open prompt-text-file: " + path);
+    }
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return s;
+}
+
+static std::vector<int32_t> tokenize_text(llama_model * model, const std::string & text) {
+    const auto * vocab = llama_model_get_vocab(model);
+    int32_t n = -llama_tokenize(vocab, text.data(), (int32_t)text.size(),
+                                nullptr, 0, /*add_special=*/true, /*parse_special=*/false);
+    if (n <= 0) {
+        throw std::runtime_error("llama_tokenize sizing failed");
+    }
+    std::vector<llama_token> tmp(n);
+    int32_t got = llama_tokenize(vocab, text.data(), (int32_t)text.size(),
+                                 tmp.data(), n, true, false);
+    if (got != n) {
+        throw std::runtime_error("llama_tokenize result mismatch");
+    }
+    std::vector<int32_t> out(tmp.begin(), tmp.end());
+    return out;
+}
+
+int main(int argc, char ** argv) {
+    std::string model_path;
+    std::string prompt_tokens_path;
+    std::string prompt_text;
+    std::string prompt_text_file;
+    std::string out_summary;
+    int32_t n_gpu_layers  = 99;
+    int32_t n_ctx         = 4096;
+    int32_t n_siblings    = 0;
+    int32_t n_spec_steps  = 1;
+    bool skip_rollback    = false;
+    bool gapped_accept    = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if      (arg == "--model"            && i + 1 < argc) model_path         = argv[++i];
+        else if (arg == "--prompt-tokens"    && i + 1 < argc) prompt_tokens_path = argv[++i];
+        else if (arg == "--prompt-text"      && i + 1 < argc) prompt_text        = argv[++i];
+        else if (arg == "--prompt-text-file" && i + 1 < argc) prompt_text_file   = argv[++i];
+        else if (arg == "--out-summary"      && i + 1 < argc) out_summary        = argv[++i];
+        else if (arg == "--n-siblings"       && i + 1 < argc) n_siblings         = std::atoi(argv[++i]);
+        else if (arg == "--n-spec-steps"     && i + 1 < argc) n_spec_steps       = std::atoi(argv[++i]);
+        else if (arg == "--gapped-accept") gapped_accept = true;
+        else if (arg == "--skip-rollback") skip_rollback = true;
+        else if (arg == "--n-gpu-layers"     && i + 1 < argc) n_gpu_layers       = std::atoi(argv[++i]);
+        else if (arg == "--n-ctx"            && i + 1 < argc) n_ctx              = std::atoi(argv[++i]);
+        else if (arg == "-h" || arg == "--help") { usage(argv[0]); return 0; }
+        else { fprintf(stderr, "unknown argument: %s\n", arg.c_str()); usage(argv[0]); return 1; }
+    }
+
+    int input_modes = (!prompt_tokens_path.empty()) + (!prompt_text.empty()) + (!prompt_text_file.empty());
+    if (model_path.empty() || out_summary.empty() || input_modes != 1) {
+        fprintf(stderr, "must provide exactly one of --prompt-tokens, --prompt-text, --prompt-text-file\n");
+        usage(argv[0]); return 1;
+    }
+
+    llama_backend_init();
+
+    auto mparams         = llama_model_default_params();
+    mparams.n_gpu_layers = n_gpu_layers;
+
+    llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
+    if (!model) {
+        LOG_ERR("failed to load model: %s\n", model_path.c_str());
+        llama_backend_free();
+        return 1;
+    }
+
+    auto cparams    = llama_context_default_params();
+    cparams.n_ctx   = (uint32_t)n_ctx;
+    cparams.n_batch = (uint32_t)n_ctx;
+
+    int rc = 1;
+    try {
+        std::vector<int32_t> tokens;
+        if (!prompt_tokens_path.empty()) {
+            tokens = read_prompt_tokens(prompt_tokens_path);
+        } else {
+            std::string text = !prompt_text.empty()
+                ? prompt_text
+                : read_text_file(prompt_text_file);
+            tokens = tokenize_text(model, text);
+            LOG_INF("tokenized %zu tokens from text\n", tokens.size());
+        }
+        if (tokens.size() < 2) {
+            throw std::runtime_error("need at least 2 tokens");
+        }
+
+        LOG_INF("loaded %zu tokens; running chain pass...\n", tokens.size());
+        std::vector<float> hidden_a;
+        std::vector<float> hidden_b;
+        std::vector<float> A = run_chain_capture_last(model, cparams, tokens, &hidden_a);
+
+        LOG_INF("running chain-prefill + tree-root pass (n_siblings=%d, n_spec_steps=%d)...\n",
+                n_siblings, n_spec_steps);
+        std::vector<float> B;
+        if (n_spec_steps == 1 && gapped_accept) {
+            B = run_chain_then_tree_gapped_last(model, cparams, tokens, &hidden_b);
+        } else if (n_spec_steps == 1) {
+            B = run_chain_then_tree_root(model, cparams, tokens, n_siblings, &hidden_b);
+        } else if (n_spec_steps == 2) {
+            B = run_chain_then_tree_two_step(model, cparams, tokens, n_siblings, skip_rollback, gapped_accept, &hidden_b);
+        } else {
+            throw std::runtime_error("--n-spec-steps must be 1 or 2");
+        }
+
+        DiffStats s = diff_logits(A, B);
+
+        std::ofstream f(out_summary);
+        f << "n_tokens=" << tokens.size() << "\n";
+        f << "n_siblings=" << n_siblings << "\n";
+        f << "n_spec_steps=" << n_spec_steps << "\n";
+        f << "skip_rollback=" << (skip_rollback ? 1 : 0) << "\n";
+        f << "gapped_accept=" << (gapped_accept ? 1 : 0) << "\n";
+        f << "vocab_size=" << A.size() << "\n";
+        f << "max_abs_diff=" << s.max_abs_diff << "\n";
+        f << "mean_abs_diff=" << s.mean_abs_diff << "\n";
+        if (!hidden_a.empty() && !hidden_b.empty()) {
+            DiffStats hs = diff_logits(hidden_a, hidden_b);
+            f << "hidden_max_abs_diff=" << hs.max_abs_diff << "\n";
+            f << "hidden_mean_abs_diff=" << hs.mean_abs_diff << "\n";
+        }
+        f << "argmax_chain=" << s.argmax_a << "\n";
+        f << "argmax_tree_root=" << s.argmax_b << "\n";
+        f << "top5_chain=";
+        for (int x : s.top5_a) f << x << " ";
+        f << "\ntop5_tree_root=";
+        for (int x : s.top5_b) f << x << " ";
+        f << "\n";
+
+        fprintf(stderr, "max_abs_diff = %.6g\n", s.max_abs_diff);
+        fprintf(stderr, "mean_abs_diff = %.6g\n", s.mean_abs_diff);
+        fprintf(stderr, "argmax: chain=%d tree_root=%d %s\n",
+                s.argmax_a, s.argmax_b,
+                s.argmax_a == s.argmax_b ? "MATCH" : "DIFF");
+
+        rc = 0;
+    } catch (const std::exception & e) {
+        LOG_ERR("error: %s\n", e.what());
+        rc = 1;
+    }
+
+    llama_model_free(model);
+    llama_backend_free();
+    return rc;
+}

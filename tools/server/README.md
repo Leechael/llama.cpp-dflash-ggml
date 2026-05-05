@@ -1825,3 +1825,39 @@ You can use html formatting if needed.
   </body>
 </html>
 ```
+
+## Speculative decoding: DDTree (dflash)
+
+DDTree is a tree-structured speculative decoding method that uses a compact dflash-draft companion model to propose multiple token paths in parallel, then verifies them against the target model in a single forward pass. It typically yields 5-10x accepted tokens per target forward pass compared to 1 for autoregressive decoding.
+
+**Required flags:**
+
+- `-m <target-gguf>` — target model (Qwen3.5-27B Q4_K_M or similar)
+- `-md <draft-gguf>` — dflash-draft GGUF (arch `LLM_ARCH_DFLASH_DRAFT`)
+- `--speculative-mode ddtree`
+
+**Optional flags:**
+
+- `--ddtree-budget N` — tree node budget per spec step (default: 22)
+- `--ddtree-temp F` — temperature for draft log-prob extraction (default: 1.0)
+- `--ddtree-no-chain-seed` — disable greedy chain seed for the tree heap
+
+**Constraints (Phase 5):**
+
+- `--parallel 1` only — multi-slot DDTree is out of scope for Phase 5
+- Target must be Qwen3.5-27B; draft must be the matching `dflash-draft` GGUF
+- Greedy verification only — DDTree's accept decision is argmax-based; temperature and top-p affect only draft log-prob extraction, not acceptance
+- Known limitation: SSM conv state may diverge after ~17 tokens per spec step boundary; full bit-equal awaits `ggml_ssm_conv_tree_persist` op (follow-up)
+
+**Example command:**
+
+```bash
+llama-server \
+    -m models/Qwen3.5-27B-Q4_K_M.gguf \
+    -md models/draft/model.gguf \
+    --speculative-mode ddtree --ddtree-budget 22 \
+    -ctk tq3_0 -ctv tq3_0 \
+    --port 8002 -ngl 99 -c 16384
+```
+
+Compatible with `--api-key`, `--chat-template`, `--jinja`, and all standard server flags.

@@ -1,6 +1,8 @@
 *
 !*.*
 !snapshots/
+!fixtures/
+!fixtures/**
 *.o
 ggml-common.h
 **/*.swp
