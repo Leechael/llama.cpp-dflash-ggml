@@ -243,6 +243,7 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+    bool read_only_tree = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
