@@ -326,8 +326,14 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
 
-    res &= head == mctx->get_head();
-    res &= rs_z == mctx->get_rs_z();
+    const bool read_only_tree_compatible =
+        read_only_tree &&
+        params.ubatch.parent_id != nullptr &&
+        params.ubatch.n_tokens > 1;
+    if (!read_only_tree_compatible) {
+        res &= head == mctx->get_head();
+        res &= rs_z == mctx->get_rs_z();
+    }
 
     return res;
 }
@@ -613,8 +619,14 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
 
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    const bool read_only_tree_compatible =
+        inp_rs->read_only_tree &&
+        params.ubatch.parent_id != nullptr &&
+        params.ubatch.n_tokens > 1;
+    if (!read_only_tree_compatible) {
+        res &= inp_rs->head == mctx->get_recr()->get_head();
+        res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    }
 
     return res;
 }
@@ -2590,10 +2602,13 @@ ggml_tensor * llm_graph_context::build_rs(
 
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, rs_size);
 
-    // Clear a single state which will then be copied to the other cleared states.
-    // Note that this is a no-op when the view is zero-sized.
-    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    const bool read_only_tree = parent_ids != nullptr && ubatch.parent_id != nullptr && ubatch.n_tokens > 1;
+    if (!read_only_tree) {
+        // Clear a single state which will then be copied to the other cleared states.
+        // Note that this is a no-op when the view is zero-sized.
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    }
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
@@ -2601,12 +2616,14 @@ ggml_tensor * llm_graph_context::build_rs(
     ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
     ggml_build_forward_expand(gf, output_states);
 
-    // copy extra states which won't be changed further (between n_seqs and n_rs)
-    ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);
-    ggml_build_forward_expand(gf,
-        ggml_cpy(ctx0,
-            states_extra,
-            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+    if (!read_only_tree) {
+        // copy extra states which won't be changed further (between n_seqs and n_rs)
+        ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0,
+                states_extra,
+                ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+    }
 
     return output_states;
 }
@@ -2629,6 +2646,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->read_only_tree = ubatch.parent_id != nullptr && ubatch.n_tokens > 1;
 
     return inp;
 }
