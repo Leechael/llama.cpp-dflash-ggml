@@ -116,6 +116,7 @@ struct llama_hparams {
     float    rope_freq_base_train_swa  = 10000.0f;
     float    rope_freq_scale_train;
     float    rope_freq_scale_train_swa = 1.0f;
+    float    rope_scaling_alpha        = 0.0f;  // NTK-aware alpha for XDRoPE
 
     uint32_t n_ctx_orig_yarn;
     float    rope_yarn_log_mul = 0.0f;
@@ -208,6 +209,21 @@ struct llama_hparams {
 
     // qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
+
+    // EAGLE3 draft model - layer indices to extract from target model
+    // e.g., for 32-layer target: [2, 16, 29] (low, middle, high)
+    std::array<int, 3> eagle3_extract_layers = {0, 0, 0};
+
+    // EAGLE3 draft model - target model hidden size
+    uint32_t eagle3_target_hidden_size = 0;
+
+    // EAGLE3 draft model - apply hidden_norm before storing residual
+    bool eagle3_norm_before_residual = false;
+
+    // DFlash draft model
+    std::array<int, 5> dflash_target_layer_ids = {};
+    uint32_t dflash_block_size     = 16;
+    uint32_t dflash_mask_token_id  = 0;
 
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;

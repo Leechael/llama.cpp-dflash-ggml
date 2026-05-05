@@ -31,6 +31,16 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
+        // EAGLE3: Extract intermediate layer features from target model at layer INPUT
+        if (eagle3 && cparams.eagle3_extract_enabled && !eagle3->extract_layer_indices.empty()) {
+            static const char * eagle3_extract_names[] = {"eagle3_extract_0", "eagle3_extract_1", "eagle3_extract_2"};
+            for (size_t i = 0; i < eagle3->extract_layer_indices.size() && i < 3; ++i) {
+                if (eagle3->extract_layer_indices[i] == il) {
+                    cb(inpL, eagle3_extract_names[i], il);
+                    break;
+                }
+            }
+        }
         // norm
         cur = build_norm(inpL,
                 model.layers[il].attn_norm, NULL,
@@ -70,7 +80,7 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
                 cb(Kcur, "Kcur_normed", il);
             }
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].bo, model.layers[il].wo_s,
+                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             if (model.layers[il].wo_s) {
                 cur = ggml_mul(ctx0, cur, model.layers[il].wo_s);

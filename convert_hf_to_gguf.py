@@ -97,6 +97,7 @@ class ModelBase:
     metadata_override: Path | None
     dir_model_card: Path
     remote_hf_model_id: str | None
+    target_model_dir: Path | None
 
     # subclasses should define this!
     model_arch: gguf.MODEL_ARCH
@@ -116,7 +117,7 @@ class ModelBase:
                  split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False,
                  small_first_shard: bool = False, hparams: dict[str, Any] | None = None, remote_hf_model_id: str | None = None,
                  disable_mistral_community_chat_template: bool = False,
-                 sentence_transformers_dense_modules: bool = False,
+                 sentence_transformers_dense_modules: bool = False, target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
@@ -136,6 +137,7 @@ class ModelBase:
         self.dry_run = dry_run
         self.remote_hf_model_id = remote_hf_model_id
         self.sentence_transformers_dense_modules = sentence_transformers_dense_modules
+        self.target_model_dir = target_model_dir
         self.fuse_gate_up_exps = fuse_gate_up_exps
         self._gate_exp_buffer: dict[int, Tensor] = {}
         self._up_exp_buffer: dict[int, Tensor] = {}
@@ -746,7 +748,12 @@ class ModelBase:
 
         if (not quant_algo or not quant_layers) and quant_config_file.is_file():
             with open(quant_config_file, "r", encoding="utf-8") as f:
-                quant_config = json.load(f).get("quantization") or {}
+                hf_quant_config = json.load(f)
+                quant_config = hf_quant_config.get("quantization") or {}
+                producer = hf_quant_config.get("producer") or {}
+                producer_name = (producer.get("name") or "").lower()
+                if quant_method is None:
+                    self.hparams.setdefault("quantization_config", {})["quant_method"] = producer_name
                 quant_algo = quant_config.get("quant_algo", quant_algo)
                 quant_layers = quant_config.get("quantized_layers", quant_layers) or {}
 
@@ -1850,20 +1857,28 @@ class TextModel(ModelBase):
             with open(module_path, encoding="utf-8") as f:
                 modules = json.load(f)
             for mod in modules:
-                if mod["type"] == "sentence_transformers.models.Pooling":
+                if mod["type"].endswith("Pooling"):
                     pooling_path = mod["path"]
                     break
+
+        mode_mapping = {
+            "mean": gguf.PoolingType.MEAN,
+            "cls": gguf.PoolingType.CLS,
+            "lasttoken": gguf.PoolingType.LAST,
+        }
 
         # get pooling type
         if pooling_path is not None:
             with open(self.dir_model / pooling_path / "config.json", encoding="utf-8") as f:
                 pooling = json.load(f)
-            if pooling["pooling_mode_mean_tokens"]:
+            if pooling.get("pooling_mode_mean_tokens"):
                 pooling_type = gguf.PoolingType.MEAN
-            elif pooling["pooling_mode_cls_token"]:
+            elif pooling.get("pooling_mode_cls_token"):
                 pooling_type = gguf.PoolingType.CLS
-            elif pooling["pooling_mode_lasttoken"]:
+            elif pooling.get("pooling_mode_lasttoken"):
                 pooling_type = gguf.PoolingType.LAST
+            elif (pooling_mode := pooling.get("pooling_mode")) in mode_mapping:
+                pooling_type = mode_mapping[pooling_mode]
             else:
                 raise NotImplementedError("Only MEAN, CLS, and LAST pooling types supported")
             self.gguf_writer.add_pooling_type(pooling_type)
@@ -2801,6 +2816,9 @@ class StableLMModel(TextModel):
     "VLlama3ForCausalLM",
     "LlavaForConditionalGeneration",
     "VoxtralForConditionalGeneration",
+    "LlamaForCausalLMEagle3",
+    "Eagle3Speculator",
+    "Eagle3DraftModel",
     "IQuestCoderForCausalLM",
     "LlamaModel")
 class LlamaModel(TextModel):
@@ -2815,7 +2833,60 @@ class LlamaModel(TextModel):
         hparams = ModelBase.load_hparams(self.dir_model, is_mistral_format=False)
         self.origin_hf_arch = hparams.get('architectures', [None])[0]
 
+        # detect EAGLE-3 llama checkpoint
+        if "draft_vocab_size" in self.hparams and self.hparams["num_hidden_layers"] == 1:
+            self.is_eagle3 = True
+            self.model_arch = gguf.MODEL_ARCH.EAGLE3
+            logger.info("Detected EAGLE-3 draft model, switching to EAGLE3 architecture")
+            # Re-initialize tensor_map with EAGLE3 architecture
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+            # Update gguf_writer architecture
+            self.gguf_writer.arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
+            self.gguf_writer.add_architecture()
+            if not hasattr(self, 'target_model_dir') or not self.target_model_dir:
+                raise ValueError(
+                    "EAGLE3 model requires --target-model-dir to be specified. "
+                    "Please provide the path to the target model directory to read config.json"
+                )
+            # Read both EAGLE3 raw config and target model config
+            with open(self.dir_model / "config.json", 'r', encoding='utf-8') as f:
+                eagle3_raw_config = json.load(f)
+            with open(self.target_model_dir / "config.json", 'r', encoding='utf-8') as f:
+                target_config = json.load(f)
+
+            # EAGLE3 extract_layers
+            target_num_layers = target_config["num_hidden_layers"]
+            extract_layers = [2, target_num_layers // 2, target_num_layers - 3]
+            logger.info(f"EAGLE3: extract_layers = {extract_layers} (target model has {target_num_layers} layers)")
+            self.gguf_writer.add_array(f"{self.gguf_writer.arch}.extract_layers", extract_layers)
+
+            # EAGLE3 target_hidden_size: prefer EAGLE3 config, fallback to target config
+            if "target_hidden_size" in eagle3_raw_config and eagle3_raw_config["target_hidden_size"] is not None:
+                target_hidden_size = eagle3_raw_config["target_hidden_size"]
+                logger.info(f"EAGLE3: target_hidden_size = {target_hidden_size} (from EAGLE3 config)")
+            else:
+                target_hidden_size = target_config["hidden_size"]
+                logger.info(f"EAGLE3: target_hidden_size = {target_hidden_size} (from target model config)")
+            self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.target_hidden_size", target_hidden_size)
+
+            # Eagle3Speculator norm_before_residual specific handling
+            norm_before_residual = eagle3_raw_config.get("norm_before_residual", False)
+            logger.info(f"EAGLE3: norm_before_residual = {norm_before_residual} (from EAGLE3 config)")
+            self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.norm_before_residual", norm_before_residual)
+
     def set_vocab(self):
+        # For EAGLE-3 models, use tokenizer from target model if provided
+        if hasattr(self, 'is_eagle3') and self.is_eagle3:
+            if self.target_model_dir is None:
+                raise ValueError(
+                    "EAGLE-3 draft model requires --target-model-dir to be specified. "
+                    "Please provide the path to the target model directory containing the tokenizer."
+                )
+            logger.info(f"EAGLE-3: Using tokenizer from target model: {self.target_model_dir}")
+            # Temporarily swap dir_model to load tokenizer from target model
+            original_dir_model = self.dir_model
+            self.dir_model = self.target_model_dir
+
         if self.origin_hf_arch == "GlmasrModel":
             return self._set_vocab_glmedge()
 
@@ -2859,6 +2930,10 @@ class LlamaModel(TextModel):
         if self.hparams.get("vocab_size", 32000) == 49152:
             self.gguf_writer.add_add_bos_token(False)
 
+        # Restore original dir_model for EAGLE-3
+        if hasattr(self, 'is_eagle3') and self.is_eagle3:
+            self.dir_model = original_dir_model
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hparams = self.hparams
@@ -2880,7 +2955,55 @@ class LlamaModel(TextModel):
 
     _experts: list[dict[str, Tensor]] | None = None
 
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        tensors = super().index_tensors(remote_hf_model_id)
+
+        # Handle Eagle3Speculator nested config
+        if "transformer_layer_config" in self.hparams:
+            self.hparams = {**self.hparams, **self.hparams["transformer_layer_config"]}
+            
+        # EAGLE-3 detection: check hparams directly (before self.is_eagle3 is set)
+        if "draft_vocab_size" in self.hparams and self.hparams["num_hidden_layers"] == 1:
+            logger.info("EAGLE-3: Renaming midlayer.* or layers.0.* to model.layers.0.*")
+            new_tensors = {}
+            # EAGLE-3: rename midlayer.* to model.layers.0.* for compatibility with llama model
+            for name, gen in tensors.items():
+                if name.startswith("midlayer."):
+                    new_name = "model.layers.0." + name[len("midlayer."):]
+                    new_tensors[new_name] = gen
+                elif name.startswith("layers.0."): # layers.0.* -> model.layers.0.* (Eagle3Speculator format)
+                    new_name = "model." + name
+                    new_tensors[new_name] = gen
+                else:
+                    new_tensors[name] = gen
+            return new_tensors
+        else:
+            return tensors
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+
+        # Eagle-3 llama checkpoint special handling
+        if hasattr(self, 'is_eagle3') and self.is_eagle3:
+            # Eagle-3 llama checkpoint special weights handling
+            # fc.weight: feature fusion layer
+            if name == "fc.weight":
+                yield (name, data_torch)
+                return
+            # d2t: draft to target vocabulary mapping
+            elif name == "d2t":
+                # Skip parent class processing (store for manual handling in prepare_tensors)
+                if not hasattr(self, '_eagle3_int_tensors'):
+                    self._eagle3_int_tensors = {}
+                self._eagle3_int_tensors[name] = data_torch
+                return
+            # t2d: target to draft vocabulary mapping (not used, skip completely)
+            elif name == "t2d":
+                return
+            # hidden_norm: EAGLE-3 specific layer normalization
+            elif name == "model.layers.0.hidden_norm.weight":
+                yield ("blk.0.hidden_norm.weight", data_torch)
+                return
+
         n_head = self.find_hparam(["n_heads", "num_attention_heads"])
         n_kv_head = self.find_hparam(["n_kv_heads", "num_key_value_heads"])
 
@@ -2950,6 +3073,17 @@ class LlamaModel(TextModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        # EAGLE3: If no lm_head in draft model, load from target model
+        if hasattr(self, 'is_eagle3') and self.is_eagle3 and "lm_head.weight" not in self.model_tensors:
+            from safetensors import safe_open
+            for sf_file in self.target_model_dir.glob("*.safetensors"):
+                with safe_open(sf_file, framework="pt") as f:
+                    if "lm_head.weight" in f.keys():
+                        lm_head = f.get_tensor("lm_head.weight")
+                        logger.info(f"EAGLE3: No lm_head in draft model, loaded lm_head from {sf_file.name}, shape = {lm_head.shape}")
+                        yield ("output.weight", lm_head)
+                        break
+
         if rope_params := self.rope_parameters.get("full_attention", self.rope_parameters):
             if rope_params.get("rope_type", '').lower() == "llama3":
                 base = rope_params.get("rope_theta", 10000.0)
@@ -2980,7 +3114,25 @@ class LlamaModel(TextModel):
                 yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), torch.tensor(rope_factors, dtype=torch.float32))
 
     def prepare_tensors(self):
+        # EAGLE-3: collect original dtypes BEFORE parent class converts them to F32
+        eagle3_original_dtypes = {}
+        if hasattr(self, 'is_eagle3') and self.is_eagle3:
+            for name, data_torch in self.get_tensors():
+                if name == "d2t":
+                    eagle3_original_dtypes[name] = data_torch.dtype
+
         super().prepare_tensors()
+
+        if hasattr(self, 'is_eagle3') and self.is_eagle3 and hasattr(self, '_eagle3_int_tensors'):
+            for name, data_torch in self._eagle3_int_tensors.items():
+                old_dtype = eagle3_original_dtypes.get(name, data_torch.dtype)
+                # Keep as int64 to match original torch tensor dtype
+                data = data_torch.to(torch.int64).numpy()
+                data_qtype = gguf.GGMLQuantizationType.I64
+
+                shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
+                logger.info(f"{name + ',':<30} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
+                self.gguf_writer.add_tensor(name, data, raw_dtype=data_qtype)
 
         if self._experts is not None:
             # flatten `list[dict[str, Tensor]]` into `list[str]`
@@ -4732,6 +4884,47 @@ class Qwen3Model(Qwen2Model):
                     yield from super().modify_tensors(data_torch, name, bid)
                 return
 
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("DFlashDraftModel")
+class DFlashModel(Qwen3Model):
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def set_vocab(self):
+        if self.target_model_dir is None:
+            raise ValueError(
+                "DFlash draft model requires --target-model-dir to be specified. "
+                "Please provide the path to the target model directory containing the tokenizer."
+            )
+        logger.info(f"DFLASH: Using tokenizer from target model: {self.target_model_dir}")
+        original_dir = self.dir_model
+        self.dir_model = self.target_model_dir
+        super().set_vocab()
+        self.dir_model = original_dir
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        block_size = self.hparams.get("block_size", 16)
+        self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.block_size", block_size)
+        dflash_config = self.hparams.get("dflash_config", {})
+        target_layer_ids = dflash_config.get("target_layer_ids", [])
+        if target_layer_ids:
+            extract_layer_ids = [i + 1 for i in target_layer_ids]
+            self.gguf_writer.add_array(f"{self.gguf_writer.arch}.target_layer_ids", extract_layer_ids)
+        mask_token_id = dflash_config.get("mask_token_id", None)
+        if mask_token_id is not None:
+            self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.mask_token_id", mask_token_id)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name == "fc.weight":
+            yield (name, data_torch)
+            return
+        if name == "hidden_norm.weight":
+            yield ("hidden_norm.weight", data_torch)
+            return
+        if not name.startswith("model."):
+            name = "model." + name
         yield from super().modify_tensors(data_torch, name, bid)
 
 
@@ -7180,7 +7373,7 @@ class EmbeddingGemma(Gemma3Model):
                 with open(modules_file, encoding="utf-8") as modules_json_file:
                     mods = json.load(modules_json_file)
                 for mod in mods:
-                    if mod["type"] == "sentence_transformers.models.Dense":
+                    if mod["type"].endswith("Dense"):
                         mod_path = mod["path"]
                         # check if model.safetensors file for Dense layer exists
                         model_tensors_file = self.dir_model / mod_path / "model.safetensors"
@@ -10912,14 +11105,14 @@ class NemotronHModel(GraniteHybridModel):
         vocab_size = -(vocab_size // -pad_vocab) * pad_vocab
         self.hparams["vocab_size"] = vocab_size
 
-        assert max(tokenizer.vocab.values()) < vocab_size
+        assert max(tokenizer.vocab.values()) < vocab_size  # ty: ignore[unresolved-attribute]
 
         tokpre = self.get_vocab_base_pre(tokenizer)
 
-        reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()}
-        added_vocab = tokenizer.get_added_vocab()
+        reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()}  # ty: ignore[unresolved-attribute]
+        added_vocab = tokenizer.get_added_vocab()  # ty: ignore[unresolved-attribute]
 
-        added_tokens_decoder = tokenizer.added_tokens_decoder
+        added_tokens_decoder = tokenizer.added_tokens_decoder  # ty: ignore[unresolved-attribute]
 
         for i in range(vocab_size):
             if i not in reverse_vocab:
@@ -10930,7 +11123,7 @@ class NemotronHModel(GraniteHybridModel):
                 if token in added_vocab:
                     if not added_tokens_decoder[i].normalized:
                         previous_token = token
-                        token = tokenizer.decode(tokenizer.encode(token, add_special_tokens=False))
+                        token = tokenizer.decode(tokenizer.encode(token, add_special_tokens=False))  # ty: ignore[unresolved-attribute, invalid-assignment]
                         if previous_token != token:
                             logger.info(f"{repr(previous_token)} is encoded and decoded back to {repr(token)} using AutoTokenizer")
 
@@ -11847,7 +12040,7 @@ class LLaDAMoEModel(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
-@ModelBase.register("HunYuanDenseV1ForCausalLM", "HunYuanVLForConditionalGeneration")
+@ModelBase.register("HunYuanDenseV1ForCausalLM")
 class HunYuanModel(TextModel):
     model_arch = gguf.MODEL_ARCH.HUNYUAN_DENSE
 
@@ -11986,28 +12179,58 @@ class HunYuanModel(TextModel):
 
 
 @ModelBase.register("HunYuanVLForConditionalGeneration")
-class HunyuanOCRVisionModel(MmprojModel):
+class HunyuanVLVisionModel(MmprojModel):
+    # Handles both HunyuanOCR and HunyuanVL, which share the HF architecture name
+    # "HunYuanVLForConditionalGeneration" and the `vit.perceive.*` vision layout.
+    # Each variant maps to a different projector type in clip.cpp so image
+    # preprocessing follows the correct code path.
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.hparams_vision is not None
-        # HunyuanOCR uses max_image_size instead of image_size
+        # HunyuanOCR / HunyuanVL uses max_image_size instead of image_size
         if "image_size" not in self.hparams_vision:
             self.hparams_vision["image_size"] = self.hparams_vision.get("max_image_size", 2048)
+
+    @staticmethod
+    def is_ocr_variant(hparams: dict) -> bool:
+        """Return True for HunyuanOCR, False for HunyuanVL.
+
+        The projector's output dim must equal the text model's hidden_size by
+        construction (that's what "projector" means). HunyuanOCR pairs a 1B text
+        backbone (hidden=1024); HunyuanVL pairs a 4B one (hidden=3072). So the
+        ViT -> LLM projection dim is a hard architectural signature, not a
+        magic number.
+        """
+        vision_out = int((hparams.get("vision_config") or {}).get("out_hidden_size", 0))
+        return vision_out == 1024
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         assert self.hparams_vision is not None
-        hparams = self.hparams_vision
-        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.HUNYUANOCR)
-        self.gguf_writer.add_vision_use_gelu(True)
-        self.gguf_writer.add_vision_attention_layernorm_eps(hparams.get("rms_norm_eps", 1e-5))
-        self.gguf_writer.add_vision_spatial_merge_size(hparams.get("spatial_merge_size", 2))
-        self.gguf_writer.add_vision_min_pixels(self.preprocessor_config["min_pixels"])
-        self.gguf_writer.add_vision_max_pixels(self.preprocessor_config["max_pixels"])
+        vcfg = self.hparams_vision
+
+        if self.is_ocr_variant(self.global_config):
+            # --- HunyuanOCR ---
+            self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.HUNYUANOCR)
+            self.gguf_writer.add_vision_use_gelu(True)
+            self.gguf_writer.add_vision_attention_layernorm_eps(vcfg.get("rms_norm_eps", 1e-5))
+            self.gguf_writer.add_vision_spatial_merge_size(vcfg.get("spatial_merge_size", 2))
+            self.gguf_writer.add_vision_min_pixels(self.preprocessor_config["min_pixels"])
+            self.gguf_writer.add_vision_max_pixels(self.preprocessor_config["max_pixels"])
+            return
+
+        # --- HunyuanVL ---
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.HUNYUANVL)
+        self.gguf_writer.add_vision_use_gelu(str(vcfg["hidden_act"]).lower() == "gelu")
+        self.gguf_writer.add_vision_attention_layernorm_eps(float(vcfg["rms_norm_eps"]))
+        self.gguf_writer.add_vision_spatial_merge_size(int(vcfg["spatial_merge_size"]))
+        self.gguf_writer.add_vision_min_pixels(int(self.preprocessor_config["min_pixels"]))
+        self.gguf_writer.add_vision_max_pixels(int(self.preprocessor_config["max_pixels"]))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if not name.startswith("vit."):
-            return  # skip text tensors
+            return
         # strip CLS token (row 0) from position embeddings so resize_position_embeddings works
         if "position_embedding" in name:
             data_torch = data_torch[1:]  # [n_patches+1, n_embd] -> [n_patches, n_embd]
@@ -12015,9 +12238,64 @@ class HunyuanOCRVisionModel(MmprojModel):
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
         # force conv weights to F32 or F16 to avoid BF16 IM2COL issues on Metal
+        # Both HunyuanOCR and HunyuanVL emit the ViT -> LLM projection as mm.0/mm.2.
         if ("mm.0." in new_name or "mm.2." in new_name) and new_name.endswith(".weight"):
             return gguf.GGMLQuantizationType.F16 if self.ftype == gguf.LlamaFileType.MOSTLY_F16 else gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+
+@ModelBase.register("HunYuanVLForConditionalGeneration")
+class HunyuanVLTextModel(HunYuanModel):
+    # The "HunYuanVLForConditionalGeneration" HF architecture covers both HunyuanOCR
+    # and HunyuanVL. HunyuanOCR reuses the HunYuan-Dense text backbone (standard RoPE),
+    # while HunyuanVL introduces a new LLM arch with XD-RoPE. Detect the variant from
+    # the config and pick the matching GGUF architecture.
+    model_arch = gguf.MODEL_ARCH.HUNYUAN_VL
+
+    @staticmethod
+    def _is_ocr_config(hparams: dict) -> bool:
+        # OCR pairs a 1B text backbone (hidden=1024) with a ViT projector that
+        # outputs 1024-d; HunyuanVL uses 3072-d. Keep in sync with
+        # HunyuanVLVisionModel.is_ocr_variant.
+        return int((hparams.get("vision_config") or {}).get("out_hidden_size", 0)) == 1024
+
+    def __init__(self, dir_model: Path, *args, **kwargs):
+        raw_hparams = kwargs.get("hparams") or ModelBase.load_hparams(dir_model, is_mistral_format=False)
+        if self._is_ocr_config(raw_hparams):
+            self.model_arch = gguf.MODEL_ARCH.HUNYUAN_DENSE
+        else:
+            self.model_arch = gguf.MODEL_ARCH.HUNYUAN_VL
+        super().__init__(dir_model, *args, **kwargs)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        # Only emit XD-RoPE metadata for the HunyuanVL backbone; HunyuanOCR uses
+        # the HunYuan-Dense arch which already handles standard rope in super().
+        if self.model_arch != gguf.MODEL_ARCH.HUNYUAN_VL:
+            return
+
+        if self.rope_parameters.get("rope_type") != "xdrope":
+            return
+
+        # defaults for HunyuanVL. The C++ side later computes:
+        #   freq_base = rope_theta * alpha ** (head_dim / (head_dim - 2))
+        self.gguf_writer.add_rope_freq_base(float(self.rope_parameters["rope_theta"]))
+        self.gguf_writer.add_rope_scaling_alpha(float(self.rope_parameters["alpha"]))
+        self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.NONE)
+        self.gguf_writer.add_rope_scaling_factor(float(self.rope_parameters.get("factor", 1)))
+
+        ctx_len = int(self.hparams["max_position_embeddings"])
+        self.gguf_writer.add_rope_scaling_orig_ctx_len(ctx_len)
+        self.gguf_writer.add_context_length(ctx_len)
+
+        self.gguf_writer.add_rope_dimension_sections(list(self.rope_parameters["xdrope_section"]))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Skip vision tensors — they are written by HunyuanVLVisionModel
+        if name.startswith("vit."):
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
 
 
 @ModelBase.register("SmolLM3ForCausalLM")
@@ -13114,6 +13392,7 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.float16: np.float16,
         torch.float32: np.float32,
         torch.uint8: np.uint8,
+        torch.int64: np.int64,
     }
 
     # only used when byteswapping data. Only correct size is needed
@@ -13274,6 +13553,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-tensor-first-split", action="store_true",
         help="do not add tensors to the first split (disabled by default)"
+    )
+    parser.add_argument(
+        "--target-model-dir", type=str, default=None,
+        help="directory containing target model tokenizer (for EAGLE-3 draft models that don't have their own tokenizer)",
     )
     parser.add_argument(
         "--metadata", type=Path,
@@ -13459,6 +13742,7 @@ def main() -> None:
                                      small_first_shard=args.no_tensor_first_split,
                                      remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
                                      sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
+                                     target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps
                                      )
 

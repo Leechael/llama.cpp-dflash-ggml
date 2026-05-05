@@ -13,6 +13,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <cinttypes>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -21,6 +22,7 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NONE,
     COMMON_SPECULATIVE_TYPE_DRAFT,
     COMMON_SPECULATIVE_TYPE_EAGLE3,
+    COMMON_SPECULATIVE_TYPE_DFLASH,
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
@@ -32,6 +34,7 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
     {"eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3},
+    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH},
     {"ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -46,6 +49,7 @@ struct common_speculative_config {
     common_speculative_config(common_speculative_type t,
             const common_params_speculative & p = common_params_speculative{}) : type(t), params(p) {}
 };
+
 
 static bool common_speculative_are_compatible(
     const llama_model * model_tgt,
@@ -144,9 +148,27 @@ struct common_speculative_state {
     virtual void accept(uint16_t n_accepted) = 0;
 };
 
+struct common_speculative_checkpoint {
+    llama_pos pos_min  = 0;
+    llama_pos pos_max  = 0;
+
+    int64_t   n_tokens = 0;
+
+    std::vector<uint8_t> data;
+
+    size_t size() const {
+        return data.size();
+    }
+
+    size_t ckpt_size   = 0;
+};
+
 struct common_speculative_state_draft : public common_speculative_state {
     llama_context * ctx_tgt; // only used for retokenizing from ctx_dft
     llama_context * ctx_dft;
+
+    bool use_ckpt = false;
+    struct common_speculative_checkpoint ckpt;
 
     common_sampler * smpl;
 
@@ -160,10 +182,12 @@ struct common_speculative_state_draft : public common_speculative_state {
             enum common_speculative_type type,
             llama_context * ctx_tgt,
             llama_context * ctx_dft,
-            const std::vector<std::pair<std::string, std::string>> & replacements)
+            const std::vector<std::pair<std::string, std::string>> & replacements,
+            bool use_ckpt)
         : common_speculative_state(type)
         , ctx_tgt(ctx_tgt)
         , ctx_dft(ctx_dft)
+        , use_ckpt(use_ckpt)
     {
         batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
         smpl = nullptr;
@@ -210,7 +234,9 @@ struct common_speculative_state_draft : public common_speculative_state {
     ~common_speculative_state_draft() override {
         llama_perf_context_print(ctx_dft);
 
-        llama_free(ctx_dft);
+        if (ctx_dft) {
+            llama_free(ctx_dft);
+        }
 
         common_sampler_free(smpl);
 
@@ -218,7 +244,48 @@ struct common_speculative_state_draft : public common_speculative_state {
     }
 
     void begin(const llama_tokens & prompt) override {
-        GGML_UNUSED(prompt);
+        if (use_ckpt && ckpt.size() > 0) {
+            // delete checkpoint
+            LOG_DBG("%s: delete checkpoint, prompt.size=%zu, pos_min=%d, pos_max=%d, n_tokens=%" PRId64 ", size=%.3f MiB\n",
+                    __func__, prompt.size(), ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, (float) ckpt.data.size() / 1024 / 1024);
+            ckpt.pos_min   = 0;
+            ckpt.pos_max   = 0;
+            ckpt.n_tokens  = 0;
+            ckpt.ckpt_size = 0;
+            ckpt.data.clear();
+        }
+    }
+
+    size_t draft_create_checkpoint(int n_tokens_prompt, int n_tokens_batch) {
+        int slot_id = 0;
+        const size_t checkpoint_size = llama_state_seq_get_size_ext(ctx_dft, slot_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+        ckpt.pos_min  = llama_memory_seq_pos_min(llama_get_memory(ctx_dft), slot_id);
+        ckpt.pos_max  = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot_id);
+        ckpt.n_tokens = n_tokens_prompt - n_tokens_batch;
+        ckpt.data.resize(checkpoint_size);
+
+        const size_t n = llama_state_seq_get_data_ext(ctx_dft, ckpt.data.data(), checkpoint_size, slot_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (n != checkpoint_size) {
+            GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", checkpoint_size, n);
+        }
+
+        LOG_DBG("%s: pos_min = %d, pos_max = %d, size = %.3f MiB\n", __func__,
+                ckpt.pos_min, ckpt.pos_max, (float) ckpt.data.size() / 1024 / 1024);
+        return n;
+    }
+
+    size_t draft_restore_checkpoint(size_t ckpt_size_part_expected) {
+        int slot_id = 0;
+        LOG_DBG("%s: pos_min = %d, pos_max = %d\n", __func__, ckpt.pos_min, ckpt.pos_max);
+        const size_t n = llama_state_seq_set_data_ext(ctx_dft, ckpt.data.data(), ckpt.size(), slot_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (n != ckpt_size_part_expected) {
+            GGML_ABORT("%s: failed to restore context checkpoint (pos_min=%d, pos_max=%d, size=%zu, get_data_ext->%zu, set_data_ext->%zu",
+                        __func__, ckpt.pos_min, ckpt.pos_max, ckpt.size(), ckpt_size_part_expected, n);
+        }
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), slot_id, ckpt.pos_max + 1, -1);
+
+        return n;
     }
 
     void draft(
@@ -228,16 +295,16 @@ struct common_speculative_state_draft : public common_speculative_state {
             llama_tokens & result) override {
         auto * spec = this;
 
-        auto & batch      = spec->batch;
-        auto & ctx_tgt    = spec->ctx_tgt;
-        auto & ctx_dft    = spec->ctx_dft;
-        auto & smpl       = spec->smpl;
-        auto & prompt_dft = spec->prompt_dft;
+        auto & batch       = spec->batch;
+        auto & ctx_tgt     = spec->ctx_tgt;
+        auto & ctx_dft     = spec->ctx_dft;
+        auto & smpl        = spec->smpl;
+        auto & prompt_dft  = spec->prompt_dft;
 
         auto * mem_dft = llama_get_memory(ctx_dft);
 
-        int reuse_i = 0;
-        int reuse_n = 0;
+        int reuse_i = 0; // index of part to be reused in prompt_dft
+        int reuse_n = 0; // length of part to be reused in prompt_dft
 
         const int n_ctx = llama_n_ctx(ctx_dft) - params.n_max;
 
@@ -287,18 +354,26 @@ struct common_speculative_state_draft : public common_speculative_state {
             }
         }
 
-        LOG_DBG("%s: reuse_i = %d, reuse_n = %d, prompt = %d\n", __func__, reuse_i, reuse_n, (int) prompt_dft.size());
+        LOG_DBG("%s: reuse_i = %d, reuse_n = %d, #prompt_dft = %zu, #prompt_cur = %zu\n",
+                __func__, reuse_i, reuse_n, prompt_dft.size(), prompt_cur.size());
+        if (use_ckpt && ckpt.ckpt_size == 0 && reuse_n > 0) {
+            LOG_DBG("%s: no checkpoint available, no reuse, (reuse_i=%d, reuse_n=%d) -> (0, 0)\n",
+                    __func__, reuse_i, reuse_n);
+            reuse_i = 0;
+            reuse_n = 0;
+        }
 
         result.clear();
         result.reserve(params.n_max);
 
-        if (reuse_n == 0) {
+        bool needs_ckpt = use_ckpt && prompt_dft.size() > 0;
+        if (reuse_n == 0 || (use_ckpt && reuse_i > 0)) {
             llama_memory_clear(mem_dft, false);
             prompt_dft.clear();
         } else {
             // this happens when a previous draft has been discarded (for example, due to being too small), but the
             // target model agreed with it. in this case, we simply pass back the previous results to save compute
-            if (reuse_i + reuse_n < (int) prompt_dft.size() && prompt_dft[reuse_i + reuse_n] == id_last) {
+            if (reuse_i + reuse_n < (int64_t) prompt_dft.size() && prompt_dft[reuse_i + reuse_n] == id_last) {
                 for (int i = reuse_i + reuse_n + 1; i < (int) prompt_dft.size(); ++i) {
                     result.push_back(prompt_dft[i]);
 
@@ -310,17 +385,48 @@ struct common_speculative_state_draft : public common_speculative_state {
                 return;
             }
 
+            bool do_restore = false;
+            if (prompt_dft.size() > prompt_cur.size() && reuse_i + reuse_n < (int64_t) prompt_dft.size()) {
+                // This can happen after a partial acceptance (speculative decoding with checkpoints)
+                LOG_DBG("%s: #prompt_dft=%zu, #prompt_cur=%zu, shorten draft\n",
+                        __func__, prompt_dft.size(), prompt_cur.size());
+                prompt_dft.resize(prompt_cur.size());
+                do_restore = true;
+            }
+
             if (reuse_i > 0) {
-                llama_memory_seq_rm (mem_dft, 0, 0, reuse_i);
+                bool is_removed = llama_memory_seq_rm (mem_dft, 0, 0, reuse_i);
+                if (!is_removed) {
+                    LOG_ERR("%s: llama_memory_seq_rm failed, reuse_i=%d\n", __func__, reuse_i);
+                }
                 llama_memory_seq_add(mem_dft, 0, reuse_i, -1, -reuse_i);
 
                 prompt_dft.erase(prompt_dft.begin(), prompt_dft.begin() + reuse_i);
             }
 
-            if (reuse_n < (int) prompt_dft.size()) {
-                llama_memory_seq_rm (mem_dft, 0, reuse_n, -1);
-                prompt_dft.erase(prompt_dft.begin() + reuse_n, prompt_dft.end());
+            if (reuse_n < (int) prompt_dft.size() || do_restore) {
+                if (use_ckpt) {
+                    if (ckpt.n_tokens > (int64_t) prompt_dft.size()) {
+                        LOG_INF("%s: checkpoint is too large, prompt_tgt.size=%zu, ckpt.n_tokens=%" PRId64 ", reuse_n=%d, prompt_dft.size=%zu\n",
+                                __func__, prompt_tgt.size(), ckpt.n_tokens, reuse_n, prompt_dft.size());
+                    }
+                    draft_restore_checkpoint(ckpt.ckpt_size);
+                    reuse_n = ckpt.n_tokens;
+                    prompt_dft.resize(reuse_n);
+                    needs_ckpt = false;
+                } else {
+                    bool is_removed = llama_memory_seq_rm (mem_dft, 0, reuse_n, -1);
+                    if (!is_removed) {
+                        LOG_ERR("%s: llama_memory_seq_rm failed, reuse_n=%d, prompt_dft.size=%zu\n",
+                                __func__, reuse_n, prompt_dft.size());
+                    }
+                    prompt_dft.erase(prompt_dft.begin() + reuse_n, prompt_dft.end());
+                }
             }
+        }
+
+        if (needs_ckpt) {
+            ckpt.ckpt_size = draft_create_checkpoint(prompt_dft.size(), batch.n_tokens);
         }
 
         // prepare a batch to evaluate any new tokens in the prompt
@@ -337,7 +443,11 @@ struct common_speculative_state_draft : public common_speculative_state {
         if (batch.n_tokens > 0) {
             //LOG_DBG("%s: draft prompt batch: %s\n", __func__, string_from(ctx, batch).c_str());
 
-            llama_decode(ctx_dft, batch);
+            int ret = llama_decode(ctx_dft, batch);
+            if (ret != 0 && ret != 1) {
+                LOG_WRN("%s: llama_decode returned %d, prompt_cur.size=%zu\n",
+                        __func__, ret, prompt_cur.size());
+            }
         }
 
         const llama_pos n_past = prompt_dft.size();
@@ -351,7 +461,11 @@ struct common_speculative_state_draft : public common_speculative_state {
 
         LOG_DBG("%s: draft prompt: %s\n", __func__, string_from(ctx_dft, prompt_dft).c_str());
 
-        llama_decode(ctx_dft, batch);
+        int ret = llama_decode(ctx_dft, batch);
+        if (ret != 0 && ret != 1) {
+            LOG_WRN("%s: llama_decode returned %d, prompt_cur.size=%zu, prompt_dft.size=%zu\n",
+                    __func__, ret, prompt_cur.size(), prompt_dft.size());
+        }
 
         common_sampler_reset(smpl);
 
@@ -387,7 +501,11 @@ struct common_speculative_state_draft : public common_speculative_state {
             common_batch_add(batch, id, n_past + i + 1, { 0 }, true);
 
             // evaluate the drafted tokens on the draft model
-            llama_decode(ctx_dft, batch);
+            ret = llama_decode(ctx_dft, batch);
+            if (ret != 0) {
+                LOG_WRN("%s: llama_decode[%d] returned %d, prompt_cur.size=%zu, prompt_dft.size=%zu\n",
+                        __func__, i, ret, prompt_cur.size(), prompt_dft.size());
+            }
 
             prompt_dft.push_back(id);
         }
@@ -438,7 +556,52 @@ struct common_speculative_state_draft : public common_speculative_state {
 };
 
 struct common_speculative_state_eagle3 : public common_speculative_state {
-    common_speculative_state_eagle3(enum common_speculative_type type) : common_speculative_state(type) {}
+    llama_context * ctx_tgt;
+
+    common_sampler * smpl;
+
+    llama_batch batch;
+
+    struct llama_context * ctx_dft_enc = nullptr;
+    struct llama_context * ctx_dft_dec = nullptr;
+
+    int32_t eagle3_n_past = 0;  // number of verified positions in decoder KV cache
+
+    common_speculative_state_eagle3(
+            enum common_speculative_type type,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft_enc,
+            llama_context * ctx_dft_dec)
+        : common_speculative_state(type)
+        , ctx_tgt(ctx_tgt)
+        , ctx_dft_enc(ctx_dft_enc)
+        , ctx_dft_dec(ctx_dft_dec)
+    {
+        batch = llama_batch_init(llama_n_batch(ctx_dft_dec), 0, 1);
+
+        // Initialize sampler for EAGLE3 decoder
+        common_params_sampling params;
+        params.no_perf = false;
+        params.top_k = 10; // set 1 for greedy sampling (argmax) to match vLLM's default behavior but >1 always gets higher acceptance rate for eagle3
+        params.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+        smpl = common_sampler_init(llama_get_model(ctx_dft_dec), params);
+    }
+
+    ~common_speculative_state_eagle3() override {
+        llama_perf_context_print(ctx_dft_dec);
+
+        if (ctx_dft_dec) {
+            llama_free(ctx_dft_dec);
+        }
+
+        if (ctx_dft_enc) {
+            llama_free(ctx_dft_enc);
+        }
+
+        common_sampler_free(smpl);
+
+        llama_batch_free(batch);
+    }
 
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
@@ -448,16 +611,234 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & draft_tokens) override {
-        // TODO: implement
-        GGML_UNUSED(params);
-        GGML_UNUSED(prompt_tgt);
-        GGML_UNUSED(id_last);
-        GGML_UNUSED(draft_tokens);
+            llama_tokens & result) override {
+        auto * spec = this;
+
+        auto & batch       = spec->batch;
+        auto & ctx_tgt     = spec->ctx_tgt;
+        auto & ctx_dft_enc = spec->ctx_dft_enc;
+        auto & ctx_dft_dec = spec->ctx_dft_dec;
+        auto & smpl        = spec->smpl;
+
+        //result = gen_eagle3_draft(spec, params, prompt_tgt, id_last);
+        const int n_embd = llama_model_n_embd(llama_get_model(ctx_dft_enc));
+        const int n      = (int)prompt_tgt.size();
+        const int n_new  = n - spec->eagle3_n_past;
+
+        GGML_ASSERT(n >= 1 && "prompt_tgt is empty");
+        GGML_ASSERT(n_new >= 1 && "must have at least 1 new token");
+
+        // Clear draft positions from decoder KV cache [n_past, inf)
+        llama_memory_seq_rm(llama_get_memory(ctx_dft_dec), 0, spec->eagle3_n_past, -1);
+
+        // Encoder: features → g_embeddings
+        const float * features = llama_get_eagle3_target_features(ctx_tgt);
+        GGML_ASSERT(features && "no target features");
+
+        llama_batch enc_batch = {
+            /*.n_tokens  =*/ n_new,
+            /*.token     =*/ nullptr,
+            /*.embd      =*/ const_cast<float*>(features),
+            /*.pos       =*/ nullptr,
+            /*.n_seq_id  =*/ nullptr,
+            /*.seq_id    =*/ nullptr,
+            /*.logits    =*/ nullptr,
+        };
+        GGML_ASSERT(llama_encode(ctx_dft_enc, enc_batch) == 0);
+
+        const float * g_embd = llama_get_embeddings(ctx_dft_enc);
+        GGML_ASSERT(g_embd && "encoder output failed");
+
+        // Decoder batch: process new tokens with KV cache reuse
+        llama_set_eagle3_g_embeddings(ctx_dft_dec, g_embd, n_embd, n_new);
+
+        common_batch_clear(batch);
+        for (int i = 0; i < n_new; i++) {
+            const int pos = spec->eagle3_n_past + i;
+            const llama_token tok = (pos < n - 1) ? prompt_tgt[pos + 1] : id_last;
+            common_batch_add(batch, tok, pos, {0}, true);
+        }
+
+        GGML_ASSERT(llama_decode(ctx_dft_dec, batch) == 0);
+
+        spec->eagle3_n_past = n;  // update verified positions
+
+        // Sample draft tokens
+        result.clear();
+        common_sampler_reset(smpl);
+
+        // Sample and check probability (consistent with standard speculative decoding)
+        auto sample_and_check = [&](int idx) -> bool {
+            common_sampler_sample(smpl, ctx_dft_dec, idx);
+
+            const auto * cur_p = common_sampler_get_candidates(smpl, true);
+            const llama_token id = cur_p->data[0].id;
+
+            common_sampler_accept(smpl, id, true);
+            result.push_back(id);
+
+            return cur_p->data[0].p >= params.p_min;
+        };
+
+        // First draft token from batch decode
+        if (!sample_and_check(n_new - 1)) {
+            return;
+        }
+
+        // Autoregressive: use prenorm as g_embd (-1 = last output)
+        const float * prenorm = llama_get_embeddings_ith(ctx_dft_dec, -1);
+
+        for (int i = 1; i < params.n_max; i++) {
+            GGML_ASSERT(prenorm && "prenorm failed");
+            llama_set_eagle3_g_embeddings(ctx_dft_dec, prenorm, n_embd, 1);
+
+            common_batch_clear(batch);
+            common_batch_add(batch, result.back(), n - 1 + i, {0}, true);
+            GGML_ASSERT(llama_decode(ctx_dft_dec, batch) == 0);
+
+            prenorm = llama_get_embeddings_ith(ctx_dft_dec, -1);
+
+            if (!sample_and_check(0)) {
+                break;
+            }
+        }
     }
 
     void accept(uint16_t n_accepted) override {
         // noop
+        GGML_UNUSED(n_accepted);
+    }
+};
+
+struct common_speculative_state_dflash : public common_speculative_state {
+    llama_context * ctx_tgt;
+
+    common_sampler * smpl;
+
+    llama_batch batch;
+
+    struct llama_context * ctx_dft_enc = nullptr;
+    struct llama_context * ctx_dft_dec = nullptr;
+
+    int32_t dflash_n_past = 0;
+
+    // Host-side buffer: accumulated DFlash-encoded target features across all
+    // committed prompt+drafted tokens. Grows by `n_new * n_embd` floats per draft step
+    // and is fed to the DFlash decoder via llama_set_dflash_accumulated_target_ctx()
+    std::vector<float> accumulated_ctx;
+
+    common_speculative_state_dflash(
+            enum common_speculative_type type,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft_enc,
+            llama_context * ctx_dft_dec)
+        : common_speculative_state(type)
+        , ctx_tgt(ctx_tgt)
+        , ctx_dft_enc(ctx_dft_enc)
+        , ctx_dft_dec(ctx_dft_dec)
+    {
+        batch = llama_batch_init(llama_n_batch(ctx_dft_dec), 0, 1);
+
+        common_params_sampling params;
+        params.no_perf = false;
+        params.top_k = 1;
+        params.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+        smpl = common_sampler_init(llama_get_model(ctx_dft_dec), params);
+    }
+
+    ~common_speculative_state_dflash() override {
+        llama_perf_context_print(ctx_dft_dec);
+
+        if (ctx_dft_dec) {
+            llama_free(ctx_dft_dec);
+        }
+
+        if (ctx_dft_enc) {
+            llama_free(ctx_dft_enc);
+        }
+
+        common_sampler_free(smpl);
+        llama_batch_free(batch);
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        GGML_UNUSED(prompt);
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        const int n_embd           = llama_model_n_embd(llama_get_model(ctx_dft_dec));
+        // block_size is bounded by the model's trained block_size (from GGUF metadata).
+        const int model_block_size = llama_model_dflash_block_size(llama_get_model(ctx_dft_dec));
+        const int block_size       = std::min((int)params.n_max, model_block_size);
+        const int n                = (int)prompt_tgt.size();
+        const int n_new            = n - dflash_n_past;
+
+        GGML_ASSERT(n >= 1 && "prompt_tgt is empty");
+        GGML_ASSERT(n_new >= 1 && "must have at least 1 new token");
+
+        // Step 1: Encode new accepted tokens' features
+        const float * features = llama_get_dflash_target_features(ctx_tgt);
+
+        llama_batch enc_batch = {
+            /*.n_tokens  =*/ n_new,
+            /*.token     =*/ nullptr,
+            /*.embd      =*/ const_cast<float*>(features),
+            /*.pos       =*/ nullptr,
+            /*.n_seq_id  =*/ nullptr,
+            /*.seq_id    =*/ nullptr,
+            /*.logits    =*/ nullptr,
+        };
+        if (llama_encode(ctx_dft_enc, enc_batch) != 0) {
+            LOG_ERR("DFlash: encoder failed\n");
+            return;
+        }
+
+        const float * target_ctx_new = llama_get_embeddings(ctx_dft_enc);
+        GGML_ASSERT(target_ctx_new && "encoder output is null");
+
+        // Step 2: Append to accumulated target_ctx and set on decoder context (writes to cross.v_embd)
+        const size_t new_size = (size_t)n_embd * n_new;
+        accumulated_ctx.insert(accumulated_ctx.end(), target_ctx_new, target_ctx_new + new_size);
+
+        const int n_ctx_total = (int)(accumulated_ctx.size() / n_embd);
+        llama_set_dflash_accumulated_target_ctx(ctx_dft_dec, accumulated_ctx.data(), n_embd, n_ctx_total);
+
+        // Step 3: Decode noise block
+        const llama_token mask_token_id = llama_model_dflash_mask_token_id(llama_get_model(ctx_dft_dec));
+
+        common_batch_clear(batch);
+        for (int i = 0; i < block_size; i++) {
+            const llama_token tok = (i == 0) ? id_last : mask_token_id;
+            common_batch_add(batch, tok, i, {0}, true);
+        }
+
+        if (llama_decode(ctx_dft_dec, batch) != 0) {
+            LOG_ERR("DFlash: noise decode failed\n");
+            return;
+        }
+
+        dflash_n_past = n;
+
+        // Step 4: Sample draft tokens from positions 1..block_size-1
+        result.clear();
+        common_sampler_reset(smpl);
+
+        for (int i = 1; i < block_size; i++) {
+            common_sampler_sample(smpl, ctx_dft_dec, i);
+
+            const auto * cur_p = common_sampler_get_candidates(smpl, true);
+            const llama_token id = cur_p->data[0].id;
+
+            common_sampler_accept(smpl, id, true);
+            result.push_back(id);
+        }
+    }
+
+    void accept(uint16_t n_accepted) override {
         GGML_UNUSED(n_accepted);
     }
 };
@@ -636,6 +1017,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
 
                     mod.reset();
                     n_low = 0;
+                    i_last = 0;
                 }
             } else {
                 n_low = 0;
@@ -739,6 +1121,7 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
 
 struct common_speculative {
     std::vector<std::unique_ptr<common_speculative_state>> impls; // list of implementations to use and their states
+
     common_speculative_state * curr_impl = nullptr; // current implementation in use (for stats)
 };
 
@@ -798,53 +1181,41 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
     return it->second;
 }
 
-bool common_speculative_is_compat(llama_context * ctx_tgt) {
-    auto * mem = llama_get_memory(ctx_tgt);
-    if (mem == nullptr) {
-        return false;
-    }
-
-    bool res = true;
-
-    llama_memory_clear(mem, true);
-
-    // eval 2 tokens to check if the context is compatible
-    std::vector<llama_token> tmp;
-    tmp.push_back(0);
-    tmp.push_back(0);
-
-    int ret = llama_decode(ctx_tgt, llama_batch_get_one(tmp.data(), tmp.size()));
-    if (ret != 0) {
-        LOG_ERR("%s: llama_decode() failed: %d\n", __func__, ret);
-        res = false;
-        goto done;
-    }
-
-    // try to remove the last tokens
-    if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
-        LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
-        res = false;
-        goto done;
-    }
-
-done:
-    llama_memory_clear(mem, true);
-    llama_synchronize(ctx_tgt);
-
-    return res;
-}
-
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt) {
     llama_context * ctx_dft = nullptr;
+
+    llama_context * ctx_dft_enc = nullptr;
+    llama_context * ctx_dft_dec = nullptr;
+
     if (params.model_dft) {
-        ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
-        if (ctx_dft == nullptr) {
-            LOG_ERR("%s", "failed to create draft context\n");
-            return nullptr;
+        if (params.eagle3 || params.dflash) {
+            llama_context_params params_enc = params.cparams_dft;
+            params_enc.target_model = nullptr;
+            params_enc.embeddings = true;
+            ctx_dft_enc = llama_init_from_model(params.model_dft, params_enc);
+            if (!ctx_dft_enc) {
+                LOG_ERR("failed to create %s draft model encoder context\n", params.eagle3 ? "EAGLE3" : "DFlash");
+                return nullptr;
+            }
+
+            llama_context_params params_dec = params.cparams_dft;
+            params_dec.target_model = params.model_tgt;
+            params_dec.embeddings = true;
+            ctx_dft_dec = llama_init_from_model(params.model_dft, params_dec);
+            if (!ctx_dft_dec) {
+                LOG_ERR("failed to create %s draft model decoder context\n", params.eagle3 ? "EAGLE3" : "DFlash");
+                return nullptr;
+            }
+        } else {
+            ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
+            if (ctx_dft == nullptr) {
+                LOG_ERR("failed to create draft model context\n");
+                return nullptr;
+            }
         }
     }
 
@@ -852,7 +1223,8 @@ common_speculative * common_speculative_init(
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
         bool has_draft = !params.mparams_dft.path.empty();
-        bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
+        bool has_draft_eagle3 = params.eagle3;
+        bool has_draft_dflash = params.dflash;
 
         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
         bool has_ngram_simple  = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
@@ -893,10 +1265,13 @@ common_speculative * common_speculative_init(
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
         }
         if (has_draft) {
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
-        }
-        if (has_draft_eagle3) {
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
+            if (has_draft_eagle3) {
+                configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
+            } else if (has_draft_dflash) {
+                configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
+            } else {
+                configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
+            }
         }
     }
 
@@ -908,15 +1283,30 @@ common_speculative * common_speculative_init(
             case COMMON_SPECULATIVE_TYPE_NONE:
                 break;
             case COMMON_SPECULATIVE_TYPE_DRAFT: {
+                const bool use_ckpt = common_context_can_seq_rm(ctx_dft) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+
                 impls.push_back(std::make_unique<common_speculative_state_draft>(config.type,
                     /* .ctx_tgt      = */ ctx_tgt,
                     /* .ctx_dft      = */ ctx_dft,
-                    /* .replacements = */ params.replacements
+                    /* .replacements = */ params.replacements,
+                    /* .use_ckpt     = */ use_ckpt
                 ));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
-                impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type));
+                impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type,
+                    /* .ctx_tgt      = */ ctx_tgt,
+                    /* .ctx_dft_enc  = */ ctx_dft_enc,
+                    /* .ctx_dft_dec  = */ ctx_dft_dec
+                ));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DFLASH: {
+                impls.push_back(std::make_unique<common_speculative_state_dflash>(config.type,
+                    /* .ctx_tgt      = */ ctx_tgt,
+                    /* .ctx_dft_enc  = */ ctx_dft_enc,
+                    /* .ctx_dft_dec  = */ ctx_dft_dec
+                ));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
@@ -966,7 +1356,8 @@ common_speculative * common_speculative_init(
     }
 
     auto * result = new common_speculative {
-        /* .impls = */ std::move(impls)
+        /* .impls     = */ std::move(impls),
+        /* .curr_impl = */ nullptr,
     };
 
     return result;
