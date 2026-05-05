@@ -336,6 +336,29 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
+    ggml_tensor * conv_persist = nullptr;
+    if (parent_ids != nullptr && dflash_persist_conv_l != nullptr &&
+            il >= 0 && il < (int32_t)dflash_persist_conv_l->size()) {
+        conv_persist = (*dflash_persist_conv_l)[il];
+    }
+
+    ggml_tensor * ssm_persist = nullptr;
+    if (parent_ids != nullptr && dflash_persist_inter_l != nullptr &&
+            il >= 0 && il < (int32_t)dflash_persist_inter_l->size()) {
+        ssm_persist = (*dflash_persist_inter_l)[il];
+    }
+
+    static const bool s_skip_tree_live_updates = []{
+        const char * e = getenv("LLAMA_DDTREE_SKIP_TREE_LIVE_UPDATES");
+        return e == nullptr || e[0] != '0';
+    }();
+    const bool skip_tree_live_updates =
+        s_skip_tree_live_updates &&
+        parent_ids != nullptr &&
+        n_seq_tokens > 1 &&
+        conv_persist != nullptr &&
+        ssm_persist != nullptr;
+
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
@@ -357,7 +380,9 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
                      kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
     cb(state_update_target, "state_update_target", il);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    if (!skip_tree_live_updates) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    }
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -366,11 +391,6 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     // use tree conv when parent_ids are set; identical output shape to ggml_ssm_conv.
     // Phase 5 fix: when a per-layer conv-persist buffer is allocated, use the
     // _persist variant so each token writes its post-state for SSM rollback.
-    ggml_tensor * conv_persist = nullptr;
-    if (parent_ids != nullptr && dflash_persist_conv_l != nullptr &&
-            il >= 0 && il < (int32_t)dflash_persist_conv_l->size()) {
-        conv_persist = (*dflash_persist_conv_l)[il];
-    }
     ggml_tensor * conv_output_proper;
     if (parent_ids != nullptr) {
         conv_output_proper = (conv_persist != nullptr)
@@ -442,10 +462,12 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(new_state, "new_state", il);
 
     // Update the recurrent states
-    ggml_build_forward_expand(gf,
-            ggml_cpy(ctx0, new_state,
-                ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    if (!skip_tree_live_updates) {
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, new_state,
+                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
