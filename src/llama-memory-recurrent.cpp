@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_map>
 
 //
 // llama_memory_recurrent
@@ -604,7 +605,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens && ubatch.parent_id == nullptr) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
@@ -664,6 +665,147 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
     return true;
+}
+
+llama_mem_snapshot_id llama_memory_recurrent::snapshot(llama_seq_id seq_id) {
+    if (seq_id < 0 || (uint32_t) seq_id >= size) {
+        return LLAMA_MEM_SNAPSHOT_INVALID;
+    }
+
+    const int32_t n_layer = (int32_t) r_l.size();
+
+    snapshot_entry entry;
+    entry.seq_id = seq_id;
+    entry.r_backup.resize(n_layer, nullptr);
+    entry.s_backup.resize(n_layer, nullptr);
+
+    // group backup tensors by buffer type, matching the main cache allocation pattern
+    struct ggml_backend_buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(2u * n_layer * ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) { return nullptr; }
+            ctx_map.emplace(buft, ctx);
+            return ctx;
+        }
+        return it->second.get();
+    };
+
+    for (int il = 0; il < n_layer; ++il) {
+        if (r_l[il] == nullptr) { continue; }
+
+        ggml_backend_buffer_t main_buf = r_l[il]->buffer;
+        ggml_backend_buffer_type_t buft = main_buf
+            ? ggml_backend_buffer_get_type(main_buf)
+            : ggml_backend_cpu_buffer_type();
+
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) { return LLAMA_MEM_SNAPSHOT_INVALID; }
+
+        // one cell worth of r and s
+        ggml_tensor * rb = ggml_new_tensor_1d(ctx, r_l[il]->type, hparams.n_embd_r());
+        ggml_tensor * sb = ggml_new_tensor_1d(ctx, s_l[il]->type, hparams.n_embd_s());
+        entry.r_backup[il] = rb;
+        entry.s_backup[il] = sb;
+    }
+
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) { return LLAMA_MEM_SNAPSHOT_INVALID; }
+        ggml_backend_buffer_clear(buf, 0);
+        entry.ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // copy current cell state into the backup tensors via a host bounce buffer.
+    // ggml_backend_tensor_copy doesn't follow view_src->buffer, but tensor_get/set do.
+    const int32_t cell_id = cells[seq_id].tail;
+    entry.cell_id = cell_id;
+    if (cell_id >= 0) {
+        entry.cell_pos = cells[cell_id].pos;
+        entry.cell_src = cells[cell_id].src;
+    }
+    if (cell_id >= 0) {
+        std::vector<uint8_t> bounce;
+        for (int il = 0; il < n_layer; ++il) {
+            if (r_l[il] == nullptr) { continue; }
+
+            const size_t r_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+            const size_t s_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+
+            if (bounce.size() < std::max(r_row, s_row)) {
+                bounce.resize(std::max(r_row, s_row));
+            }
+
+            ggml_backend_tensor_get(r_l[il], bounce.data(), (size_t) cell_id * r_row, r_row);
+            ggml_backend_tensor_set(entry.r_backup[il], bounce.data(), 0, r_row);
+
+            ggml_backend_tensor_get(s_l[il], bounce.data(), (size_t) cell_id * s_row, s_row);
+            ggml_backend_tensor_set(entry.s_backup[il], bounce.data(), 0, s_row);
+        }
+    }
+
+    llama_mem_snapshot_id snap_id = next_snap_id++;
+    snapshots.emplace(snap_id, std::move(entry));
+    return snap_id;
+}
+
+bool llama_memory_recurrent::restore(llama_mem_snapshot_id snap_id) {
+    auto it = snapshots.find(snap_id);
+    if (it == snapshots.end()) { return false; }
+
+    const snapshot_entry & entry = it->second;
+    const llama_seq_id seq_id = entry.seq_id;
+
+    if (seq_id < 0 || (uint32_t) seq_id >= size) { return false; }
+
+    // restore the seq's tail to the cell that was snapshotted
+    const int32_t cell_id = entry.cell_id;
+    if (cell_id < 0) {
+        return true; // no live cell at snapshot time — nothing to restore
+    }
+
+    cells[seq_id].tail = cell_id;
+    cells[cell_id].pos = entry.cell_pos;
+    cells[cell_id].src = entry.cell_src;
+
+    const int32_t n_layer = (int32_t) r_l.size();
+
+    std::vector<uint8_t> bounce;
+    for (int il = 0; il < n_layer; ++il) {
+        if (r_l[il] == nullptr) { continue; }
+        if (entry.r_backup[il] == nullptr) { continue; }
+
+        const size_t r_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+        const size_t s_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+
+        if (bounce.size() < std::max(r_row, s_row)) {
+            bounce.resize(std::max(r_row, s_row));
+        }
+
+        ggml_backend_tensor_get(entry.r_backup[il], bounce.data(), 0, r_row);
+        ggml_backend_tensor_set(r_l[il], bounce.data(), (size_t) cell_id * r_row, r_row);
+
+        ggml_backend_tensor_get(entry.s_backup[il], bounce.data(), 0, s_row);
+        ggml_backend_tensor_set(s_l[il], bounce.data(), (size_t) cell_id * s_row, s_row);
+    }
+
+    return true;
+}
+
+void llama_memory_recurrent::release(llama_mem_snapshot_id snap_id) {
+    snapshots.erase(snap_id);
 }
 
 size_t llama_memory_recurrent::total_size() const {

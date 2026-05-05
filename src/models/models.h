@@ -56,6 +56,7 @@ struct llm_build_delta_net_base : public llm_graph_context {
                         int   il);
 
     // choose one of two implementations above based on the number of tokens
+    // if parent_ids != nullptr, dispatches to build_delta_net_tree
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
                 ggml_tensor * q,
                 ggml_tensor * k,
@@ -63,6 +64,20 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
+                        int   il);
+
+    // tree-mode variant: uses ggml_ssm_conv_tree + ggml_gated_delta_net_tree
+    // When persist_inter != nullptr, calls ggml_gated_delta_net_tree_persist to write
+    // per-token intermediate states to the provided external buffer.
+    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_tree(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s,
+                ggml_tensor * par_ids,      // [n_tokens] i32
+                ggml_tensor * persist_inter, // optional, may be null
                         int   il);
 };
 
@@ -180,6 +195,10 @@ struct llm_build_command_r : public llm_graph_context {
 
 struct llm_build_dbrx : public llm_graph_context {
     llm_build_dbrx(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_dflash_draft : public llm_graph_context {
+    llm_build_dflash_draft(const llama_model & model, const llm_graph_params & params);
 };
 
 struct llm_build_deci : public llm_graph_context {

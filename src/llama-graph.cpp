@@ -326,8 +326,14 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
 
-    res &= head == mctx->get_head();
-    res &= rs_z == mctx->get_rs_z();
+    const bool read_only_tree_compatible =
+        read_only_tree &&
+        params.ubatch.parent_id != nullptr &&
+        params.ubatch.n_tokens > 1;
+    if (!read_only_tree_compatible) {
+        res &= head == mctx->get_head();
+        res &= rs_z == mctx->get_rs_z();
+    }
 
     return res;
 }
@@ -613,8 +619,14 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
 
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    const bool read_only_tree_compatible =
+        inp_rs->read_only_tree &&
+        params.ubatch.parent_id != nullptr &&
+        params.ubatch.n_tokens > 1;
+    if (!read_only_tree_compatible) {
+        res &= inp_rs->head == mctx->get_recr()->get_head();
+        res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    }
 
     return res;
 }
@@ -783,6 +795,17 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     return true;
 }
 
+void llm_graph_input_tree::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->parent_id != nullptr);
+    GGML_ASSERT(inp_parent_ids != nullptr);
+
+    const int32_t n_tokens = (int32_t) ubatch->n_tokens;
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(inp_parent_ids->buffer));
+    int32_t * data = (int32_t *) inp_parent_ids->data;
+    memcpy(data, ubatch->parent_id, n_tokens * sizeof(int32_t));
+}
+
 //
 // llm_graph_result
 //
@@ -801,9 +824,12 @@ int64_t llm_graph_result::get_max_nodes() const {
 void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
-    t_logits      = nullptr;
-    t_embd        = nullptr;
-    t_embd_pooled = nullptr;
+    t_logits        = nullptr;
+    t_embd          = nullptr;
+    t_embd_pooled   = nullptr;
+    t_hidden_capture = nullptr;
+    t_dflash_top_logits = nullptr;
+    t_dflash_top_ids = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -841,6 +867,15 @@ void llm_graph_result::set_outputs() {
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
+    }
+    if (t_hidden_capture != nullptr) {
+        ggml_set_output(t_hidden_capture);
+    }
+    if (t_dflash_top_logits != nullptr) {
+        ggml_set_output(t_dflash_top_logits);
+    }
+    if (t_dflash_top_ids != nullptr) {
+        ggml_set_output(t_dflash_top_ids);
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
@@ -891,6 +926,81 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     if (debug > 0) {
         LLAMA_LOG_DEBUG("%s: can reuse graph = %d\n", __func__, res);
+    }
+
+    return res;
+}
+
+void llm_graph_input_target_feat::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    // host_data, n_embd_fc, ctx_len are stashed by llama_set_target_feat_raw() before decode.
+    const float * data    = *host_data_ptr;
+    const int64_t fc      = *n_embd_fc_ptr;
+    const int64_t ctx_len = *ctx_len_ptr;
+
+    if (inp_target_feat_raw && inp_target_feat_raw->buffer != nullptr && data != nullptr) {
+        GGML_ASSERT(inp_target_feat_raw->ne[0] == fc);
+        GGML_ASSERT(inp_target_feat_raw->ne[1] == ctx_len);
+        ggml_backend_tensor_set(inp_target_feat_raw, data, 0, (size_t)fc * ctx_len * sizeof(float));
+    }
+
+    // pos_q is local to the draft attention window, not the target's global
+    // sequence position. The draft attends over target_feat[0..ctx_len) plus
+    // the block's noise tokens, matching standalone DFlash's draft_ctx+i.
+    if (inp_pos_q && inp_pos_q->buffer != nullptr) {
+        const int64_t block_size = inp_pos_q->ne[0];
+        std::vector<int32_t> pos_q(block_size);
+        for (int64_t i = 0; i < block_size; ++i) {
+            pos_q[i] = (int32_t)(ctx_len + i);
+        }
+        ggml_backend_tensor_set(inp_pos_q, pos_q.data(), 0, block_size * sizeof(int32_t));
+    }
+
+    // pos_k: [0 .. ctx_len + block_size)
+    if (inp_pos_k && inp_pos_k->buffer != nullptr) {
+        const int64_t total_k = inp_pos_k->ne[0];
+        std::vector<int32_t> pos_k(total_k);
+        for (int64_t i = 0; i < total_k; ++i) {
+            pos_k[i] = (int32_t)i;
+        }
+        ggml_backend_tensor_set(inp_pos_k, pos_k.data(), 0, total_k * sizeof(int32_t));
+    }
+}
+
+bool llm_graph_input_target_feat::can_reuse(const llm_graph_params & params) {
+    if (params.pending_target_feat_raw_ptr == nullptr ||
+            params.pending_target_feat_n_embd_fc_ptr == nullptr ||
+            params.pending_target_feat_ctx_len_ptr == nullptr) {
+        return false;
+    }
+
+    const int64_t fc       = *params.pending_target_feat_n_embd_fc_ptr;
+    const int64_t ctx_len  = *params.pending_target_feat_ctx_len_ptr;
+    const int64_t n_tokens = params.ubatch.n_tokens;
+
+    if (fc <= 0 || ctx_len <= 0 || n_tokens <= 0) {
+        return false;
+    }
+
+    bool res = true;
+    res &= inp_target_feat_raw != nullptr;
+    res &= inp_pos_q           != nullptr;
+    res &= inp_pos_k           != nullptr;
+
+    if (inp_target_feat_raw) {
+        res &= inp_target_feat_raw->ne[0] == fc;
+        res &= inp_target_feat_raw->ne[1] == ctx_len;
+    }
+    if (inp_pos_q) {
+        res &= inp_pos_q->ne[0] == n_tokens;
+    }
+    if (inp_pos_k) {
+        res &= inp_pos_k->ne[0] == ctx_len + n_tokens;
+    }
+
+    if (debug > 1) {
+        LLAMA_LOG_DEBUG("%s: can reuse dflash target_feat graph input = %d\n", __func__, res);
     }
 
     return res;
@@ -948,6 +1058,21 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    capture_hidden   (params.capture_hidden),
+    dflash_persist_inter_l(params.dflash_persist_inter_l),
+    dflash_target_feat_fused(params.dflash_target_feat_fused),
+    dflash_kv_update_only(params.dflash_kv_update_only),
+    dflash_fuse_only(params.dflash_fuse_only),
+    dflash_draft_top_k(params.dflash_draft_top_k),
+    dflash_persist_conv_l (params.dflash_persist_conv_l),
+    pending_target_feat_raw_ptr      (params.pending_target_feat_raw_ptr),
+    pending_target_feat_n_embd_fc_ptr(params.pending_target_feat_n_embd_fc_ptr),
+    pending_target_feat_ctx_len_ptr  (params.pending_target_feat_ctx_len_ptr),
+    pending_draft_committed_pos_ptr  (params.pending_draft_committed_pos_ptr),
+    pending_target_feat_tensor_ptr   (params.pending_target_feat_tensor_ptr),
+    dflash_kv_cache_k_l              (params.dflash_kv_cache_k_l),
+    dflash_kv_cache_v_l              (params.dflash_kv_cache_v_l),
+    dflash_kv_cache_dst_pos          (params.dflash_kv_cache_dst_pos),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -1719,6 +1844,35 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
     return cur;
 }
 
+llm_graph_input_target_feat * llm_graph_context::build_inp_target_feat(int64_t n_embd_fc, int64_t ctx_len) const {
+    // The graph context holds non-owning pointers into the llama_context's pending_target_feat
+    // fields, propagated via llm_graph_params. The llama_context outlives every graph invocation,
+    // so the pointer lifetime is safe within a single decode call.
+    GGML_ASSERT(pending_target_feat_raw_ptr != nullptr &&
+                "build_inp_target_feat called without pending pointers wired in llm_graph_params");
+    auto inp = std::make_unique<llm_graph_input_target_feat>(
+        pending_target_feat_raw_ptr,
+        pending_target_feat_n_embd_fc_ptr,
+        pending_target_feat_ctx_len_ptr,
+        pending_draft_committed_pos_ptr);
+
+    const int64_t block_size = n_tokens; // == dflash_block_size at draft invocation time
+
+    inp->inp_target_feat_raw = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_fc, ctx_len);
+    ggml_set_name(inp->inp_target_feat_raw, "dflash_target_feat_raw");
+    ggml_set_input(inp->inp_target_feat_raw);
+
+    inp->inp_pos_q = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, block_size);
+    ggml_set_name(inp->inp_pos_q, "dflash_pos_q");
+    ggml_set_input(inp->inp_pos_q);
+
+    inp->inp_pos_k = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx_len + block_size);
+    ggml_set_name(inp->inp_pos_k, "dflash_pos_k");
+    ggml_set_input(inp->inp_pos_k);
+
+    return (llm_graph_input_target_feat *) res->add_input(std::move(inp));
+}
+
 ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     auto inp = std::make_unique<llm_graph_input_attn_temp>(hparams.n_attn_temp_floor_scale, hparams.f_attn_temp_scale, hparams.f_attn_temp_offset);
 
@@ -1803,6 +1957,23 @@ ggml_tensor * llm_graph_context::build_inp_cross_embd() const {
     res->add_input(std::move(inp));
 
     return cur;
+}
+
+void llm_graph_context::build_inp_tree() const {
+    auto inp = std::make_unique<llm_graph_input_tree>();
+
+    inp->inp_parent_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->inp_parent_ids);
+    ggml_set_name(inp->inp_parent_ids, "parent_ids");
+
+    // The ancestor-only attention mask is written directly into the standard
+    // kq_mask buffer in llama_kv_cache::set_input_kq_mask when ubatch->parent_id
+    // is set, so we don't allocate a separate tree_mask graph input here.
+    // TODO: phase-1 leaves pos as 1D — M-RoPE 4-axis is UNKNOWN-3 in roadmap
+
+    const_cast<llm_graph_context *>(this)->parent_ids = inp->inp_parent_ids;
+
+    res->add_input(std::move(inp));
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos_bucket_enc() const {
@@ -2431,10 +2602,13 @@ ggml_tensor * llm_graph_context::build_rs(
 
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, rs_size);
 
-    // Clear a single state which will then be copied to the other cleared states.
-    // Note that this is a no-op when the view is zero-sized.
-    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    const bool read_only_tree = parent_ids != nullptr && ubatch.parent_id != nullptr && ubatch.n_tokens > 1;
+    if (!read_only_tree) {
+        // Clear a single state which will then be copied to the other cleared states.
+        // Note that this is a no-op when the view is zero-sized.
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    }
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
@@ -2442,12 +2616,14 @@ ggml_tensor * llm_graph_context::build_rs(
     ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
     ggml_build_forward_expand(gf, output_states);
 
-    // copy extra states which won't be changed further (between n_seqs and n_rs)
-    ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);
-    ggml_build_forward_expand(gf,
-        ggml_cpy(ctx0,
-            states_extra,
-            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+    if (!read_only_tree) {
+        // copy extra states which won't be changed further (between n_seqs and n_rs)
+        ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0,
+                states_extra,
+                ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+    }
 
     return output_states;
 }
@@ -2470,6 +2646,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->read_only_tree = ubatch.parent_id != nullptr && ubatch.n_tokens > 1;
 
     return inp;
 }

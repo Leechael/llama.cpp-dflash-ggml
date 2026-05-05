@@ -243,6 +243,7 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+    bool read_only_tree = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -511,6 +512,52 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+// Input for tree-mode forward. Holds parent_ids; ancestor mask is written
+// into the standard kq_mask by llama_kv_cache::set_input_kq_mask when
+// ubatch->parent_id is non-null, so no separate mask tensor is allocated here.
+class llm_graph_input_tree : public llm_graph_input_i {
+public:
+    llm_graph_input_tree() = default;
+    virtual ~llm_graph_input_tree() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * inp_parent_ids = nullptr; // I32 [n_tokens]
+};
+
+// Graph input class for the dflash draft model's target_feat_raw, pos_q, and pos_k tensors.
+// The host side stashes the data via llama_set_target_feat_raw() before calling llama_decode()
+// on the draft context. set_input() memcpy's the stashed data into the GGML input tensors.
+class llm_graph_input_target_feat : public llm_graph_input_i {
+public:
+    // host_data, n_embd_fc, ctx_len are non-owning; they point into llama_context's pending fields.
+    // committed_pos is the number of tokens already committed before this draft step.
+    llm_graph_input_target_feat(
+            const float ** host_data_ptr,   // pointer to context's pending_target_feat_raw field
+            const int64_t * n_embd_fc_ptr,  // pointer to context's pending_target_feat_n_embd_fc
+            const int64_t * ctx_len_ptr,    // pointer to context's pending_target_feat_ctx_len
+            const int64_t * committed_pos_ptr) // pointer to context's pending_draft_committed_pos
+        : host_data_ptr(host_data_ptr), n_embd_fc_ptr(n_embd_fc_ptr),
+          ctx_len_ptr(ctx_len_ptr), committed_pos_ptr(committed_pos_ptr) {}
+    virtual ~llm_graph_input_target_feat() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // [5*n_embd, ctx_len] F32 — stacked hidden captures from target layers
+    ggml_tensor * inp_target_feat_raw = nullptr;
+    // [block_size] I32 — Q positions: [committed_pos .. committed_pos + block_size)
+    ggml_tensor * inp_pos_q = nullptr;
+    // [ctx_len + block_size] I32 — K positions: [0 .. ctx_len + block_size)
+    ggml_tensor * inp_pos_k = nullptr;
+
+private:
+    const float ** host_data_ptr;
+    const int64_t * n_embd_fc_ptr;
+    const int64_t * ctx_len_ptr;
+    const int64_t * committed_pos_ptr;
+};
+
 //
 // llm_graph_result
 //
@@ -566,6 +613,39 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // If true, qwen35 forward writes hidden states at dflash_target_capture_layers
+    // into t_hidden_capture on the result. No-op (zero overhead) when false.
+    bool capture_hidden = false;
+
+    // dflash draft target_feat injection (Task 1).
+    // Non-owning pointers into llama_context's pending_target_feat fields.
+    // Non-null only when running the dflash-draft graph; graph inputs use them in set_input().
+    const float ** pending_target_feat_raw_ptr      = nullptr;
+    const int64_t * pending_target_feat_n_embd_fc_ptr = nullptr;
+    const int64_t * pending_target_feat_ctx_len_ptr   = nullptr;
+    const int64_t * pending_draft_committed_pos_ptr   = nullptr;
+    ggml_tensor * const * pending_target_feat_tensor_ptr = nullptr;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_k_l = nullptr;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_v_l = nullptr;
+    int64_t dflash_kv_cache_dst_pos = 0;
+
+    bool dflash_target_feat_fused = false;
+    bool dflash_kv_update_only    = false;
+    bool dflash_fuse_only         = false;
+    int32_t dflash_draft_top_k = 0;
+
+    // dflash Phase 2.4: per-layer SSM intermediate-state persist buffers.
+    // Non-owning pointer into llama_context::dflash_persist_inter_l. Null when not in
+    // tree mode or when the buffers have not yet been allocated. Graph builder reads
+    // (*dflash_persist_inter_l)[il] for each recurrent layer and passes it to
+    // build_delta_net_tree() as the persist_inter argument.
+    const std::vector<ggml_tensor *> * dflash_persist_inter_l = nullptr;
+
+    // dflash Phase 5: per-layer conv post-state persist buffers (paired with
+    // dflash_persist_inter_l). Read by ggml_ssm_conv_tree_persist; rolled back
+    // into r_l[il] after spec verify.
+    const std::vector<ggml_tensor *> * dflash_persist_conv_l  = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -625,11 +705,18 @@ struct llm_graph_params {
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
-            arch  == other.arch  &&
-            gtype == other.gtype &&
-            cvec  == other.cvec  &&
-            loras == other.loras &&
-            cross == other.cross;
+            arch           == other.arch           &&
+            gtype          == other.gtype          &&
+            cvec           == other.cvec           &&
+            loras          == other.loras          &&
+            cross          == other.cross          &&
+            capture_hidden == other.capture_hidden &&
+            dflash_target_feat_fused == other.dflash_target_feat_fused &&
+            dflash_kv_update_only == other.dflash_kv_update_only &&
+            dflash_fuse_only == other.dflash_fuse_only &&
+            dflash_draft_top_k == other.dflash_draft_top_k &&
+            (dflash_persist_inter_l != nullptr) == (other.dflash_persist_inter_l != nullptr) &&
+            (dflash_persist_conv_l  != nullptr) == (other.dflash_persist_conv_l  != nullptr);
     }
 };
 
@@ -640,9 +727,12 @@ public:
     virtual ~llm_graph_result() = default;
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
-    ggml_tensor * get_logits()      const { return t_logits; }
-    ggml_tensor * get_embd()        const { return t_embd; }
-    ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+    ggml_tensor * get_logits()         const { return t_logits; }
+    ggml_tensor * get_embd()           const { return t_embd; }
+    ggml_tensor * get_embd_pooled()    const { return t_embd_pooled; }
+    ggml_tensor * get_hidden_capture() const { return t_hidden_capture; }
+    ggml_tensor * get_dflash_top_logits() const { return t_dflash_top_logits; }
+    ggml_tensor * get_dflash_top_ids()    const { return t_dflash_top_ids; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -666,11 +756,18 @@ public:
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
-    ggml_tensor * t_inp_tokens  = nullptr;
-    ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
-    ggml_tensor * t_logits      = nullptr;
-    ggml_tensor * t_embd        = nullptr;
-    ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_inp_tokens    = nullptr;
+    ggml_tensor * t_inp_embd      = nullptr; // [n_embd_inp, n_tokens]
+    ggml_tensor * t_logits        = nullptr;
+    ggml_tensor * t_embd          = nullptr;
+    ggml_tensor * t_embd_pooled   = nullptr;
+    // dflash hidden capture: [5*n_embd, n_tokens] F32, populated when capture_hidden=true in graph_params
+    ggml_tensor * t_hidden_capture = nullptr;
+
+    // dflash-draft top-K graph outputs: [K, n_tokens]
+    // t_dflash_top_logits stores full-vocab-normalized log-probs for the selected ids.
+    ggml_tensor * t_dflash_top_logits = nullptr;
+    ggml_tensor * t_dflash_top_ids    = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -758,8 +855,40 @@ struct llm_graph_context {
 
     llm_graph_result * res;
 
+    // dflash hidden capture: propagated from llm_graph_params::capture_hidden
+    const bool capture_hidden;
+
+    // dflash Phase 2.4: per-layer SSM intermediate-state persist buffer pointers.
+    // Non-owning pointer into llama_context::dflash_persist_inter_l (via graph_params).
+    // Null when not in tree mode. Indexed by layer index il.
+    const std::vector<ggml_tensor *> * dflash_persist_inter_l;
+
+    bool dflash_target_feat_fused;
+    bool dflash_kv_update_only;
+    bool dflash_fuse_only;
+    int32_t dflash_draft_top_k;
+
+    // dflash Phase 5: per-layer conv post-state persist buffer pointers
+    // (paired with dflash_persist_inter_l).
+    const std::vector<ggml_tensor *> * dflash_persist_conv_l;
+
+    // dflash draft target_feat injection: propagated from llm_graph_params.
+    // Non-owning; valid only for the dflash-draft graph builder.
+    const float ** pending_target_feat_raw_ptr;
+    const int64_t * pending_target_feat_n_embd_fc_ptr;
+    const int64_t * pending_target_feat_ctx_len_ptr;
+    const int64_t * pending_draft_committed_pos_ptr;
+    ggml_tensor * const * pending_target_feat_tensor_ptr;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_k_l;
+    const std::vector<ggml_tensor *> * dflash_kv_cache_v_l;
+    int64_t dflash_kv_cache_dst_pos;
+
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // tree-mode field: non-null when batch.parent_id is set; consumed by
+    // ggml_ssm_conv_tree / ggml_gated_delta_net_tree on hybrid layers.
+    ggml_tensor * parent_ids = nullptr; // [n_tokens] i32
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -866,9 +995,17 @@ struct llm_graph_context {
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 
+    // build tree-mode input tensors (parent_ids + tree_mask); sets this->parent_ids and this->tree_mask
+    void build_inp_tree() const;
+
     ggml_tensor * build_inp_cross_embd() const;
     ggml_tensor * build_inp_pos_bucket_enc() const;
     ggml_tensor * build_inp_pos_bucket_dec() const;
+
+    // Build input tensors for the dflash draft model (target_feat_raw, pos_q, pos_k).
+    // Returns the target_feat_raw tensor (already registered as graph input).
+    // pos_q and pos_k are accessible via the returned llm_graph_input_target_feat*.
+    llm_graph_input_target_feat * build_inp_target_feat(int64_t n_embd_fc, int64_t ctx_len) const;
     ggml_tensor * build_pos_bias(ggml_tensor * pos_bucket, ggml_tensor * attn_rel_b) const;
 
     //

@@ -224,6 +224,7 @@ bool llama_batch_allocr::init(
             /*.seq_id_unq   =*/ this->seq_id_unq.data(),
             /*.seq_idx      =*/ this->seq_idx.data(),
             /*.output       =*/ batch.logits,
+            /*.parent_id    =*/ batch.parent_id,
             /*.data         =*/ {},
         };
 
@@ -428,6 +429,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.parent_id    =*/ nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -683,6 +685,11 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     assert(n_tokens%n_seqs == 0);
 
+    // tree-mode parent_ids must not be split across ubatches: the ubatch must cover
+    // every token of the public batch in a single emission.
+    GGML_ASSERT((batch.parent_id == nullptr || (size_t) n_tokens == (size_t) batch.n_tokens) &&
+                "tree-mode batch with parent_id must fit in a single ubatch");
+
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
     const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
@@ -722,6 +729,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         udata->n_seq_id[i] = batch.n_seq_id[idxs[i]];
         udata->output[i]   = batch.logits[idxs[i]];
 
+        if (batch.parent_id) {
+            udata->parent_id.push_back(batch.parent_id[idxs[i]]);
+        }
+
         for (int s = 0; s < udata->n_seq_id[i]; ++s) {
             const llama_seq_id seq_id = batch.seq_id[idxs[i]][s];
 
@@ -747,6 +758,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
     }
 
+    int32_t * parent_id_ptr = udata->parent_id.empty() ? nullptr : udata->parent_id.data();
+
     llama_ubatch res {
         /*.b_equal_seqs =*/ equal_seqs,
         /*.n_tokens     =*/ n_tokens,
@@ -763,6 +776,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.parent_id    =*/ parent_id_ptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -864,25 +878,27 @@ struct llama_batch llama_batch_get_one(
              llama_token * tokens,
                  int32_t   n_tokens) {
     return {
-        /*n_tokens =*/ n_tokens,
-        /*tokens   =*/ tokens,
-        /*embd     =*/ nullptr,
-        /*pos      =*/ nullptr,
-        /*n_seq_id =*/ nullptr,
-        /*seq_id   =*/ nullptr,
-        /*logits   =*/ nullptr,
+        /*n_tokens  =*/ n_tokens,
+        /*tokens    =*/ tokens,
+        /*embd      =*/ nullptr,
+        /*pos       =*/ nullptr,
+        /*n_seq_id  =*/ nullptr,
+        /*seq_id    =*/ nullptr,
+        /*logits    =*/ nullptr,
+        /*parent_id =*/ nullptr,
     };
 }
 
 struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_t n_seq_max) {
     llama_batch batch = {
-        /*n_tokens =*/ 0,
-        /*tokens   =*/ nullptr,
-        /*embd     =*/ nullptr,
-        /*pos      =*/ nullptr,
-        /*n_seq_id =*/ nullptr,
-        /*seq_id   =*/ nullptr,
-        /*logits   =*/ nullptr,
+        /*n_tokens  =*/ 0,
+        /*tokens    =*/ nullptr,
+        /*embd      =*/ nullptr,
+        /*pos       =*/ nullptr,
+        /*n_seq_id  =*/ nullptr,
+        /*seq_id    =*/ nullptr,
+        /*logits    =*/ nullptr,
+        /*parent_id =*/ nullptr,
     };
 
     if (embd) {
@@ -904,6 +920,17 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
     return batch;
 }
 
+struct llama_batch llama_batch_init_tree(int32_t n_tokens_alloc, int32_t embd, int32_t n_seq_max) {
+    llama_batch batch = llama_batch_init(n_tokens_alloc, embd, n_seq_max);
+
+    batch.parent_id = (int32_t *) malloc(sizeof(int32_t) * n_tokens_alloc);
+    for (int i = 0; i < n_tokens_alloc; ++i) {
+        batch.parent_id[i] = -1;
+    }
+
+    return batch;
+}
+
 void llama_batch_free(struct llama_batch batch) {
     if (batch.token)    free(batch.token);
     if (batch.embd)     free(batch.embd);
@@ -916,4 +943,5 @@ void llama_batch_free(struct llama_batch batch) {
         free(batch.seq_id);
     }
     if (batch.logits)   free(batch.logits);
+    if (batch.parent_id) free(batch.parent_id);
 }

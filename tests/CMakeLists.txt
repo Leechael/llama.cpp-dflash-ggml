@@ -210,6 +210,8 @@ llama_build_and_test(
     peg-parser/tests.h
 )
 llama_build_and_test(test-regex-partial.cpp)
+llama_build_and_test(test-speculative-tree.cpp)
+llama_build_and_test(test-speculative-draft-backend.cpp)
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
@@ -297,4 +299,60 @@ target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/s
 if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
+endif()
+
+# DDTree Phase 1 acceptance test.
+# Requires a 16+ GB Qwen3.5-27B GGUF not available in CI.
+# Enable manually: cmake -DLLAMA_BUILD_TESTS_QWEN35_TREE=ON ...
+option(LLAMA_BUILD_TESTS_QWEN35_TREE "Build DDTree tree-mode acceptance test (requires large GGUF)" OFF)
+if (LLAMA_BUILD_TESTS_QWEN35_TREE)
+    llama_build(test-qwen35-tree.cpp)
+    # Note: NOT registered with llama_test / add_test — must be run manually.
+endif()
+
+# DDTree diagnostic: chain forward vs single tree-mode root forward.
+# Used to isolate whether the long-prompt ddtree bug is in the tree kernels
+# or above (driver / KV slot / capture). Same large GGUF requirement.
+option(LLAMA_BUILD_TESTS_QWEN35_ROOT_VS_CHAIN "Build DDTree root-vs-chain diagnostic (requires large GGUF)" OFF)
+if (LLAMA_BUILD_TESTS_QWEN35_ROOT_VS_CHAIN)
+    llama_build(test-qwen35-root-vs-chain.cpp)
+    # Manual run only.
+endif()
+
+# DDTree Phase 2 acceptance test: snapshot/restore symmetry.
+# Requires a 16+ GB Qwen3.5-27B GGUF not available in CI.
+# Requires the llama_seq_snapshot / llama_seq_restore / llama_seq_release API
+# delivered by the Phase 2 implementation agent.
+# Enable manually: cmake -DLLAMA_BUILD_TESTS_QWEN35_TREE_ROLLBACK=ON ...
+option(LLAMA_BUILD_TESTS_QWEN35_TREE_ROLLBACK "Build DDTree snapshot/restore acceptance test (requires large GGUF)" OFF)
+if (LLAMA_BUILD_TESTS_QWEN35_TREE_ROLLBACK)
+    llama_build(test-qwen35-tree-rollback.cpp)
+    # Note: NOT registered with llama_test / add_test — must be run manually.
+endif()
+
+# DDTree Phase 3 acceptance tests: dflash-draft forward + hidden-state capture.
+# Requires a 16+ GB Qwen3.5-27B GGUF and a converted dflash-draft GGUF.
+# Requires Phase 3 API from the implementation agent:
+#   llama_model_token_embd_lookup, llama_set_capture_hidden, llama_get_hidden_capture.
+# Enable manually: cmake -DLLAMA_BUILD_TESTS_DFLASH_DRAFT=ON ...
+option(LLAMA_BUILD_TESTS_DFLASH_DRAFT "Build DDTree Phase 3 dflash-draft and chain-capture acceptance tests (requires large GGUFs)" OFF)
+if (LLAMA_BUILD_TESTS_DFLASH_DRAFT)
+    llama_build(test-dflash-draft.cpp)
+    llama_build(test-qwen35-chain-capture.cpp)
+    # Note: NOT registered with llama_test / add_test — must be run manually.
+endif()
+
+# DDTree Phase 4 end-to-end speculative decode acceptance test.
+# Requires Qwen3.5-27B GGUF (~16 GB) and dflash-draft GGUF.  Not available in CI.
+# Requires Phase 4 API from the implementation agent:
+#   llama_speculative_tree_driver_init / _step / _free  (common/speculative-tree-driver.h)
+#   llama_set_target_feat_raw  (Phase 3 gap, llama.h)
+# Enable manually: cmake -DLLAMA_BUILD_TESTS_SPECULATIVE_TREE_E2E=ON ...
+option(LLAMA_BUILD_TESTS_SPECULATIVE_TREE_E2E
+    "Build DDTree Phase 4 end-to-end speculative decode acceptance test (requires large GGUFs)"
+    OFF)
+if (LLAMA_BUILD_TESTS_SPECULATIVE_TREE_E2E)
+    llama_build(test-speculative-tree-e2e.cpp)
+    # Note: NOT registered with llama_test / add_test — must be run manually.
+    # Both --target-model and --draft-model are required at runtime.
 endif()

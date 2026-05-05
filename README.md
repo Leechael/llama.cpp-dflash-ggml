@@ -10,6 +10,12 @@
 
 LLM inference in C/C++
 
+## DFlash / DDTree local notes
+
+This fork carries experimental Qwen3.5 DFlash / DDTree work. Dataset benchmark
+setup, Castle commands, correctness caveats, and current llama.cpp-vs-Python
+numbers are tracked in [docs/ddtree-dataset-eval-plan.md](docs/ddtree-dataset-eval-plan.md).
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)

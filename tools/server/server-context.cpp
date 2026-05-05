@@ -9,6 +9,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "speculative-tree-driver.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -57,6 +58,11 @@ struct server_slot {
     mtmd_context * mctx = nullptr;
 
     common_speculative * spec = nullptr;
+
+    // DDTree speculative decoding state (Phase 5); null when ddtree_mode is off
+    llama_speculative_tree_driver * spec_driver     = nullptr;
+    llama_token                     ddtree_root_tok = LLAMA_TOKEN_NULL; // bonus token from prev step / first sampled
+    llama_pos                       ddtree_committed_pos = 0;           // KV positions committed so far
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -186,6 +192,14 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+
+        // free DDTree driver if one was created for this request
+        if (spec_driver) {
+            llama_speculative_tree_driver_free(spec_driver);
+            spec_driver = nullptr;
+        }
+        ddtree_root_tok      = LLAMA_TOKEN_NULL;
+        ddtree_committed_pos = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -399,6 +413,56 @@ struct server_slot {
             );
         }
 
+        if (spec_driver) {
+            const llama_speculative_tree_driver_stats st =
+                llama_speculative_tree_driver_get_stats(spec_driver);
+            if (st.n_steps > 0) {
+                SLT_CNT(*this,
+                        "ddtree stats: steps=%lld exact_avg_commit=%0.3f batched_avg_commit=%0.3f exact_max=%d batched_max=%d snapshot_replays=%lld fast_batched_replays=%lld fast_batched_cb=%lld fast_rollback=%lld batched_exact_diff=%lld batched_longer=%lld batched_shorter=%lld capture_clamps=%lld\n",
+                        (long long)st.n_steps,
+                        (double)st.n_committed_tokens / (double)st.n_steps,
+                        (double)st.n_batched_posterior_committed_tokens / (double)st.n_steps,
+                        (int)st.max_committed_tokens_per_step,
+                        (int)st.max_batched_posterior_committed_tokens_per_step,
+                        (long long)st.n_snapshot_replays,
+                        (long long)st.n_fast_batched_replays,
+                        (long long)st.n_fast_batched_callback_steps,
+                        (long long)st.n_fast_rollback_steps,
+                        (long long)st.n_batched_exact_diff,
+                        (long long)st.n_batched_exact_longer,
+                        (long long)st.n_batched_exact_shorter,
+                        (long long)st.n_capture_clamps);
+                const double inv_steps = 1.0 / (double)st.n_steps;
+                SLT_CNT(*this,
+                        "ddtree timing avg: step=%0.2f ms pack=%0.2f draft=%0.2f topk=%0.2f build=%0.2f snap=%0.2f target_tree=%0.2f posterior=%0.2f accept=%0.2f compact=%0.2f rollback=%0.2f ingest=%0.2f tree_ingest=%0.2f replay_ingest=%0.2f replay=%0.2f exact=%0.2f exact_decode=%0.2f exact_sample=%0.2f exact_advance=%0.2f exact_nodes=%0.2f\n",
+                        st.t_step_ms * inv_steps,
+                        st.t_target_feat_pack_ms * inv_steps,
+                        st.t_draft_decode_ms * inv_steps,
+                        st.t_topk_ms * inv_steps,
+                        st.t_build_tree_ms * inv_steps,
+                        st.t_snapshot_ms * inv_steps,
+                        st.t_target_tree_decode_ms * inv_steps,
+                        st.t_posterior_scan_ms * inv_steps,
+                        st.t_accept_path_ms * inv_steps,
+                        st.t_kv_compact_ms * inv_steps,
+                        st.t_ssm_rollback_ms * inv_steps,
+                        st.t_ingest_capture_ms * inv_steps,
+                        st.t_tree_ingest_ms * inv_steps,
+                        st.t_replay_ingest_ms * inv_steps,
+                        st.t_replay_ms * inv_steps,
+                        st.t_exact_validate_ms * inv_steps,
+                        st.t_exact_decode_ms * inv_steps,
+                        st.t_exact_sample_ms * inv_steps,
+                        st.t_exact_advance_ms * inv_steps,
+                        (double)st.n_exact_validate_nodes * inv_steps);
+                SLT_CNT(*this,
+                        "ddtree timing total: prompt_ingest=%0.2f ms tree_ingest=%0.2f ms replay_ingest=%0.2f ms\n",
+                        st.t_prompt_ingest_ms,
+                        st.t_tree_ingest_ms,
+                        st.t_replay_ingest_ms);
+            }
+        }
+
         common_speculative_print_stats(spec);
     }
 
@@ -563,6 +627,11 @@ private:
 
     llama_model_ptr model_dft;
 
+    // DDTree draft context — separate from the chain-mode draft since it needs
+    // different n_ctx / n_batch sizing (small, fixed to draft block_size).
+    // Null when ddtree_mode is off.
+    llama_context * ctx_ddtree_dft = nullptr;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -600,6 +669,16 @@ private:
         for (server_slot & slot : slots) {
             common_speculative_free(slot.spec);
             slot.spec = nullptr;
+
+            if (slot.spec_driver) {
+                llama_speculative_tree_driver_free(slot.spec_driver);
+                slot.spec_driver = nullptr;
+            }
+        }
+
+        if (ctx_ddtree_dft) {
+            llama_free(ctx_ddtree_dft);
+            ctx_ddtree_dft = nullptr;
         }
 
         llama_batch_free(batch);
@@ -682,6 +761,9 @@ private:
             params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
             auto mparams_dft = common_model_params_to_llama(params_dft);
+            if (params_base.speculative.ddtree_mode) {
+                mparams_dft.target_model = model;
+            }
 
             model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
             if (model_dft == nullptr) {
@@ -691,6 +773,32 @@ private:
 
             params_base.speculative.model_dft = model_dft.get();
             params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+
+            // DDTree mode: create a dedicated draft context with the sizing the
+            // dflash-draft model expects (small n_ctx, small n_batch = block_size).
+            if (params_base.speculative.ddtree_mode) {
+                // Phase 5: single-slot only — enforce this up front.
+                if (params_base.n_parallel > 1) {
+                    fprintf(stderr, "DDTree mode supports only --parallel 1 in Phase 5\n");
+                    return false;
+                }
+
+                llama_context_params cparams_ddft = llama_context_default_params();
+                cparams_ddft.n_ctx   = 2048 + 16; // DRAFT_CTX_MAX + block_size
+                cparams_ddft.n_batch = 16;         // one block per decode
+
+                ctx_ddtree_dft = llama_init_from_model(model_dft.get(), cparams_ddft);
+                if (!ctx_ddtree_dft) {
+                    SRV_ERR("%s", "failed to create DDTree draft context\n");
+                    return false;
+                }
+                SRV_INF("%s", "DDTree draft context initialized\n");
+
+                // Enable hidden capture on the target context so the driver can
+                // read intermediate layer features for tree scoring.
+                llama_set_capture_hidden(ctx, true);
+                SRV_INF("%s", "DDTree: hidden capture enabled on target context\n");
+            }
         }
 
         std::string & mmproj_path = params_base.mmproj.path;
@@ -1213,6 +1321,14 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        if (params_base.speculative.ddtree_mode && !slot.task->is_child()) {
+            const std::string prompt_text = slot.task->tokens.detokenize(ctx, true);
+            SLT_INF(slot, "DDTree request prompt: tokens = %d, chars = %zu\n",
+                    slot.task->n_tokens(), prompt_text.size());
+            SLT_INF(slot, "DDTree request prompt begin\n%s\nDDTree request prompt end\n",
+                    prompt_text.c_str());
+        }
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -2091,6 +2207,15 @@ private:
                 continue;
             }
 
+            // DDTree slots drive their own batch submissions internally via the driver.
+            // Skip the normal token-addition and batch-decode path for them.
+            if (params_base.speculative.ddtree_mode && slot.spec_driver) {
+                if (!slot_batched) {
+                    slot_batched = &slot;
+                }
+                continue;
+            }
+
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
                 slot_batched = &slot;
@@ -2155,9 +2280,14 @@ private:
             }
         }
 
-        // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx);
+        // process in chunks of params.n_batch. In DDTree mode hidden capture is
+        // only retained for the physical ubatch produced by llama_decode(), so
+        // prompt prefill must be submitted in n_ubatch-sized chunks to keep the
+        // driver's target feature ring complete.
         int32_t n_ubatch = llama_n_ubatch(ctx);
+        const int32_t n_batch_default = llama_n_batch(ctx);
+        const int32_t n_batch_prompt  = params_base.speculative.ddtree_mode ? n_ubatch : n_batch_default;
+        int32_t n_batch = n_batch_prompt;
 
         float  alora_scale       = -1.0f;
         size_t alora_disabled_id = 0;
@@ -2332,6 +2462,19 @@ private:
                                     }
 
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+                                }
+
+                                if (params_base.speculative.ddtree_mode && n_past > 0) {
+                                    const int32_t ddtree_rebuild_nt = llama_speculative_tree_driver_context_window();
+                                    const int32_t n_rebuild = std::min<int32_t>(ddtree_rebuild_nt, slot.task->n_tokens());
+                                    const int32_t n_past_max = std::max<int32_t>(0, slot.task->n_tokens() - n_rebuild);
+
+                                    if (n_past > n_past_max) {
+                                        SLT_WRN(slot,
+                                                "DDTree prompt cache reuse capped from %d to %d to rebuild the last %d target-feature tokens\n",
+                                                n_past, n_past_max, n_rebuild);
+                                        n_past = n_past_max;
+                                    }
                                 }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
@@ -2590,6 +2733,12 @@ private:
                                     break;
                                 }
                             }
+                            if (params_base.speculative.ddtree_mode) {
+                                const int32_t ddtree_rebuild_nt = llama_speculative_tree_driver_context_window();
+                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + ddtree_rebuild_nt) {
+                                    should_break = true;
+                                }
+                            }
                             if (should_break) {
                                 break;
                             }
@@ -2598,6 +2747,9 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
+                    const bool ddtree_rebuild_checkpoint =
+                        params_base.speculative.ddtree_mode &&
+                        slot.task->n_tokens() == slot.prompt.n_tokens() + llama_speculative_tree_driver_context_window();
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -2614,7 +2766,11 @@ private:
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
                     } else {
-                        if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
+                        if (ddtree_rebuild_checkpoint) {
+                            do_checkpoint = do_checkpoint && true;
+                            SLT_INF(slot, "creating DDTree rebuild checkpoint before the last %d prompt tokens at position %d\n",
+                                    llama_speculative_tree_driver_context_window(), slot.prompt.n_tokens());
+                        } else if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
                             // near the end of the prompt
                             do_checkpoint = do_checkpoint && true;
                         } else {
@@ -2713,10 +2869,31 @@ private:
         }
 
         if (batch.n_tokens == 0) {
-            SRV_WRN("%s", "no tokens to decode\n");
+            // DDTree slots don't put tokens in the main batch (the driver handles its
+            // own tree-mode decodes after the main loop). When ddtree_mode is on, the
+            // main batch can legitimately be empty for several consecutive ticks while
+            // slots transition through DONE_PROMPT → GENERATING or wait for the next
+            // request — don't treat that as a hung scheduler.
+            bool ddtree_active = false;
+            if (params_base.speculative.ddtree_mode) {
+                for (const auto & slot : slots) {
+                    if (slot.spec_driver != nullptr ||
+                        slot.state == SLOT_STATE_PROCESSING_PROMPT ||
+                        slot.state == SLOT_STATE_DONE_PROMPT ||
+                        slot.state == SLOT_STATE_STARTED ||
+                        slot.state == SLOT_STATE_GENERATING) {
+                        ddtree_active = true;
+                        break;
+                    }
+                }
+            }
 
-            if (++n_empty_consecutive > 3) {
-                GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
+            if (!ddtree_active) {
+                SRV_WRN("%s", "no tokens to decode\n");
+
+                if (++n_empty_consecutive > 3) {
+                    GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
+                }
             }
         } else {
             n_empty_consecutive = 0;
@@ -2795,7 +2972,37 @@ private:
             i_next = i + n_tokens;
 
             // on successful decode, restore the original batch size
-            n_batch = llama_n_batch(ctx);
+            n_batch = n_batch_prompt;
+
+            // DDTree: incrementally ingest the just-decoded ubatch's hidden capture
+            // into each prompt-processing slot's ring buffer. The capture buffer is
+            // overwritten on every llama_decode, so we MUST consume it before the
+            // next inner-loop iteration. Phase 5 is single-slot, so the entire
+            // batch_view belongs to one slot.
+            if (params_base.speculative.ddtree_mode && ctx_ddtree_dft) {
+                for (auto & slot : slots) {
+                    if (slot.state != SLOT_STATE_PROCESSING_PROMPT &&
+                        slot.state != SLOT_STATE_DONE_PROMPT) {
+                        continue;
+                    }
+                    if (slot.spec_driver == nullptr) {
+                        llama_ddtree_params dp;
+                        dp.budget     = params_base.speculative.ddtree_budget;
+                        dp.temp       = params_base.speculative.ddtree_temp;
+                        dp.chain_seed = params_base.speculative.ddtree_chain_seed;
+                        dp.top_k      = params_base.speculative.ddtree_top_k;
+                        dp.block_size = 16;
+                        slot.spec_driver = llama_speculative_tree_driver_init(ctx, ctx_ddtree_dft, dp);
+                        if (!slot.spec_driver) {
+                            SLT_ERR(slot, "%s", "failed to allocate DDTree driver during prompt processing\n");
+                            continue;
+                        }
+                    }
+                    // Append n_tokens columns from this decode's capture buffer to the ring.
+                    llama_speculative_tree_driver_ingest_prompt_capture(
+                        slot.spec_driver, (int32_t)n_tokens);
+                }
+            }
 
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
             for (auto & slot : slots) {
@@ -2853,11 +3060,56 @@ private:
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
 
+                    if (params_base.speculative.ddtree_mode && ctx_ddtree_dft) {
+                        // DDTree: the driver was lazy-allocated and the ring was filled
+                        // incrementally during prompt prefill (one ingest per inner-loop
+                        // ubatch decode). If something went wrong upstream we may not
+                        // have a driver here — fall back to EOS.
+                        if (!slot.spec_driver) {
+                            SLT_ERR(slot, "%s", "DDTree driver missing at GENERATING transition\n");
+                            slot.stop = STOP_TYPE_EOS;
+                            slot.has_next_token = false;
+                            slot.print_timings();
+                            send_final_response(slot);
+                            metrics.on_prediction(slot);
+                            slot.release();
+                            continue;
+                        }
+
+                        // Greedy-sample the first generated token from the last prompt logit.
+                        const int tok_idx = slot.i_batch - i;
+                        const float * logits = llama_get_logits_ith(ctx, tok_idx);
+                        const int n_vocab = llama_vocab_n_tokens(vocab);
+                        llama_token first_tok = 0;
+                        float best = logits[0];
+                        for (int v = 1; v < n_vocab; ++v) {
+                            if (logits[v] > best) { best = logits[v]; first_tok = (llama_token)v; }
+                        }
+
+                        slot.ddtree_root_tok      = first_tok;
+                        slot.ddtree_committed_pos = (llama_pos)slot.prompt.tokens.size();
+                        slot.i_batch              = -1;
+                        // slot.reset() doesn't touch has_next_token; if the previous
+                        // request ended on a stop condition the flag is still false,
+                        // and the DDTree gen block would skip this slot forever.
+                        slot.has_next_token       = true;
+
+                        slot.t_start_generation  = ggml_time_us();
+                        slot.t_prompt_processing  = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                        metrics.on_prompt_eval(slot);
+                        continue; // will be handled in the DDTree generation loop below
+                    }
+
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
+                }
+
+                // DDTree slots run their driver step outside this loop (after llama_decode)
+                if (params_base.speculative.ddtree_mode && slot.spec_driver) {
+                    continue;
                 }
 
                 if (slot.i_batch_dft.size() > 0) {
@@ -2959,6 +3211,151 @@ private:
                 }
 
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
+            }
+        }
+
+        // DDTree generation: run one spec-decode step per slot, after the main llama_decode.
+        // The driver calls llama_decode on ctx internally (tree-mode batch), so it must run
+        // outside the main decode loop.
+        if (params_base.speculative.ddtree_mode) {
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING || !slot.spec_driver) {
+                    continue;
+                }
+                if (slot.ddtree_root_tok == LLAMA_TOKEN_NULL || !slot.has_next_token) {
+                    continue;
+                }
+
+                // Grammar-aware verify: clone the slot sampler and let the
+                // driver pick each chain step via the cloned sampler+grammar.
+                // The clone gets root_token accepted up front so the first
+                // sample at row 0 sees the grammar state "after root".
+                // LLAMA_DDTREE_NO_GRAMMAR_VERIFY=1 disables this and falls back
+                // to internal argmax (diagnostic; baseline for accept-rate
+                // comparison).
+                // Spec verify is grammar-free by default. Reference DFlash /
+                // DDTree implementations verify with greedy target argmax
+                // only — grammar / penalties / dry are the main sampler's
+                // responsibility on commit, not the verify walk's. Running
+                // grammar inside the verify walk costs ~50 ms / cb on
+                // tool-call JSON schemas for zero acceptance change
+                // (batched_exact_diff = 0 measured across multi-turn agent
+                // runs; see archived/GRAMMAR_VERIFY_DEFAULT_OFF_2026-05-02.md).
+                //
+                // LLAMA_DDTREE_GRAMMAR_VERIFY=1 opts back in if a future
+                // grammar-tight workload needs it.
+                static const bool s_grammar_verify = []{
+                    const char * e = getenv("LLAMA_DDTREE_GRAMMAR_VERIFY");
+                    return e && e[0] == '1';
+                }();
+                // Opt-in batched-argmax short-circuit. Skips the full sampler
+                // chain when the driver's raw argmax is already grammar-valid,
+                // saving ~30 ms per cb call. NOT safe when the chain contains
+                // score-modifying samplers (penalties/dry/xtc) whose effect
+                // can shift the argmax: those are exactly the samplers that
+                // prevent agent reasoning loops, so dropping them lets the
+                // model re-emit the same tool call indefinitely. Stays off
+                // unless explicitly enabled by env var; greedy chains with
+                // only mask-style samplers (top_k/top_p/min_p/temp) can opt in.
+                static const bool s_batched_shortcircuit = []{
+                    const char * e = std::getenv("LLAMA_DDTREE_BATCHED_SHORTCIRCUIT");
+                    return e && e[0] == '1';
+                }();
+                struct ddtree_verify_state {
+                    common_sampler * smpl;
+                    llama_context  * ctx;
+                    bool             use_shortcircuit;
+                };
+                ddtree_verify_state vstate{
+                    /*smpl=*/             (s_grammar_verify && slot.smpl) ? common_sampler_clone(slot.smpl.get()) : nullptr,
+                    /*ctx =*/             ctx,
+                    /*use_shortcircuit=*/ s_batched_shortcircuit,
+                };
+                if (vstate.smpl) {
+                    common_sampler_accept(vstate.smpl, slot.ddtree_root_tok, true);
+                }
+                llama_speculative_tree_verify_cbs vcbs{};
+                vcbs.user_data  = &vstate;
+                vcbs.sample_cb  = [](void * ud, int32_t logits_row_idx, llama_token batched_pick) -> int32_t {
+                    auto * s = (ddtree_verify_state *)ud;
+                    if (!s->smpl) {
+                        return 0; // shouldn't happen; driver falls back if cb null
+                    }
+                    if (s->use_shortcircuit &&
+                        batched_pick != LLAMA_TOKEN_NULL &&
+                        common_sampler_grammar_token_valid(s->smpl, batched_pick)) {
+                        return (int32_t)batched_pick;
+                    }
+                    return (int32_t)common_sampler_sample(s->smpl, s->ctx, logits_row_idx, /*grammar_first=*/true);
+                };
+                vcbs.advance_cb = [](void * ud, llama_token tok) {
+                    auto * s = (ddtree_verify_state *)ud;
+                    if (s->smpl) {
+                        common_sampler_accept(s->smpl, tok, true);
+                    }
+                };
+
+                auto accepted = llama_speculative_tree_driver_step(
+                    slot.spec_driver, slot.ddtree_root_tok, slot.ddtree_committed_pos,
+                    vstate.smpl ? &vcbs : nullptr);
+
+                if (vstate.smpl) {
+                    common_sampler_free(vstate.smpl);
+                }
+
+                if (accepted.empty()) {
+                    SLT_ERR(slot, "%s", "DDTree driver step returned empty result, treating as EOS\n");
+                    slot.stop = STOP_TYPE_EOS;
+                    slot.has_next_token = false;
+                    slot.print_timings();
+                    send_final_response(slot);
+                    metrics.on_prediction(slot);
+                    slot.release();
+                    continue;
+                }
+
+                // accepted: [root_echo, draft_accepted..., bonus]
+                // commit everything except the bonus token. The driver used a
+                // grammar-aware verify (via vcbs above) so all accepted tokens
+                // are guaranteed to be in the sampler+grammar's allowed set.
+                const int n_committed = (int)accepted.size() - 1;
+
+                const int64_t t_current = ggml_time_us();
+                slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+
+                bool slot_done = false;
+                for (int ai = 0; ai < n_committed; ++ai) {
+                    const llama_token tok = accepted[ai];
+
+                    slot.n_decoded += 1;
+
+                    completion_token_output result;
+                    result.tok          = tok;
+                    result.text_to_send = common_token_to_piece(ctx, tok, accept_special_token(slot, tok));
+                    result.prob         = 1.0f;
+
+                    // update sampler history so repetition penalties remain correct
+                    common_sampler_accept(slot.smpl.get(), tok, true);
+
+                    // track position in prompt token list
+                    slot.prompt.tokens.push_back(tok);
+
+                    if (!process_token(result, slot)) {
+                        slot.print_timings();
+                        send_final_response(slot);
+                        metrics.on_prediction(slot);
+                        slot.release();
+                        slot_done = true;
+                        break;
+                    }
+                }
+
+                if (!slot_done) {
+                    slot.ddtree_root_tok      = accepted.back(); // bonus = next root
+                    slot.ddtree_committed_pos += (llama_pos)n_committed;
+                    slot.n_draft_total        += params_base.speculative.ddtree_budget;
+                    slot.n_draft_accepted     += n_committed - 1; // root was not a draft, rest were
+                }
             }
         }
 

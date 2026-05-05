@@ -179,6 +179,16 @@ public:
 
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
+    // After a tree-verify forward fills KV slots [spine_start, spine_start+N),
+    // compact the accepted spine: K/V rows from slot (spine_start + accepted_dfs[i])
+    // are moved to slot (spine_start + i) for i in [0, commit_n). Cells outside
+    // [spine_start, spine_start+kv_size) are untouched (preserves prompt prefill).
+    // Only operates on the stream assigned to seq_id.
+    void seq_compact_tree(llama_seq_id seq_id,
+                          const std::vector<int32_t> & accepted_dfs,
+                          int32_t commit_n,
+                          int32_t spine_start);
+
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
     // return empty slot_info on failure
@@ -202,7 +212,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const slot_info & sinfo) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

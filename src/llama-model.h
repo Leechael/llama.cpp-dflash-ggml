@@ -546,6 +546,10 @@ struct llama_model {
     struct ggml_tensor * conv1d   = nullptr;
     struct ggml_tensor * conv1d_b = nullptr;
 
+    // dflash-draft top-level tensors
+    struct ggml_tensor * dflash_fc          = nullptr; // "fc"          [5*n_embd, n_embd]
+    struct ggml_tensor * dflash_hidden_norm = nullptr; // "hidden_norm"  [n_embd]
+
     // gemma3n altup
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
