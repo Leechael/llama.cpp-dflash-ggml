@@ -1470,9 +1470,14 @@ static void copy_tensor_async_candidates(
     ggml_backend_sched_t sched);
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    const bool profile_dflash =
+    const bool profile_dflash_draft =
         model.arch == LLM_ARCH_DFLASH_DRAFT &&
         std::getenv("LLAMA_DDTREE_PROFILE") != nullptr;
+    const bool profile_dflash_tree =
+        model.arch == LLM_ARCH_QWEN35 &&
+        ubatch.parent_id != nullptr &&
+        std::getenv("LLAMA_DDTREE_PROFILE") != nullptr;
+    const bool profile_dflash = profile_dflash_draft || profile_dflash_tree;
 
     const int64_t t_total_start_us = profile_dflash ? ggml_time_us() : 0;
     int64_t t_apply_us       = 0;
@@ -1566,6 +1571,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (profile_dflash) {
             t_build_alloc_us = ggml_time_us() - t0_us;
         }
+
+        if (profile_dflash_tree) {
+            int op_counts[GGML_OP_COUNT] = {};
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if ((int)node->op >= 0 && node->op < GGML_OP_COUNT) {
+                    op_counts[node->op]++;
+                }
+            }
+            LLAMA_LOG_INFO("dflash_tree_graph: tokens=%u outputs=%d nodes=%d "
+                    "mul_mat=%d fgdn=%d ssm_conv=%d flash_attn=%d cpy=%d rms_norm=%d l2_norm=%d unary=%d soft_max=%d\n",
+                    ubatch.n_tokens,
+                    n_outputs,
+                    ggml_graph_n_nodes(gf),
+                    op_counts[GGML_OP_MUL_MAT],
+                    op_counts[GGML_OP_GATED_DELTA_NET],
+                    op_counts[GGML_OP_SSM_CONV],
+                    op_counts[GGML_OP_FLASH_ATTN_EXT],
+                    op_counts[GGML_OP_CPY],
+                    op_counts[GGML_OP_RMS_NORM],
+                    op_counts[GGML_OP_L2_NORM],
+                    op_counts[GGML_OP_UNARY],
+                    op_counts[GGML_OP_SOFT_MAX]);
+        }
     }
 
     // set the input data for the input tensors
@@ -1593,11 +1622,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     ret = GGML_STATUS_SUCCESS;
 
-    if (profile_dflash) {
+    if (profile_dflash_draft) {
         LLAMA_LOG_INFO("dflash_draft_ubatch_timing: tokens=%u outputs=%d ctx_len=%" PRId64 " reused=%d apply=%.3f build_alloc=%.3f set_inputs=%.3f compute=%.3f total=%.3f ms\n",
                 ubatch.n_tokens,
                 n_outputs,
                 pending_target_feat_ctx_len,
+                reused_graph ? 1 : 0,
+                t_apply_us       / 1000.0,
+                t_build_alloc_us / 1000.0,
+                t_set_inputs_us  / 1000.0,
+                t_compute_us     / 1000.0,
+                (ggml_time_us() - t_total_start_us) / 1000.0);
+    } else if (profile_dflash_tree) {
+        LLAMA_LOG_INFO("dflash_tree_ubatch_timing: tokens=%u outputs=%d reused=%d apply=%.3f build_alloc=%.3f set_inputs=%.3f compute=%.3f total=%.3f ms\n",
+                ubatch.n_tokens,
+                n_outputs,
                 reused_graph ? 1 : 0,
                 t_apply_us       / 1000.0,
                 t_build_alloc_us / 1000.0,
