@@ -116,7 +116,11 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 // Each successive walk beyond -1 decrements by 1, so virtual slot -k maps to
 // sx slot (K-1 - k), which indexes into the old state region [0, K-1). This
 // matches SGLang's causal_conv1d_triton HAS_EAGLE_TREE_CUSTOM_ATTN_MASK path.
-template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+// dflash27b_ggml: tree-mode + per-token persistent conv state. When
+// WITH_PERSIST is true, every token writes its (K-1)-element conv "post-state"
+// (the last K-1 cols of its parent-chain window) into persist_inter so the
+// driver can roll the live conv state back to the accepted DFS node.
+template <bool apply_silu, size_t split_d_inner, size_t d_conv, bool WITH_PERSIST = false>
 static __global__ void ssm_conv_tree_f32(
         const float * __restrict__ src0,        // sx: [K-1+n_t, d_inner, n_s]
         const float * __restrict__ src1,        // c:  [K, d_inner]
@@ -125,6 +129,8 @@ static __global__ void ssm_conv_tree_f32(
         const int src1_nb1,
         float * __restrict__ dst,               // [d_inner, n_t, n_s]
         const int dst_nb0, const int dst_nb1, const int dst_nb2,
+        float * __restrict__ persist_inter,     // [K-1, d_inner, n_t, n_s] when WITH_PERSIST, else nullptr
+        const int64_t d_inner_total,            // full d_inner for persist row stride
         const int64_t n_t) {
     GGML_UNUSED(src0_nb0);
     const int tid  = threadIdx.x;
@@ -151,6 +157,10 @@ static __global__ void ssm_conv_tree_f32(
 
     const int * parent_ids_seq = parent_ids + bidx * n_t;
 
+    // Channel index this thread owns within the full d_inner dimension.
+    // Used both for indexing persist_inter (when enabled) and as bookkeeping.
+    const int channel = (int)(bidy * split_d_inner) + tid;
+
     for (int64_t i = 0; i < n_t; i++) {
         // Walk the parent chain K-1 times to fill the conv window.
         // ancestor_virtual[k] gives the "virtual slot" for kernel position k,
@@ -175,14 +185,31 @@ static __global__ void ssm_conv_tree_f32(
         }
 
         float sumf = 0.0f;
+        // Cache window values so we can both convolve and (optionally) persist
+        // them without re-reading from global memory.
+        float window[d_conv];
 #pragma unroll
         for (size_t k = 0; k < d_conv; k++) {
             // Map virtual slot → sx slot: sx_slot = (K-1) + ancestors[k].
             const int sx_slot = (int)(d_conv - 1) + ancestors[k];
-            const float x_val = x_block[tid * stride_x + sx_slot];
-            sumf += x_val * w[k];
+            window[k] = x_block[tid * stride_x + sx_slot];
+            sumf += window[k] * w[k];
         }
         y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+
+        if constexpr (WITH_PERSIST) {
+            // Per-token "post-state": the (K-1) most recent cols of this token's
+            // window — i.e. ancestors[1..K-1]. Layout matches the live conv state
+            // tensor (r_l): [K-1, d_inner, ...] with K-1 fastest. Persist memory
+            // layout: persist_inter[s][t][channel][k] flat = ((s*n_t + t)*d_inner + channel) * (K-1) + k.
+            float * persist_token = persist_inter
+                + ((bidx * n_t + i) * d_inner_total + channel) * (int64_t)(d_conv - 1);
+#pragma unroll
+            for (size_t k = 0; k < d_conv - 1; k++) {
+                // ancestors[1] is the oldest col we keep; ancestors[K-1] = self.
+                persist_token[k] = window[k + 1];
+            }
+        }
     }
 }
 
@@ -190,7 +217,8 @@ template <bool apply_silu>
 static void ssm_conv_tree_f32_cuda(const float * src0, const float * src1, const int * parent_ids,
                                    const int src0_nb0, const int src0_nb1, const int src0_nb2,
                                    const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
-                                   const int dst_nb2, const int64_t nc, const int64_t nr,
+                                   const int dst_nb2, float * persist_inter,
+                                   const int64_t nc, const int64_t nr,
                                    const int64_t n_t, const int64_t n_s, cudaStream_t stream) {
     const int threads = 128;
     GGML_ASSERT(nr % threads == 0);
@@ -198,9 +226,15 @@ static void ssm_conv_tree_f32_cuda(const float * src0, const float * src1, const
     const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
     auto launch_kernel = [&](auto NC) {
         constexpr int kNC = decltype(NC)::value;
-        ssm_conv_tree_f32<apply_silu, threads, kNC><<<blocks, threads, 0, stream>>>(
-            src0, src1, parent_ids, src0_nb0, src0_nb1, src0_nb2, src1_nb1,
-            dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+        if (persist_inter != nullptr) {
+            ssm_conv_tree_f32<apply_silu, threads, kNC, /*WITH_PERSIST=*/true><<<blocks, threads, 0, stream>>>(
+                src0, src1, parent_ids, src0_nb0, src0_nb1, src0_nb2, src1_nb1,
+                dst, dst_nb0, dst_nb1, dst_nb2, persist_inter, nr, n_t);
+        } else {
+            ssm_conv_tree_f32<apply_silu, threads, kNC, /*WITH_PERSIST=*/false><<<blocks, threads, 0, stream>>>(
+                src0, src1, parent_ids, src0_nb0, src0_nb1, src0_nb2, src1_nb1,
+                dst, dst_nb0, dst_nb1, dst_nb2, nullptr, nr, n_t);
+        }
     };
 
     switch (nc) {
@@ -275,16 +309,26 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     if (parent_ids != nullptr) {
         GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
         const int * parent_ids_d = (const int *) parent_ids->data;
+        // dflash27b_ggml: optional src[3] = persist_inter (F32) buffer where
+        // each token's [K-1, d_inner] post-state is written for SSM rollback.
+        const struct ggml_tensor * persist_inter = dst->src[3];
+        float * persist_d = nullptr;
+        if (persist_inter != nullptr) {
+            GGML_ASSERT(persist_inter->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(persist_inter));
+            GGML_ASSERT(ggml_nelements(persist_inter) >= (int64_t)(nc - 1) * nr * n_t * n_s);
+            persist_d = (float *) persist_inter->data;
+        }
         if (fuse_silu) {
             ssm_conv_tree_f32_cuda<true>(src0_d, src1_d, parent_ids_d,
                 src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1],
                 dst_d, out->nb[0], out->nb[1], out->nb[2],
-                nc, nr, n_t, n_s, stream);
+                persist_d, nc, nr, n_t, n_s, stream);
         } else {
             ssm_conv_tree_f32_cuda<false>(src0_d, src1_d, parent_ids_d,
                 src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1],
                 dst_d, out->nb[0], out->nb[1], out->nb[2],
-                nc, nr, n_t, n_s, stream);
+                persist_d, nc, nr, n_t, n_s, stream);
         }
         return;
     }
